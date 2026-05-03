@@ -1,0 +1,8 @@
+zig-out/
+zig-cache/
+.zig-cache/
+
+# Data directories
+data/
+*.mdbx
+*.mdbx-lck
