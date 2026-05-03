@@ -1,0 +1,46 @@
+/// Shared types and constants for the flat log store format.
+/// Used by engine (writing) and sdk (reading + filtering).
+const std = @import("std");
+
+// ── Tuning constants ─────────────────────────────────────────────────────
+
+/// Maximum event topics per EVM log entry (LOG0..LOG4).
+pub const MAX_TOPICS = 4;
+
+/// Maximum logs per block for pre-allocated buffers. Busiest mainnet blocks
+/// have ~6,000 logs. 8,192 provides headroom without excessive stack usage.
+pub const MAX_LOGS_PER_BLOCK: usize = 8_192;
+
+/// Serialize/compress/decompress buffer size. Must fit the largest block's
+/// serialized log data (~1.5 MB typical, 3+ MB worst case).
+pub const BLOCK_BUF_SIZE: usize = 4 * 1024 * 1024;
+
+/// io_uring read buffer size per slot. Compressed blocks max ~200 KB on mainnet.
+pub const IO_BUF_SIZE: usize = 256 * 1024;
+
+/// Blocks between meta commits during import. Each commit fsyncs (~1ms).
+/// 10K balances crash resilience (~3s of lost work) against fsync overhead (<1%).
+pub const COMMIT_INTERVAL: usize = 10_000;
+
+// ── Raw log ──────────────────────────────────────────────────────────────
+
+/// A single EVM log entry. Core interchange type between import, serialization,
+/// filtering, and handler dispatch. `data` is a borrowed slice — valid only
+/// within the current decompression buffer's lifetime.
+pub const RawLog = struct {
+    block_number: u64,
+    tx_index: u16,
+    log_index: u16,
+    address: [20]u8,
+    topic_count: u8,
+    topics: [MAX_TOPICS][32]u8,
+    data: []const u8,
+    tx_hash: [32]u8,
+};
+
+// ── Tests ────────────────────────────────────────────────────────────────
+
+test "RawLog size sanity" {
+    // Ensure RawLog doesn't accidentally grow (catches field additions)
+    try std.testing.expect(@sizeOf(RawLog) < 256);
+}
