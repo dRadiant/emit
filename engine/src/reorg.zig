@@ -5,8 +5,8 @@
 /// invalidated entries from the pending ring. Caller re-fetches and re-inserts
 /// canonical blocks after this returns.
 ///
-/// No network I/O — the caller is responsible for fetching canonical hashes
-/// and re-inserting blocks. This keeps the module testable without mocks.
+/// No network I/O. The caller is responsible for fetching canonical hashes
+/// and re-inserting blocks after this returns.
 const std = @import("std");
 const PendingRing = @import("pending_ring.zig").PendingRing;
 

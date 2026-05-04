@@ -220,7 +220,7 @@ pub fn buildTestBlooms(block_numbers: []const u64, addr_blooms: ?[]const [bloom_
 }
 
 /// Construct a FlatStoreReader from in-memory buffers. Does not own the
-/// buffers — caller is responsible for freeing. Do NOT call close() on this.
+/// buffers. Caller is responsible for freeing. Do not call close() on this.
 pub fn testReader(
     index_buf: []align(page_align) const u8,
     blooms_buf: []align(page_align) const u8,

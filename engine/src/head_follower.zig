@@ -138,7 +138,7 @@ fn ingestBlock(
 }
 
 /// Move blocks with 64+ confirmations from pending ring to flat store.
-/// Batches ring persistence — one flush after all pops.
+/// Batches ring persistence. One flush after all pops.
 fn finalizeReady(ring: *PendingRing, writer: *FlatStoreWriter, head: u64, alloc: std.mem.Allocator) void {
     var finalized: u32 = 0;
     while (ring.canFinalize(head)) {
