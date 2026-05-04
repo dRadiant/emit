@@ -18,19 +18,19 @@
 ///     lz4_data(lz4_len)
 const std = @import("std");
 const core = @import("core");
-const bloom_mod = core.bloom;
+const bloom = core.bloom;
 
 pub const FINALITY_DEPTH: u64 = 64;
 
 const HASH_SIZE = 32;
-const FIXED_ENTRY_SIZE = 8 + HASH_SIZE + bloom_mod.BLOOM_SIZE + bloom_mod.ADDR_BLOOM_SIZE + 4;
+const FIXED_ENTRY_SIZE = 8 + HASH_SIZE + bloom.BLOOM_SIZE + bloom.ADDR_BLOOM_SIZE + 4;
 // block_number(8) + hash(32) + topic(256) + addr(1024) + lz4_len(4) = 1324
 
 pub const Entry = struct {
     block_number: u64,
     hash: [HASH_SIZE]u8,
-    topic_bloom: [bloom_mod.BLOOM_SIZE]u8,
-    addr_bloom: [bloom_mod.ADDR_BLOOM_SIZE]u8,
+    topic_bloom: [bloom.BLOOM_SIZE]u8,
+    addr_bloom: [bloom.ADDR_BLOOM_SIZE]u8,
     lz4_entry: []u8, // owned by allocator
 
     fn totalSize(self: Entry) usize {
@@ -65,8 +65,8 @@ pub const PendingRing = struct {
         self: *PendingRing,
         block_number: u64,
         hash: [HASH_SIZE]u8,
-        topic_bloom: *const [bloom_mod.BLOOM_SIZE]u8,
-        addr_bloom: *const [bloom_mod.ADDR_BLOOM_SIZE]u8,
+        topic_bloom: *const [bloom.BLOOM_SIZE]u8,
+        addr_bloom: *const [bloom.ADDR_BLOOM_SIZE]u8,
         lz4_entry: []const u8,
     ) !void {
         const owned = try self.alloc.alloc(u8, lz4_entry.len);
@@ -171,10 +171,10 @@ pub const PendingRing = struct {
             pos += 8;
             @memcpy(buf[pos..][0..HASH_SIZE], &e.hash);
             pos += HASH_SIZE;
-            @memcpy(buf[pos..][0..bloom_mod.BLOOM_SIZE], &e.topic_bloom);
-            pos += bloom_mod.BLOOM_SIZE;
-            @memcpy(buf[pos..][0..bloom_mod.ADDR_BLOOM_SIZE], &e.addr_bloom);
-            pos += bloom_mod.ADDR_BLOOM_SIZE;
+            @memcpy(buf[pos..][0..bloom.BLOOM_SIZE], &e.topic_bloom);
+            pos += bloom.BLOOM_SIZE;
+            @memcpy(buf[pos..][0..bloom.ADDR_BLOOM_SIZE], &e.addr_bloom);
+            pos += bloom.ADDR_BLOOM_SIZE;
             std.mem.writeInt(u32, buf[pos..][0..4], @intCast(e.lz4_entry.len), .little);
             pos += 4;
             @memcpy(buf[pos..][0..e.lz4_entry.len], e.lz4_entry);
@@ -212,10 +212,10 @@ pub const PendingRing = struct {
             pos += 8;
             const hash = buf[pos..][0..HASH_SIZE].*;
             pos += HASH_SIZE;
-            const topic_bloom = buf[pos..][0..bloom_mod.BLOOM_SIZE].*;
-            pos += bloom_mod.BLOOM_SIZE;
-            const addr_bloom = buf[pos..][0..bloom_mod.ADDR_BLOOM_SIZE].*;
-            pos += bloom_mod.ADDR_BLOOM_SIZE;
+            const topic_bloom = buf[pos..][0..bloom.BLOOM_SIZE].*;
+            pos += bloom.BLOOM_SIZE;
+            const addr_bloom = buf[pos..][0..bloom.ADDR_BLOOM_SIZE].*;
+            pos += bloom.ADDR_BLOOM_SIZE;
             const lz4_len: usize = std.mem.readInt(u32, buf[pos..][0..4], .little);
             pos += 4;
 
@@ -239,8 +239,8 @@ pub const PendingRing = struct {
 
 const testing = std.testing;
 const dummy_hash = [_]u8{0xAA} ** 32;
-const dummy_topic = [_]u8{0} ** bloom_mod.BLOOM_SIZE;
-const dummy_addr = [_]u8{0} ** bloom_mod.ADDR_BLOOM_SIZE;
+const dummy_topic = [_]u8{0} ** bloom.BLOOM_SIZE;
+const dummy_addr = [_]u8{0} ** bloom.ADDR_BLOOM_SIZE;
 const dummy_entry = [_]u8{ 1, 0, 0, 0, 0x42 };
 
 

@@ -103,22 +103,22 @@ pub fn decompressEntry(entry: []const u8, out: []u8) ![]const u8 {
 // Built during import (engine) and during filtered index build (sdk).
 // Topic bloom: insert topic0 of each log. Address bloom: insert emitting address.
 
-const bloom_mod = @import("bloom.zig");
+const bloom = @import("bloom.zig");
 
-pub fn buildTopicBloom(logs: []const RawLog) bloom_mod.Bloom {
-    var bloom = bloom_mod.Bloom.init();
+pub fn buildTopicBloom(logs: []const RawLog) bloom.Bloom {
+    var b = bloom.Bloom.init();
     for (logs) |log| {
-        if (log.topic_count > 0) bloom.insert(log.topics[0]);
+        if (log.topic_count > 0) b.insert(log.topics[0]);
     }
-    return bloom;
+    return b;
 }
 
-pub fn buildAddrBloom(logs: []const RawLog) bloom_mod.AddrBloom {
-    var bloom = bloom_mod.AddrBloom.init();
+pub fn buildAddrBloom(logs: []const RawLog) bloom.AddrBloom {
+    var b = bloom.AddrBloom.init();
     for (logs) |log| {
-        bloom.insert(bloom_mod.AddrBloom.addrToBloomKey(log.address));
+        b.insert(bloom.AddrBloom.addrToBloomKey(log.address));
     }
-    return bloom;
+    return b;
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -208,7 +208,7 @@ test "buildTopicBloom" {
         .tx_hash = [_]u8{0} ** 32,
     }};
 
-    const bloom = buildTopicBloom(&logs);
-    try std.testing.expect(bloom.mightContain(topic));
-    try std.testing.expect(!bloom.mightContain(other));
+    const tb = buildTopicBloom(&logs);
+    try std.testing.expect(tb.mightContain(topic));
+    try std.testing.expect(!tb.mightContain(other));
 }

@@ -2,11 +2,11 @@
 /// Takes a target address, scans bloom entries, returns matching block numbers.
 /// Used by sdk (filtered index build) and engine (v2 remote streaming).
 const std = @import("std");
-const bloom_mod = @import("bloom.zig");
+const bloom = @import("bloom.zig");
 const flat_reader = @import("flat_reader.zig");
 const parallel = @import("parallel.zig");
 
-const AddrBloom = bloom_mod.AddrBloom;
+const AddrBloom = bloom.AddrBloom;
 const FlatStoreReader = flat_reader.FlatStoreReader;
 
 /// Single-threaded bloom scan. For small datasets or when called from parallel.
@@ -117,7 +117,7 @@ fn scanBloomRange(comptime prefetch: bool, args: *BloomWorkerArgs) void {
         if (block_number > args.end_block) break;
         args.result_scanned += 1;
 
-        const addr_bloom = entry[flat_reader.ADDR_BLOOM_OFFSET..][0..bloom_mod.ADDR_BLOOM_SIZE];
+        const addr_bloom = entry[flat_reader.ADDR_BLOOM_OFFSET..][0..bloom.ADDR_BLOOM_SIZE];
         if (AddrBloom.bytesContain(addr_bloom, args.addr_bloom_key)) {
             args.result_matching.append(args.alloc, block_number) catch continue;
 
@@ -149,7 +149,7 @@ test "scanBlooms matches correct blocks" {
     ab_target.insert(AddrBloom.addrToBloomKey(target_addr));
     var ab_other = AddrBloom.init();
     ab_other.insert(AddrBloom.addrToBloomKey(other_addr));
-    const addr_blooms = [_][bloom_mod.ADDR_BLOOM_SIZE]u8{ ab_target.bits, ab_other.bits, ab_target.bits };
+    const addr_blooms = [_][bloom.ADDR_BLOOM_SIZE]u8{ ab_target.bits, ab_other.bits, ab_target.bits };
 
     const block_numbers = [_]u64{ 100, 101, 102 };
     const blooms_buf = try flat_reader.buildTestBlooms(&block_numbers, &addr_blooms, alloc);

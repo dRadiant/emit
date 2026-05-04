@@ -16,7 +16,7 @@ const receipt_decoder = @import("receipt_decoder.zig");
 
 const types = core.types;
 const log_serial = core.log_serial;
-const bloom_mod = core.bloom;
+const bloom = core.bloom;
 const parallel = core.parallel;
 
 const Iterator = ?*c.rocksdb_iterator_t;
@@ -39,8 +39,8 @@ const Slot = struct {
     // Output (written by worker thread)
     entry: [MAX_ENTRY_SIZE]u8 = undefined,
     entry_len: usize = 0,
-    topic_bloom: [bloom_mod.BLOOM_SIZE]u8 = undefined,
-    addr_bloom: [bloom_mod.ADDR_BLOOM_SIZE]u8 = undefined,
+    topic_bloom: [bloom.BLOOM_SIZE]u8 = undefined,
+    addr_bloom: [bloom.ADDR_BLOOM_SIZE]u8 = undefined,
     log_count: u64 = 0,
     has_error: bool = false,
     // Atomic state for lock-free handoff

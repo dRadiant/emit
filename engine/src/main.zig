@@ -7,7 +7,6 @@
 ///   status --data-dir <path>                    Print flat store status
 const std = @import("std");
 const core = @import("core");
-const flat_writer_mod = @import("flat_writer.zig");
 const head_follower = @import("head_follower.zig");
 
 pub fn main() !void {

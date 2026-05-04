@@ -3,7 +3,7 @@
 /// Writer lives in engine; this module is read-only infrastructure shared by
 /// engine (status/validation) and sdk (filtered index builds).
 const std = @import("std");
-const bloom_mod = @import("bloom.zig");
+const bloom = @import("bloom.zig");
 
 // ── Flat store format constants ──────────────────────────────────────────
 
@@ -11,9 +11,9 @@ pub const INDEX_ENTRY_SIZE = 12; // offset:u64 LE + length:u32 LE
 pub const INDEX_HEADER_SIZE = 16; // first_block:u64 LE + entry_count:u64 LE
 
 /// blooms.bin entry: block_number(8 BE) + topic_bloom(256) + addr_bloom(1024)
-pub const BLOOM_ENTRY_SIZE = 8 + bloom_mod.BLOOM_SIZE + bloom_mod.ADDR_BLOOM_SIZE;
+pub const BLOOM_ENTRY_SIZE = 8 + bloom.BLOOM_SIZE + bloom.ADDR_BLOOM_SIZE;
 pub const TOPIC_BLOOM_OFFSET = 8;
-pub const ADDR_BLOOM_OFFSET = 8 + bloom_mod.BLOOM_SIZE;
+pub const ADDR_BLOOM_OFFSET = 8 + bloom.BLOOM_SIZE;
 pub const BLOOM_HEADER_SIZE = 8; // entry_count:u64 LE
 
 pub const META_SIZE = 40;
@@ -203,7 +203,7 @@ fn buildTestIndex(comptime N: usize, first_block: u64, entries: [N][2]u64) [INDE
 }
 
 /// Build an in-memory blooms buffer (header + entries) for testing.
-pub fn buildTestBlooms(block_numbers: []const u64, addr_blooms: ?[]const [bloom_mod.ADDR_BLOOM_SIZE]u8, allocator: std.mem.Allocator) ![]align(page_align) u8 {
+pub fn buildTestBlooms(block_numbers: []const u64, addr_blooms: ?[]const [bloom.ADDR_BLOOM_SIZE]u8, allocator: std.mem.Allocator) ![]align(page_align) u8 {
     const total = BLOOM_HEADER_SIZE + block_numbers.len * BLOOM_ENTRY_SIZE;
     const buf = try allocator.alignedAlloc(u8, .fromByteUnits(page_align), total);
     std.mem.writeInt(u64, buf[0..8], block_numbers.len, .little);
@@ -212,7 +212,7 @@ pub fn buildTestBlooms(block_numbers: []const u64, addr_blooms: ?[]const [bloom_
         var entry: [BLOOM_ENTRY_SIZE]u8 = std.mem.zeroes([BLOOM_ENTRY_SIZE]u8);
         std.mem.writeInt(u64, entry[0..8], bn, .big);
         if (addr_blooms) |abs| {
-            @memcpy(entry[ADDR_BLOOM_OFFSET..][0..bloom_mod.ADDR_BLOOM_SIZE], &abs[i]);
+            @memcpy(entry[ADDR_BLOOM_OFFSET..][0..bloom.ADDR_BLOOM_SIZE], &abs[i]);
         }
         @memcpy(buf[off..][0..BLOOM_ENTRY_SIZE], &entry);
     }

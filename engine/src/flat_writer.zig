@@ -4,7 +4,7 @@
 const std = @import("std");
 const core = @import("core");
 
-const bloom_mod = core.bloom;
+const bloom = core.bloom;
 const flat_reader = core.flat_reader;
 const Meta = flat_reader.Meta;
 
@@ -71,8 +71,8 @@ pub const FlatStoreWriter = struct {
         self: *FlatStoreWriter,
         block_number: u64,
         lz4_entry: []const u8,
-        topic_bloom: *const [bloom_mod.BLOOM_SIZE]u8,
-        addr_bloom: *const [bloom_mod.ADDR_BLOOM_SIZE]u8,
+        topic_bloom: *const [bloom.BLOOM_SIZE]u8,
+        addr_bloom: *const [bloom.ADDR_BLOOM_SIZE]u8,
     ) !void {
         // Write index header on first block
         if (self.meta.blocks_idx_count == 0 and self.first_block == 0) {
@@ -97,8 +97,8 @@ pub const FlatStoreWriter = struct {
         // Append bloom entry: [block_number:8 BE][topic_bloom][addr_bloom]
         var bloom_entry: [flat_reader.BLOOM_ENTRY_SIZE]u8 = undefined;
         std.mem.writeInt(u64, bloom_entry[0..8], block_number, .big);
-        @memcpy(bloom_entry[flat_reader.TOPIC_BLOOM_OFFSET..][0..bloom_mod.BLOOM_SIZE], topic_bloom);
-        @memcpy(bloom_entry[flat_reader.ADDR_BLOOM_OFFSET..][0..bloom_mod.ADDR_BLOOM_SIZE], addr_bloom);
+        @memcpy(bloom_entry[flat_reader.TOPIC_BLOOM_OFFSET..][0..bloom.BLOOM_SIZE], topic_bloom);
+        @memcpy(bloom_entry[flat_reader.ADDR_BLOOM_OFFSET..][0..bloom.ADDR_BLOOM_SIZE], addr_bloom);
         _ = try self.blooms_file.pwrite(&bloom_entry, flat_reader.BLOOM_HEADER_SIZE + self.meta.blooms_count * flat_reader.BLOOM_ENTRY_SIZE);
 
         // Update counters
@@ -165,10 +165,10 @@ test "write blocks then read back via core reader" {
 
         const entry1 = [_]u8{ 3, 0, 0, 0, 0xAA, 0xBB, 0xCC };
         const entry2 = [_]u8{ 2, 0, 0, 0, 0xDD, 0xEE };
-        var topic1 = [_]u8{0x11} ** bloom_mod.BLOOM_SIZE;
-        var addr1 = [_]u8{0x22} ** bloom_mod.ADDR_BLOOM_SIZE;
-        var topic2 = [_]u8{0x33} ** bloom_mod.BLOOM_SIZE;
-        var addr2 = [_]u8{0x44} ** bloom_mod.ADDR_BLOOM_SIZE;
+        var topic1 = [_]u8{0x11} ** bloom.BLOOM_SIZE;
+        var addr1 = [_]u8{0x22} ** bloom.ADDR_BLOOM_SIZE;
+        var topic2 = [_]u8{0x33} ** bloom.BLOOM_SIZE;
+        var addr2 = [_]u8{0x44} ** bloom.ADDR_BLOOM_SIZE;
 
         try writer.appendBlock(100, &entry1, &topic1, &addr1);
         try writer.appendBlock(101, &entry2, &topic2, &addr2);
@@ -200,8 +200,8 @@ test "meta persists across reopen" {
         var writer = openFromDir(tmp.dir);
         defer closeFilesOnly(&writer);
         const entry = [_]u8{ 1, 0, 0, 0, 0x42 };
-        var topic = [_]u8{0} ** bloom_mod.BLOOM_SIZE;
-        var addr = [_]u8{0} ** bloom_mod.ADDR_BLOOM_SIZE;
+        var topic = [_]u8{0} ** bloom.BLOOM_SIZE;
+        var addr = [_]u8{0} ** bloom.ADDR_BLOOM_SIZE;
         try writer.appendBlock(50, &entry, &topic, &addr);
         try writer.appendBlock(51, &entry, &topic, &addr);
         try writer.finalize();
@@ -220,8 +220,8 @@ test "resume appends after reopen" {
     defer tmp.cleanup();
 
     const entry = [_]u8{ 1, 0, 0, 0, 0x42 };
-    var topic = [_]u8{0} ** bloom_mod.BLOOM_SIZE;
-    var addr = [_]u8{0} ** bloom_mod.ADDR_BLOOM_SIZE;
+    var topic = [_]u8{0} ** bloom.BLOOM_SIZE;
+    var addr = [_]u8{0} ** bloom.ADDR_BLOOM_SIZE;
 
     {
         var writer = openFromDir(tmp.dir);
@@ -252,7 +252,7 @@ test "bloom scan finds written blocks" {
     const target_addr = [_]u8{0xAE} ** 20;
     const other_addr = [_]u8{0xFF} ** 20;
     const entry = [_]u8{ 0, 0, 0, 0 };
-    var topic = [_]u8{0} ** bloom_mod.BLOOM_SIZE;
+    var topic = [_]u8{0} ** bloom.BLOOM_SIZE;
 
     {
         var writer = openFromDir(tmp.dir);
