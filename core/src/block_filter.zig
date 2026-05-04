@@ -19,8 +19,19 @@ pub fn scanBlooms(
     blocks_scanned: *u64,
     allocator: std.mem.Allocator,
 ) void {
-    const start_idx = reader.findBloomStart(start_block);
-    scanRange(reader, AddrBloom.addrToBloomKey(target_address), start_idx, reader.blooms_count, end_block, matching, blocks_scanned, allocator);
+    var args = BloomWorkerArgs{
+        .reader = reader,
+        .addr_bloom_key = AddrBloom.addrToBloomKey(target_address),
+        .start_idx = reader.findBloomStart(start_block),
+        .end_idx = reader.blooms_count,
+        .end_block = end_block,
+        .result_matching = matching.*,
+        .result_scanned = blocks_scanned.*,
+        .alloc = allocator,
+    };
+    scanBloomRange(false, &args);
+    matching.* = args.result_matching;
+    blocks_scanned.* = args.result_scanned;
 }
 
 /// Parallel bloom scan: split across N threads, aggregate results in block order.
@@ -93,36 +104,24 @@ const BloomWorkerArgs = struct {
     alloc: std.mem.Allocator,
 };
 
-/// Worker entry point. Walks its assigned slice of blooms.bin (mmap'd, so
-/// reads are just pointer arithmetic). For each entry: read block number
-/// (big-endian, first 8 bytes), check the 1024-byte address bloom at a
-/// fixed offset within the entry, and if it passes, record the block number.
-///
-/// On Linux, matching blocks also get an fadvise(WILLNEED) hint — the bloom
-/// scan finishes ~330ms before io_uring workers start reading blocks.dat,
-/// giving the kernel time to start async DMA for pages we'll need.
-fn bloomWorkerFn(args: *BloomWorkerArgs) void {
-    // Skip the 8-byte header to get the raw entry array
+/// Scan a range of bloom entries, checking address bloom membership.
+/// When `prefetch` is true (parallel path), issues fadvise(WILLNEED) on
+/// matching blocks so the kernel starts async NVMe DMA during the scan.
+fn scanBloomRange(comptime prefetch: bool, args: *BloomWorkerArgs) void {
     const base = args.reader.blooms_map[flat_reader.BLOOM_HEADER_SIZE..];
     for (args.start_idx..args.end_idx) |i| {
         const offset = i * flat_reader.BLOOM_ENTRY_SIZE;
         if (offset + flat_reader.BLOOM_ENTRY_SIZE > base.len) break;
         const entry = base[offset..][0..flat_reader.BLOOM_ENTRY_SIZE];
-
-        // Block number is big-endian so entries sort lexicographically
         const block_number = std.mem.readInt(u64, entry[0..8], .big);
         if (block_number > args.end_block) break;
         args.result_scanned += 1;
 
-        // Check address bloom — sits at a fixed offset within each entry
         const addr_bloom = entry[flat_reader.ADDR_BLOOM_OFFSET..][0..bloom_mod.ADDR_BLOOM_SIZE];
         if (AddrBloom.bytesContain(addr_bloom, args.addr_bloom_key)) {
             args.result_matching.append(args.alloc, block_number) catch continue;
 
-            // Hint the kernel to start reading this block's pages from NVMe.
-            // Costs ~13ms total per worker but primes the page cache 330ms
-            // before io_uring workers begin, measured as ~30% faster warm.
-            if (comptime @import("builtin").os.tag == .linux) {
+            if (comptime prefetch and @import("builtin").os.tag == .linux) {
                 if (args.reader.getBlockLoc(block_number)) |loc| {
                     _ = std.os.linux.fadvise(args.reader.blocks_file.handle, @intCast(loc.offset), @intCast(loc.length), std.os.linux.POSIX_FADV.WILLNEED);
                 } else |_| {}
@@ -131,33 +130,8 @@ fn bloomWorkerFn(args: *BloomWorkerArgs) void {
     }
 }
 
-/// Linear scan over a contiguous range of bloom entries. Used by the
-/// single-threaded path (scanBlooms). Same logic as bloomWorkerFn but
-/// without fadvise — the single-threaded path doesn't benefit from
-/// prefetch since reads happen sequentially after the scan completes.
-fn scanRange(
-    reader: *const FlatStoreReader,
-    addr_bloom_key: [32]u8,
-    start_idx: usize,
-    end_idx: usize,
-    end_block: u64,
-    matching: *std.ArrayListUnmanaged(u64),
-    blocks_scanned: *u64,
-    allocator: std.mem.Allocator,
-) void {
-    const base = reader.blooms_map[flat_reader.BLOOM_HEADER_SIZE..];
-    for (start_idx..end_idx) |i| {
-        const offset = i * flat_reader.BLOOM_ENTRY_SIZE;
-        if (offset + flat_reader.BLOOM_ENTRY_SIZE > base.len) break;
-        const entry = base[offset..][0..flat_reader.BLOOM_ENTRY_SIZE];
-        const block_number = std.mem.readInt(u64, entry[0..8], .big);
-        if (block_number > end_block) break;
-        blocks_scanned.* += 1;
-        const addr_bloom = entry[flat_reader.ADDR_BLOOM_OFFSET..][0..bloom_mod.ADDR_BLOOM_SIZE];
-        if (AddrBloom.bytesContain(addr_bloom, addr_bloom_key)) {
-            matching.append(allocator, block_number) catch continue;
-        }
-    }
+fn bloomWorkerFn(args: *BloomWorkerArgs) void {
+    scanBloomRange(true, args);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
