@@ -81,12 +81,14 @@ pub const PendingRing = struct {
         try self.persist();
     }
 
-    /// Get the block hash for reorg detection. Returns null if not in ring.
+    /// Get the block hash for reorg detection. O(1) via index arithmetic
+    /// since entries are dense (sequential block numbers, no gaps).
     pub fn getHash(self: *const PendingRing, block_number: u64) ?[HASH_SIZE]u8 {
-        for (self.entries.items) |e| {
-            if (e.block_number == block_number) return e.hash;
-        }
-        return null;
+        const oldest = self.oldestBlock() orelse return null;
+        if (block_number < oldest) return null;
+        const idx = block_number - oldest;
+        if (idx >= self.entries.items.len) return null;
+        return self.entries.items[idx].hash;
     }
 
     pub fn oldestBlock(self: *const PendingRing) ?u64 {
@@ -109,13 +111,16 @@ pub const PendingRing = struct {
         return current_head >= oldest + FINALITY_DEPTH;
     }
 
-    /// Remove and return the oldest entry. Caller uses the data to append
-    /// to the flat store, then the entry is gone from the ring.
-    pub fn popOldest(self: *PendingRing) !?Entry {
+    /// Remove and return the oldest entry. Does not persist.
+    /// Caller must call flush() after batch operations.
+    pub fn popOldest(self: *PendingRing) ?Entry {
         if (self.entries.items.len == 0) return null;
-        const entry = self.entries.orderedRemove(0);
+        return self.entries.orderedRemove(0);
+    }
+
+    /// Persist current state to disk. Call after batch mutations.
+    pub fn flush(self: *PendingRing) !void {
         try self.persist();
-        return entry;
     }
 
     /// Delete all entries with block_number >= from_block. Returns count deleted.
@@ -223,10 +228,6 @@ const dummy_topic = [_]u8{0} ** bloom_mod.BLOOM_SIZE;
 const dummy_addr = [_]u8{0} ** bloom_mod.ADDR_BLOOM_SIZE;
 const dummy_entry = [_]u8{ 1, 0, 0, 0, 0x42 };
 
-fn testRing() !PendingRing {
-    const tmp = testing.tmpDir(.{});
-    return PendingRing.open(tmp.dir, testing.allocator);
-}
 
 test "insert and read back hash" {
     var tmp = testing.tmpDir(.{});
@@ -268,13 +269,13 @@ test "popOldest removes and returns first entry" {
     try ring.insert(100, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
     try ring.insert(101, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
 
-    const oldest = (try ring.popOldest()).?;
+    const oldest = (ring.popOldest()).?;
     defer ring.alloc.free(oldest.lz4_entry);
     try testing.expectEqual(@as(u64, 100), oldest.block_number);
     try testing.expectEqual(@as(u64, 101), ring.oldestBlock().?);
     try testing.expectEqual(@as(usize, 1), ring.count());
 
-    const last = (try ring.popOldest()).?;
+    const last = (ring.popOldest()).?;
     defer ring.alloc.free(last.lz4_entry);
     try testing.expectEqual(@as(usize, 0), ring.count());
     try testing.expect(ring.oldestBlock() == null);

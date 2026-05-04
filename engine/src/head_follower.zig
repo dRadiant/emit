@@ -138,12 +138,18 @@ fn ingestBlock(
 }
 
 /// Move blocks with 64+ confirmations from pending ring to flat store.
+/// Batches ring persistence — one flush after all pops.
 fn finalizeReady(ring: *PendingRing, writer: *FlatStoreWriter, head: u64, alloc: std.mem.Allocator) void {
+    var finalized: u32 = 0;
     while (ring.canFinalize(head)) {
-        const oldest = (ring.popOldest() catch break) orelse break;
+        const oldest = ring.popOldest() orelse break;
         defer alloc.free(oldest.lz4_entry);
         writer.appendBlock(oldest.block_number, oldest.lz4_entry, &oldest.topic_bloom, &oldest.addr_bloom) catch break;
-        std.debug.print("Finalized block {d}\n", .{oldest.block_number});
+        finalized += 1;
+    }
+    if (finalized > 0) {
+        ring.flush() catch {};
+        std.debug.print("Finalized {d} blocks\n", .{finalized});
     }
 }
 
