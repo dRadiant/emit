@@ -8,7 +8,6 @@ pub const flat_writer = @import("flat_writer.zig");
 pub const rlp = @import("rlp.zig");
 pub const pending_ring = @import("pending_ring.zig");
 pub const receipt_decoder = @import("receipt_decoder.zig");
-pub const reorg = @import("reorg.zig");
 pub const head_follower = @import("head_follower.zig");
 
 // rocksdb_import is not included here — it depends on the rocksdb lazy dep
@@ -20,6 +19,5 @@ test {
     _ = rlp;
     _ = pending_ring;
     _ = receipt_decoder;
-    _ = reorg;
     _ = head_follower;
 }
