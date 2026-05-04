@@ -6,8 +6,10 @@
 /// handlers, entities, or manifests — that's the sdk's domain.
 pub const flat_writer = @import("flat_writer.zig");
 pub const rlp = @import("rlp.zig");
+pub const pending_ring = @import("pending_ring.zig");
 
 test {
     _ = flat_writer;
     _ = rlp;
+    _ = pending_ring;
 }

@@ -1,0 +1,378 @@
+/// Pre-finality block buffer persisted as a single file via atomic rewrite.
+///
+/// Holds the last ≤64 blocks before they're finalized to the immutable flat
+/// store. All mutations operate on an in-memory ArrayList; after each mutation
+/// the list is serialized to pending.bin via tmp + rename (crash-safe).
+///
+/// Flat files are NEVER mutated — this is the only mutable state in the engine.
+/// See ADR-001 for the decision rationale.
+///
+/// File format:
+///   count(u32 LE)
+///   [count × Entry]:
+///     block_number(u64 BE)
+///     hash(32)
+///     topic_bloom(256)
+///     addr_bloom(1024)
+///     lz4_len(u32 LE)
+///     lz4_data(lz4_len)
+const std = @import("std");
+const core = @import("core");
+const bloom_mod = core.bloom;
+
+pub const FINALITY_DEPTH: u64 = 64;
+
+const HASH_SIZE = 32;
+const FIXED_ENTRY_SIZE = 8 + HASH_SIZE + bloom_mod.BLOOM_SIZE + bloom_mod.ADDR_BLOOM_SIZE + 4;
+// block_number(8) + hash(32) + topic(256) + addr(1024) + lz4_len(4) = 1324
+
+pub const Entry = struct {
+    block_number: u64,
+    hash: [HASH_SIZE]u8,
+    topic_bloom: [bloom_mod.BLOOM_SIZE]u8,
+    addr_bloom: [bloom_mod.ADDR_BLOOM_SIZE]u8,
+    lz4_entry: []u8, // owned by allocator
+
+    fn totalSize(self: Entry) usize {
+        return FIXED_ENTRY_SIZE + self.lz4_entry.len;
+    }
+};
+
+pub const PendingRing = struct {
+    entries: std.ArrayListUnmanaged(Entry),
+    dir: std.fs.Dir,
+    alloc: std.mem.Allocator,
+
+    /// Open or create a pending ring in the given directory.
+    /// Loads existing pending.bin if present.
+    pub fn open(dir: std.fs.Dir, alloc: std.mem.Allocator) !PendingRing {
+        var ring = PendingRing{
+            .entries = .{},
+            .dir = dir,
+            .alloc = alloc,
+        };
+        ring.load() catch {};
+        return ring;
+    }
+
+    pub fn deinit(self: *PendingRing) void {
+        for (self.entries.items) |e| self.alloc.free(e.lz4_entry);
+        self.entries.deinit(self.alloc);
+    }
+
+    /// Append a block. Persists immediately.
+    pub fn insert(
+        self: *PendingRing,
+        block_number: u64,
+        hash: [HASH_SIZE]u8,
+        topic_bloom: *const [bloom_mod.BLOOM_SIZE]u8,
+        addr_bloom: *const [bloom_mod.ADDR_BLOOM_SIZE]u8,
+        lz4_entry: []const u8,
+    ) !void {
+        const owned = try self.alloc.alloc(u8, lz4_entry.len);
+        @memcpy(owned, lz4_entry);
+        try self.entries.append(self.alloc, .{
+            .block_number = block_number,
+            .hash = hash,
+            .topic_bloom = topic_bloom.*,
+            .addr_bloom = addr_bloom.*,
+            .lz4_entry = owned,
+        });
+        try self.persist();
+    }
+
+    /// Get the block hash for reorg detection. Returns null if not in ring.
+    pub fn getHash(self: *const PendingRing, block_number: u64) ?[HASH_SIZE]u8 {
+        for (self.entries.items) |e| {
+            if (e.block_number == block_number) return e.hash;
+        }
+        return null;
+    }
+
+    pub fn oldestBlock(self: *const PendingRing) ?u64 {
+        if (self.entries.items.len == 0) return null;
+        return self.entries.items[0].block_number;
+    }
+
+    pub fn latestBlock(self: *const PendingRing) ?u64 {
+        if (self.entries.items.len == 0) return null;
+        return self.entries.items[self.entries.items.len - 1].block_number;
+    }
+
+    pub fn count(self: *const PendingRing) usize {
+        return self.entries.items.len;
+    }
+
+    /// True if the oldest block has 64+ confirmations.
+    pub fn canFinalize(self: *const PendingRing, current_head: u64) bool {
+        const oldest = self.oldestBlock() orelse return false;
+        return current_head >= oldest + FINALITY_DEPTH;
+    }
+
+    /// Remove and return the oldest entry. Caller uses the data to append
+    /// to the flat store, then the entry is gone from the ring.
+    pub fn popOldest(self: *PendingRing) !?Entry {
+        if (self.entries.items.len == 0) return null;
+        const entry = self.entries.orderedRemove(0);
+        try self.persist();
+        return entry;
+    }
+
+    /// Delete all entries with block_number >= from_block. Returns count deleted.
+    pub fn truncateFrom(self: *PendingRing, from_block: u64) !u64 {
+        var deleted: u64 = 0;
+        while (self.entries.items.len > 0) {
+            const last = self.entries.items[self.entries.items.len - 1];
+            if (last.block_number < from_block) break;
+            self.alloc.free(last.lz4_entry);
+            _ = self.entries.pop();
+            deleted += 1;
+        }
+        if (deleted > 0) try self.persist();
+        return deleted;
+    }
+
+    // ── Persistence ──────────────────────────────────────────────────────
+
+    /// Serialize all entries to pending.bin via tmp + rename.
+    fn persist(self: *PendingRing) !void {
+        var total_size: usize = 4; // count header
+        for (self.entries.items) |e| total_size += e.totalSize();
+
+        const buf = try self.alloc.alloc(u8, total_size);
+        defer self.alloc.free(buf);
+
+        var pos: usize = 0;
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(self.entries.items.len), .little);
+        pos += 4;
+
+        for (self.entries.items) |e| {
+            std.mem.writeInt(u64, buf[pos..][0..8], e.block_number, .big);
+            pos += 8;
+            @memcpy(buf[pos..][0..HASH_SIZE], &e.hash);
+            pos += HASH_SIZE;
+            @memcpy(buf[pos..][0..bloom_mod.BLOOM_SIZE], &e.topic_bloom);
+            pos += bloom_mod.BLOOM_SIZE;
+            @memcpy(buf[pos..][0..bloom_mod.ADDR_BLOOM_SIZE], &e.addr_bloom);
+            pos += bloom_mod.ADDR_BLOOM_SIZE;
+            std.mem.writeInt(u32, buf[pos..][0..4], @intCast(e.lz4_entry.len), .little);
+            pos += 4;
+            @memcpy(buf[pos..][0..e.lz4_entry.len], e.lz4_entry);
+            pos += e.lz4_entry.len;
+        }
+
+        {
+            const tmp = try self.dir.createFile("pending.bin.tmp", .{});
+            defer tmp.close();
+            try tmp.writeAll(buf[0..pos]);
+            try tmp.sync();
+        }
+        try self.dir.rename("pending.bin.tmp", "pending.bin");
+    }
+
+    /// Load entries from pending.bin on startup.
+    fn load(self: *PendingRing) !void {
+        const file = try self.dir.openFile("pending.bin", .{});
+        defer file.close();
+        const stat = try file.stat();
+        if (stat.size < 4) return;
+
+        const buf = try self.alloc.alloc(u8, stat.size);
+        defer self.alloc.free(buf);
+        const n = try file.readAll(buf);
+        if (n < 4) return;
+
+        const entry_count: usize = std.mem.readInt(u32, buf[0..4], .little);
+        var pos: usize = 4;
+
+        for (0..entry_count) |_| {
+            if (pos + FIXED_ENTRY_SIZE > n) break;
+
+            const block_number = std.mem.readInt(u64, buf[pos..][0..8], .big);
+            pos += 8;
+            const hash = buf[pos..][0..HASH_SIZE].*;
+            pos += HASH_SIZE;
+            const topic_bloom = buf[pos..][0..bloom_mod.BLOOM_SIZE].*;
+            pos += bloom_mod.BLOOM_SIZE;
+            const addr_bloom = buf[pos..][0..bloom_mod.ADDR_BLOOM_SIZE].*;
+            pos += bloom_mod.ADDR_BLOOM_SIZE;
+            const lz4_len: usize = std.mem.readInt(u32, buf[pos..][0..4], .little);
+            pos += 4;
+
+            if (pos + lz4_len > n) break;
+            const lz4_entry = try self.alloc.alloc(u8, lz4_len);
+            @memcpy(lz4_entry, buf[pos..][0..lz4_len]);
+            pos += lz4_len;
+
+            try self.entries.append(self.alloc, .{
+                .block_number = block_number,
+                .hash = hash,
+                .topic_bloom = topic_bloom,
+                .addr_bloom = addr_bloom,
+                .lz4_entry = lz4_entry,
+            });
+        }
+    }
+};
+
+// ── Tests ────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+const dummy_hash = [_]u8{0xAA} ** 32;
+const dummy_topic = [_]u8{0} ** bloom_mod.BLOOM_SIZE;
+const dummy_addr = [_]u8{0} ** bloom_mod.ADDR_BLOOM_SIZE;
+const dummy_entry = [_]u8{ 1, 0, 0, 0, 0x42 };
+
+fn testRing() !PendingRing {
+    const tmp = testing.tmpDir(.{});
+    return PendingRing.open(tmp.dir, testing.allocator);
+}
+
+test "insert and read back hash" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ring = try PendingRing.open(tmp.dir, testing.allocator);
+    defer ring.deinit();
+
+    try ring.insert(100, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+
+    const hash = ring.getHash(100).?;
+    try testing.expectEqualSlices(u8, &dummy_hash, &hash);
+    try testing.expect(ring.getHash(999) == null);
+}
+
+test "oldest and latest track correctly" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ring = try PendingRing.open(tmp.dir, testing.allocator);
+    defer ring.deinit();
+
+    try testing.expect(ring.oldestBlock() == null);
+    try testing.expect(ring.latestBlock() == null);
+
+    try ring.insert(100, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+    try ring.insert(101, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+    try ring.insert(102, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+
+    try testing.expectEqual(@as(u64, 100), ring.oldestBlock().?);
+    try testing.expectEqual(@as(u64, 102), ring.latestBlock().?);
+    try testing.expectEqual(@as(usize, 3), ring.count());
+}
+
+test "popOldest removes and returns first entry" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ring = try PendingRing.open(tmp.dir, testing.allocator);
+    defer ring.deinit();
+
+    try ring.insert(100, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+    try ring.insert(101, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+
+    const oldest = (try ring.popOldest()).?;
+    defer ring.alloc.free(oldest.lz4_entry);
+    try testing.expectEqual(@as(u64, 100), oldest.block_number);
+    try testing.expectEqual(@as(u64, 101), ring.oldestBlock().?);
+    try testing.expectEqual(@as(usize, 1), ring.count());
+
+    const last = (try ring.popOldest()).?;
+    defer ring.alloc.free(last.lz4_entry);
+    try testing.expectEqual(@as(usize, 0), ring.count());
+    try testing.expect(ring.oldestBlock() == null);
+}
+
+test "truncateFrom removes blocks at and above fork point" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ring = try PendingRing.open(tmp.dir, testing.allocator);
+    defer ring.deinit();
+
+    for (100..110) |i| {
+        try ring.insert(i, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+    }
+    try testing.expectEqual(@as(usize, 10), ring.count());
+
+    const deleted = try ring.truncateFrom(107);
+    try testing.expectEqual(@as(u64, 3), deleted);
+    try testing.expectEqual(@as(usize, 7), ring.count());
+    try testing.expectEqual(@as(u64, 106), ring.latestBlock().?);
+    try testing.expect(ring.getHash(107) == null);
+    try testing.expect(ring.getHash(106) != null);
+}
+
+test "canFinalize respects finality depth" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ring = try PendingRing.open(tmp.dir, testing.allocator);
+    defer ring.deinit();
+
+    try ring.insert(100, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+
+    try testing.expect(!ring.canFinalize(163)); // 63 confirmations
+    try testing.expect(ring.canFinalize(164)); // 64 confirmations
+}
+
+test "persists across reopen" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Write
+    {
+        var ring = try PendingRing.open(tmp.dir, testing.allocator);
+        defer ring.deinit();
+        const hash = [_]u8{0xBB} ** 32;
+        const entry = [_]u8{ 3, 0, 0, 0, 0xDE, 0xAD, 0xBE };
+        try ring.insert(42, hash, &dummy_topic, &dummy_addr, &entry);
+        try ring.insert(43, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+    }
+
+    // Reopen and verify
+    {
+        var ring = try PendingRing.open(tmp.dir, testing.allocator);
+        defer ring.deinit();
+        try testing.expectEqual(@as(usize, 2), ring.count());
+        try testing.expectEqual(@as(u64, 42), ring.oldestBlock().?);
+        const hash = ring.getHash(42).?;
+        try testing.expectEqual(@as(u8, 0xBB), hash[0]);
+    }
+}
+
+test "reorg scenario: insert, truncate, re-insert" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ring = try PendingRing.open(tmp.dir, testing.allocator);
+    defer ring.deinit();
+
+    const hash_a = [_]u8{0xAA} ** 32;
+    for (100..110) |i| {
+        try ring.insert(i, hash_a, &dummy_topic, &dummy_addr, &dummy_entry);
+    }
+
+    // Reorg at 107
+    _ = try ring.truncateFrom(107);
+
+    // Re-insert canonical
+    const hash_b = [_]u8{0xBB} ** 32;
+    for (107..110) |i| {
+        try ring.insert(i, hash_b, &dummy_topic, &dummy_addr, &dummy_entry);
+    }
+
+    try testing.expectEqual(@as(usize, 10), ring.count());
+    // 100-106: original hash
+    try testing.expectEqualSlices(u8, &hash_a, &ring.getHash(106).?);
+    // 107-109: new hash
+    try testing.expectEqualSlices(u8, &hash_b, &ring.getHash(107).?);
+}
+
+test "truncate everything leaves empty ring" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ring = try PendingRing.open(tmp.dir, testing.allocator);
+    defer ring.deinit();
+
+    try ring.insert(100, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+    try ring.insert(101, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+
+    _ = try ring.truncateFrom(100);
+    try testing.expectEqual(@as(usize, 0), ring.count());
+    try testing.expect(ring.oldestBlock() == null);
+}
