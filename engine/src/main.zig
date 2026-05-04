@@ -36,11 +36,19 @@ pub fn main() !void {
     if (std.mem.eql(u8, command, "import")) {
         const data_dir = getFlag(args, "--data-dir") orelse return usage();
 
-        if (getFlag(args, "--rocksdb")) |_| {
-            // RocksDB import compiled separately via lazy dep.
-            // For now, print instructions.
-            std.debug.print("RocksDB import requires building with: zig build import\n", .{});
-            std.debug.print("Then run: ./zig-out/bin/rocksdb-import <receipts_path> {s}\n", .{data_dir});
+        if (getFlag(args, "--rocksdb")) |rocksdb_path| {
+            // RocksDB import is a separate binary (avoids linking ~20MB of C into engine).
+            // Exec it directly once built.
+            const result = std.process.Child.run(.{
+                .allocator = alloc,
+                .argv = &.{ "rocksdb-import", rocksdb_path, data_dir },
+            });
+            if (result) |r| {
+                if (r.stdout.len > 0) std.debug.print("{s}", .{r.stdout});
+                if (r.stderr.len > 0) std.debug.print("{s}", .{r.stderr});
+            } else |_| {
+                std.debug.print("Failed to exec rocksdb-import. Build it with: zig build import\n", .{});
+            }
             return;
         }
 

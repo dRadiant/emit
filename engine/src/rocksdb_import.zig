@@ -135,7 +135,17 @@ fn iterValid(iter: Iterator) bool {
     return c.rocksdb_iter_valid(iter) != 0;
 }
 
-// ── Import entry point ───────────────────────────────────────────────────
+// ── Entry points ─────────────────────────────────────────────────────────
+
+pub fn main() !void {
+    const alloc = std.heap.page_allocator;
+    const args = try std.process.argsAlloc(alloc);
+    if (args.len < 3) {
+        std.debug.print("Usage: rocksdb-import <receipts_db_path> <data_dir>\n", .{});
+        std.process.exit(1);
+    }
+    try run(args[1], args[2]);
+}
 
 pub fn run(receipts_path: [*:0]const u8, output_path: []const u8) !void {
     const allocator = std.heap.page_allocator;
