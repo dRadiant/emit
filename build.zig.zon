@@ -18,6 +18,10 @@
             .hash = "rocksdb-9.7.4-z_CUTg_HAABgQurZzAhpJL5Erij8ZnppTmy3g1LIM8br",
             .lazy = true,
         },
+        .eth_zig = .{
+            .url = "git+https://github.com/StrobeLabs/eth.zig.git?ref=v0.3.0#757ac11ee5e6bf489aa82ff5db05f4b1fca09a21",
+            .hash = "eth_zig-0.3.0-efEm-i65QgC_yawMMg1E1xrc3E8yTZsAlfhj0wJjPyMe",
+        },
     },
     .paths = .{
         "build.zig",
