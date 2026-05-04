@@ -30,7 +30,11 @@ pub fn run(config: FollowConfig) !void {
     var writer = try FlatStoreWriter.open(config.data_dir);
     const dir = try std.fs.cwd().openDir(config.data_dir, .{});
     var ring = try PendingRing.open(dir, alloc);
-    defer ring.deinit();
+    defer {
+        writer.commitMeta() catch {};
+        ring.flush() catch {};
+        ring.deinit();
+    }
 
     if (config.ws_url) |ws_url| ws: {
         std.debug.print("Connecting to {s}...\n", .{ws_url});

@@ -53,7 +53,9 @@ pub fn main() !void {
         }
 
         if (getFlag(args, "--rpc")) |_| {
-            std.debug.print("RPC import not yet implemented.\n", .{});
+            std.debug.print("RPC import is experimental and not yet implemented.\n", .{});
+            std.debug.print("Use --rocksdb for production imports.\n", .{});
+            std.debug.print("RPC import is intended for unsupported chains or remote nodes only.\n", .{});
             return;
         }
 
