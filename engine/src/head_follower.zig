@@ -45,7 +45,9 @@ pub fn run(config: FollowConfig) !void {
 
     std.debug.print("Polling {s} every {d}ms\n", .{ config.rpc_url, config.poll_interval_ms });
     while (true) {
-        followPoll(&provider, &writer, &ring, alloc) catch {};
+        followPoll(&provider, &writer, &ring, alloc) catch |err| {
+            std.debug.print("Poll error: {s}\n", .{@errorName(err)});
+        };
         std.Thread.sleep(config.poll_interval_ms * std.time.ns_per_ms);
     }
 }
