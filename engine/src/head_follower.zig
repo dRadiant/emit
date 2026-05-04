@@ -174,6 +174,7 @@ fn finalizeReady(ring: *PendingRing, writer: *FlatStoreWriter, head: u64, alloc:
         finalized += 1;
     }
     if (finalized > 0) {
+        writer.commitMeta() catch {};
         ring.flush() catch {};
         std.debug.print("Finalized {d} blocks\n", .{finalized});
     }
