@@ -9,7 +9,8 @@ const eth = @import("eth");
 const core = @import("core");
 
 const FlatStoreWriter = @import("flat_writer.zig").FlatStoreWriter;
-const PendingRing = @import("pending_ring.zig").PendingRing;
+const pending_ring = @import("pending_ring.zig");
+const PendingRing = pending_ring.PendingRing;
 const log_serial = core.log_serial;
 const types = core.types;
 
@@ -114,6 +115,15 @@ fn ingestBlock(
 
     const header = try provider.getBlock(block_number) orelse return error.BlockNotFound;
 
+    // Reorg check: does this block's parent hash match what we stored?
+    if (ring.getHash(block_number - 1)) |stored_hash| {
+        if (!std.mem.eql(u8, &stored_hash, &header.parent_hash)) {
+            std.debug.print("Reorg detected at block {d}\n", .{block_number});
+            try resolveReorg(ring, block_number, provider);
+            return;
+        }
+    }
+
     var num_buf: [20]u8 = undefined;
     const hex = try std.fmt.bufPrint(&num_buf, "0x{x}", .{block_number});
     const eth_logs = try provider.getLogs(.{ .fromBlock = hex, .toBlock = hex });
@@ -135,6 +145,22 @@ fn ingestBlock(
 
     try ring.insert(block_number, header.hash, &topic_bloom.bits, &addr_bloom.bits, compress_buf[0..entry_len]);
     std.debug.print("Block {d}: {d} logs\n", .{ block_number, count });
+}
+
+fn resolveReorg(ring: *PendingRing, from: u64, provider: *eth.provider.Provider) !void {
+    // Fetch canonical hashes walking backwards (most reorgs are 1-2 blocks)
+    var canonical: [pending_ring.FINALITY_DEPTH][32]u8 = undefined;
+    const oldest = ring.oldestBlock() orelse return;
+    const depth = @min(from - oldest, pending_ring.FINALITY_DEPTH);
+    for (0..depth) |i| {
+        const hdr = (provider.getBlock(from - 1 - i) catch break) orelse break;
+        canonical[i] = hdr.hash;
+    }
+
+    const fork = ring.findForkPoint(from, canonical[0..depth]);
+    const removed = try ring.truncateFrom(fork);
+    try ring.flush();
+    std.debug.print("Reorg: fork at {d}, removed {d} blocks\n", .{ fork, removed });
 }
 
 /// Move blocks with 64+ confirmations from pending ring to flat store.
