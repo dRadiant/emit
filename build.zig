@@ -23,6 +23,25 @@ pub fn build(b: *std.Build) void {
         .{ .name = "eth", .module = eth_mod },
     };
 
+    // sdk module. lmdbx is lazy: the module is constructed only when a build
+    // step references it via b.lazyDependency. The sdk module is always
+    // declared so user indexers can import "emit-sdk"; lmdbx wiring happens
+    // inside that lazy block.
+    const sdk_mod = b.addModule("sdk", .{
+        .root_source_file = b.path("sdk/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core", .module = core_mod },
+            .{ .name = "lz4", .module = lz4_mod },
+            .{ .name = "eth", .module = eth_mod },
+        },
+    });
+    if (b.lazyDependency("lmdbx", .{ .target = target, .optimize = optimize })) |lmdbx_dep| {
+        sdk_mod.addImport("lmdbx", lmdbx_dep.module("lmdbx"));
+    }
+    sdk_mod.link_libc = true;
+
     // ── Engine binary ────────────────────────────────────────────────────
     const exe = b.addExecutable(.{
         .name = "emit-engine",
