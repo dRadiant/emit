@@ -57,10 +57,14 @@ pub fn build(b: *std.Build) void {
     // ── Tests ────────────────────────────────────────────────────────────
     const test_step = b.step("test", "Run all tests");
 
-    inline for (.{ "core/src/root.zig", "engine/src/root.zig" }) |root| {
+    inline for (.{
+        .{ "core-tests", "core/src/root.zig" },
+        .{ "engine-tests", "engine/src/root.zig" },
+    }) |entry| {
         const t = b.addTest(.{
+            .name = entry[0],
             .root_module = b.createModule(.{
-                .root_source_file = b.path(root),
+                .root_source_file = b.path(entry[1]),
                 .target = target,
                 .optimize = optimize,
                 .imports = engine_imports,
@@ -68,12 +72,15 @@ pub fn build(b: *std.Build) void {
         });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = sdk })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "sdk-tests", .root_module = sdk })).step);
 
-    // Compile-fail harness: each sample MUST fail with stderr containing the
-    // expected substring.
+    // Compile-fail harness: each sample MUST fail with an error line whose
+    // suffix matches `expected`. Zig's expect_errors `.contains` matcher is
+    // line-by-line `endsWith`, not free-form substring; write `expected` as
+    // the tail of the actual @compileError text.
     const compile_fail = [_]struct { path: []const u8, expected: []const u8 }{
         .{ .path = "test/compile_fail/smoke.zig", .expected = "expected: smoke" },
+        .{ .path = "test/compile_fail/append_store_load.zig", .expected = "AppendStore.load is not supported: cannot load append-only entities during backfill" },
     };
     for (compile_fail) |s| {
         const obj = b.addObject(.{
