@@ -1,16 +1,17 @@
 /// AppendStore(T): comptime-generated MDBX writer for append-only entities.
 ///
-/// Writes use MDBX_APPEND (sequential insert, no
-/// B-tree traversal, ~5x faster than upsert). load() is a @compileError —
-/// the API exists so a typo on a CachedStore vs AppendStore choice fails at
-/// compile time, not at runtime.
+/// Writes use MDBX_APPEND (sequential insert, no B-tree traversal,
+/// ~5x faster than upsert). load() is a @compileError — the API exists so
+/// a typo on a CachedStore vs AppendStore choice fails at compile time, not
+/// at runtime.
 ///
 /// Key encoding is big-endian for integer fields so MDBX byte order matches
-/// numeric order. Fixed-size arrays pass through unchanged:
-/// callers construct their primary keys (event IDs,
-/// addresses) with the byte layout they want.
+/// numeric order. Fixed-size arrays pass through unchanged: callers
+/// construct their primary keys (event IDs, addresses) with the byte layout
+/// they want.
 const std = @import("std");
 const lmdbx = @import("lmdbx");
+const entity_serial = @import("entity_serial.zig");
 
 /// SDK-stable error for an out-of-order save. Decoupled from lmdbx-zig's
 /// MDBX_EKEYMISMATCH so wrapper or upstream renames don't leak.
@@ -20,13 +21,8 @@ pub fn AppendStore(comptime T: type) type {
     const fields = @typeInfo(T).@"struct".fields;
     if (fields.len == 0) @compileError("AppendStore: entity '" ++ @typeName(T) ++ "' has no fields. The first field must be the primary key.");
 
-    const KeyField = fields[0].type;
-    const KEY_SIZE = sizeOfFixed(KeyField, @typeName(T) ++ "." ++ fields[0].name);
-    const VALUE_SIZE = comptime blk: {
-        var n: usize = 0;
-        for (fields) |f| n += sizeOfFixed(f.type, @typeName(T) ++ "." ++ f.name);
-        break :blk n;
-    };
+    const KEY_SIZE = entity_serial.fixedSize(fields[0].type, @typeName(T) ++ "." ++ fields[0].name);
+    const VALUE_SIZE = entity_serial.entitySize(T);
 
     return struct {
         const Self = @This();
@@ -44,8 +40,8 @@ pub fn AppendStore(comptime T: type) type {
         pub fn save(self: Self, txn: lmdbx.Transaction, entity: T) AppendError!void {
             var key_buf: [KEY_SIZE]u8 = undefined;
             var val_buf: [VALUE_SIZE]u8 = undefined;
-            serializeKey(entity, &key_buf);
-            serialize(entity, &val_buf);
+            entity_serial.serializeKey(T, entity, &key_buf);
+            entity_serial.serialize(T, entity, &val_buf);
             const db = lmdbx.Database{ .txn = txn, .dbi = self.dbi };
             db.set(&key_buf, &val_buf, .Append) catch |err| switch (err) {
                 error.MDBX_EKEYMISMATCH, error.MDBX_KEYEXIST => return error.KeyOutOfOrder,
@@ -64,58 +60,16 @@ pub fn AppendStore(comptime T: type) type {
         pub fn flush(_: Self, _: lmdbx.Transaction) void {}
 
         pub fn serializeKey(entity: T, out: *[KEY_SIZE]u8) void {
-            writeField(KeyField, @field(entity, fields[0].name), out, .big);
+            entity_serial.serializeKey(T, entity, out);
         }
 
         pub fn serialize(entity: T, out: *[VALUE_SIZE]u8) void {
-            var pos: usize = 0;
-            inline for (fields) |f| {
-                const sz = comptime sizeOfFixed(f.type, @typeName(T) ++ "." ++ f.name);
-                writeField(f.type, @field(entity, f.name), out[pos..][0..sz], .little);
-                pos += sz;
-            }
+            entity_serial.serialize(T, entity, out);
         }
 
         pub fn deserialize(buf: *const [VALUE_SIZE]u8) T {
-            var entity: T = undefined;
-            var pos: usize = 0;
-            inline for (fields) |f| {
-                const sz = comptime sizeOfFixed(f.type, @typeName(T) ++ "." ++ f.name);
-                @field(entity, f.name) = readField(f.type, buf[pos..][0..sz], .little);
-                pos += sz;
-            }
-            return entity;
+            return entity_serial.deserialize(T, buf);
         }
-    };
-}
-
-// ── Comptime field helpers ───────────────────────────────────────────────
-
-fn sizeOfFixed(comptime F: type, comptime ctx: []const u8) comptime_int {
-    return switch (@typeInfo(F)) {
-        .int => @sizeOf(F),
-        .array => |a| if (@typeInfo(a.child) == .int and @sizeOf(a.child) == 1) a.len else @compileError(
-            "AppendStore: field '" ++ ctx ++ "' is array of '" ++ @typeName(a.child) ++ "'; only [N]u8 arrays are supported",
-        ),
-        else => @compileError(
-            "AppendStore: field '" ++ ctx ++ "' has type '" ++ @typeName(F) ++ "'; only ints and fixed-size [N]u8 arrays are supported",
-        ),
-    };
-}
-
-fn writeField(comptime F: type, value: F, out: []u8, endian: std.builtin.Endian) void {
-    switch (@typeInfo(F)) {
-        .int => std.mem.writeInt(F, out[0..@sizeOf(F)], value, endian),
-        .array => @memcpy(out[0..@sizeOf(F)], &value),
-        else => unreachable,
-    }
-}
-
-fn readField(comptime F: type, in: []const u8, endian: std.builtin.Endian) F {
-    return switch (@typeInfo(F)) {
-        .int => std.mem.readInt(F, in[0..@sizeOf(F)], endian),
-        .array => in[0..@sizeOf(F)].*,
-        else => unreachable,
     };
 }
 
@@ -187,20 +141,18 @@ test "save monotonic and out-of-order against MDBX" {
     const env = try lmdbx.Environment.init(@ptrCast(&path_z), .{ .max_dbs = 4 });
     defer env.deinit() catch {};
 
-    {
-        const txn = try env.transaction(.{});
-        const store = try S.open(txn, "events");
+    const txn = try env.transaction(.{});
+    const store = try S.open(txn, "events");
 
-        try store.save(txn, .{ .id = idKey(1, 0), .value = 100 });
-        try store.save(txn, .{ .id = idKey(1, 1), .value = 101 });
-        try store.save(txn, .{ .id = idKey(2, 0), .value = 200 });
+    try store.save(txn, .{ .id = idKey(1, 0), .value = 100 });
+    try store.save(txn, .{ .id = idKey(1, 1), .value = 101 });
+    try store.save(txn, .{ .id = idKey(2, 0), .value = 200 });
 
-        // Out-of-order: id (1, 2) is less than the just-inserted (2, 0).
-        const out_of_order = store.save(txn, .{ .id = idKey(1, 2), .value = 102 });
-        try std.testing.expectError(error.KeyOutOfOrder, out_of_order);
+    // Out-of-order: id (1, 2) is less than the just-inserted (2, 0).
+    const out_of_order = store.save(txn, .{ .id = idKey(1, 2), .value = 102 });
+    try std.testing.expectError(error.KeyOutOfOrder, out_of_order);
 
-        try txn.commit();
-    }
+    try txn.commit();
 }
 
 fn idKey(block: u32, log_index: u32) [8]u8 {

@@ -2,10 +2,12 @@
 ///
 /// Built on top of core (flat-store reading) and lmdbx (entity stores +
 /// filtered index).
+pub const entity_serial = @import("entity_serial.zig");
 pub const append_store = @import("append_store.zig");
 pub const AppendStore = append_store.AppendStore;
 pub const AppendError = append_store.AppendError;
 
 test {
+    _ = entity_serial;
     _ = append_store;
 }
