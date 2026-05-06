@@ -81,6 +81,9 @@ pub fn build(b: *std.Build) void {
     const compile_fail = [_]struct { path: []const u8, expected: []const u8 }{
         .{ .path = "test/compile_fail/smoke.zig", .expected = "expected: smoke" },
         .{ .path = "test/compile_fail/append_store_load.zig", .expected = "AppendStore.load is not supported: cannot load append-only entities during backfill" },
+        .{ .path = "test/compile_fail/entity_not_struct.zig", .expected = "is not a struct. Entities must be plain data structs whose first field is the primary key." },
+        .{ .path = "test/compile_fail/entity_empty.zig", .expected = "has no fields. The first field must be the primary key." },
+        .{ .path = "test/compile_fail/entities_not_marker.zig", .expected = "is not a marker produced by sdk.mutable() or sdk.appendOnly()" },
     };
     for (compile_fail) |s| {
         const obj = b.addObject(.{
