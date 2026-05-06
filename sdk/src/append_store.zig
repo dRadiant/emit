@@ -1,8 +1,8 @@
 /// AppendStore(T): comptime-generated MDBX writer for append-only entities.
 ///
 /// Writes use MDBX_APPEND (sequential insert, no B-tree traversal,
-/// ~5x faster than upsert). load() is a @compileError — the API exists so
-/// a typo on a CachedStore vs AppendStore choice fails at compile time, not
+/// ~5x faster than upsert). load() is a @compileError. The API exists so a
+/// typo on a CachedStore vs AppendStore choice fails at compile time, not
 /// at runtime.
 ///
 /// Key encoding is big-endian for integer fields so MDBX byte order matches
