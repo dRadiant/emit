@@ -4,43 +4,37 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const lz4_dep = b.dependency("lz4", .{ .target = target, .optimize = optimize });
-    const lz4_mod = lz4_dep.module("lz4");
-    const eth_dep = b.dependency("eth_zig", .{ .target = target, .optimize = optimize });
-    const eth_mod = eth_dep.module("eth");
+    const lz4 = b.dependency("lz4", .{ .target = target, .optimize = optimize }).module("lz4");
+    const eth = b.dependency("eth_zig", .{ .target = target, .optimize = optimize }).module("eth");
 
     // ── Modules ──────────────────────────────────────────────────────────
-    const core_mod = b.addModule("core", .{
+    const core = b.addModule("core", .{
         .root_source_file = b.path("core/src/root.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "lz4", .module = lz4_mod }},
+        .imports = &.{.{ .name = "lz4", .module = lz4 }},
     });
 
-    const engine_imports: []const std.Build.Module.Import = &.{
-        .{ .name = "core", .module = core_mod },
-        .{ .name = "lz4", .module = lz4_mod },
-        .{ .name = "eth", .module = eth_mod },
-    };
-
-    // sdk module. lmdbx is lazy: the module is constructed only when a build
-    // step references it via b.lazyDependency. The sdk module is always
-    // declared so user indexers can import "emit-sdk"; lmdbx wiring happens
-    // inside that lazy block.
-    const sdk_mod = b.addModule("sdk", .{
+    const sdk = b.addModule("sdk", .{
         .root_source_file = b.path("sdk/src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
         .imports = &.{
-            .{ .name = "core", .module = core_mod },
-            .{ .name = "lz4", .module = lz4_mod },
-            .{ .name = "eth", .module = eth_mod },
+            .{ .name = "core", .module = core },
+            .{ .name = "lz4", .module = lz4 },
+            .{ .name = "eth", .module = eth },
         },
     });
-    if (b.lazyDependency("lmdbx", .{ .target = target, .optimize = optimize })) |lmdbx_dep| {
-        sdk_mod.addImport("lmdbx", lmdbx_dep.module("lmdbx"));
+    if (b.lazyDependency("lmdbx", .{ .target = target, .optimize = optimize })) |dep| {
+        sdk.addImport("lmdbx", dep.module("lmdbx"));
     }
-    sdk_mod.link_libc = true;
+
+    const engine_imports: []const std.Build.Module.Import = &.{
+        .{ .name = "core", .module = core },
+        .{ .name = "lz4", .module = lz4 },
+        .{ .name = "eth", .module = eth },
+    };
 
     // ── Engine binary ────────────────────────────────────────────────────
     const exe = b.addExecutable(.{
@@ -74,10 +68,30 @@ pub fn build(b: *std.Build) void {
         });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = sdk })).step);
+
+    // Compile-fail harness: each sample MUST fail with stderr containing the
+    // expected substring.
+    const compile_fail = [_]struct { path: []const u8, expected: []const u8 }{
+        .{ .path = "test/compile_fail/smoke.zig", .expected = "expected: smoke" },
+    };
+    for (compile_fail) |s| {
+        const obj = b.addObject(.{
+            .name = std.fs.path.stem(s.path),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(s.path),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "sdk", .module = sdk }},
+            }),
+        });
+        obj.expect_errors = .{ .contains = s.expected };
+        test_step.dependOn(&obj.step);
+    }
 
     // ── RocksDB import (lazy dep, only built on request) ─────────────────
     const import_step = b.step("import", "Build the RocksDB import tool");
-    if (b.lazyDependency("rocksdb", .{ .target = target, .optimize = optimize, .enable_snappy = true })) |rocksdb_dep| {
+    if (b.lazyDependency("rocksdb", .{ .target = target, .optimize = optimize, .enable_snappy = true })) |dep| {
         const import_exe = b.addExecutable(.{
             .name = "rocksdb-import",
             .root_module = b.createModule(.{
@@ -85,9 +99,9 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
                 .imports = &.{
-                    .{ .name = "core", .module = core_mod },
-                    .{ .name = "lz4", .module = lz4_mod },
-                    .{ .name = "rocksdb", .module = rocksdb_dep.module("rocksdb") },
+                    .{ .name = "core", .module = core },
+                    .{ .name = "lz4", .module = lz4 },
+                    .{ .name = "rocksdb", .module = dep.module("rocksdb") },
                 },
             }),
         });
