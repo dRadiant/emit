@@ -84,6 +84,7 @@ pub fn build(b: *std.Build) void {
         .{ .path = "test/compile_fail/entity_not_struct.zig", .expected = "is not a struct. Entities must be plain data structs whose first field is the primary key." },
         .{ .path = "test/compile_fail/entity_empty.zig", .expected = "has no fields. The first field must be the primary key." },
         .{ .path = "test/compile_fail/entities_not_marker.zig", .expected = "is not a marker produced by sdk.mutable() or sdk.appendOnly()" },
+        .{ .path = "test/compile_fail/event_missing_signature.zig", .expected = "must declare `pub const signature = \"Name(types,...)\";`. The SDK derives topic0 and name from it." },
     };
     for (compile_fail) |s| {
         const obj = b.addObject(.{
