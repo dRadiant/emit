@@ -58,69 +58,16 @@ pub fn AppendStore(comptime T: type) type {
         }
 
         pub fn flush(_: Self, _: lmdbx.Transaction) void {}
-
-        pub fn serializeKey(entity: T, out: *[KEY_SIZE]u8) void {
-            entity_serial.serializeKey(T, entity, out);
-        }
-
-        pub fn serialize(entity: T, out: *[VALUE_SIZE]u8) void {
-            entity_serial.serialize(T, entity, out);
-        }
-
-        pub fn deserialize(buf: *const [VALUE_SIZE]u8) T {
-            return entity_serial.deserialize(T, buf);
-        }
     };
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
 
 test "comptime sizes" {
-    const E = struct {
-        id: [8]u8,
-        addr: [20]u8,
-        value: u256,
-        block: u64,
-    };
+    const E = struct { id: [8]u8, addr: [20]u8, value: u256, block: u64 };
     const S = AppendStore(E);
     try std.testing.expectEqual(@as(usize, 8), S.key_size);
     try std.testing.expectEqual(@as(usize, 8 + 20 + 32 + 8), S.value_size);
-}
-
-test "serialize roundtrip" {
-    const E = struct {
-        id: [8]u8,
-        addr: [20]u8,
-        value: u256,
-        block: u64,
-    };
-    const S = AppendStore(E);
-    const original = E{
-        .id = [_]u8{ 0, 0, 0, 1, 0, 0, 0, 7 },
-        .addr = [_]u8{0xAB} ** 20,
-        .value = 0x1122334455667788,
-        .block = 18_600_100,
-    };
-    var key_buf: [S.key_size]u8 = undefined;
-    var val_buf: [S.value_size]u8 = undefined;
-    S.serializeKey(original, &key_buf);
-    S.serialize(original, &val_buf);
-    try std.testing.expectEqualSlices(u8, &original.id, &key_buf);
-    const restored = S.deserialize(&val_buf);
-    try std.testing.expectEqualSlices(u8, &original.id, &restored.id);
-    try std.testing.expectEqualSlices(u8, &original.addr, &restored.addr);
-    try std.testing.expectEqual(original.value, restored.value);
-    try std.testing.expectEqual(original.block, restored.block);
-}
-
-test "integer key serializes big-endian for monotonic byte order" {
-    const E = struct { id: u64, payload: u32 };
-    const S = AppendStore(E);
-    var key_a: [8]u8 = undefined;
-    var key_b: [8]u8 = undefined;
-    S.serializeKey(.{ .id = 100, .payload = 0 }, &key_a);
-    S.serializeKey(.{ .id = 101, .payload = 0 }, &key_b);
-    try std.testing.expect(std.mem.lessThan(u8, &key_a, &key_b));
 }
 
 test "save monotonic and out-of-order against MDBX" {

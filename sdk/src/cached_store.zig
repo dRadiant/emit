@@ -53,7 +53,7 @@ pub fn CachedStore(comptime T: type) type {
             entity_serial.encodeKey(KeyField, key, &key_buf);
             const db = lmdbx.Database{ .txn = txn, .dbi = self.dbi };
             const data = (try db.get(&key_buf)) orelse return null;
-            if (data.len < VALUE_SIZE) return error.MalformedEntity;
+            if (data.len != VALUE_SIZE) return error.MalformedEntity;
             const entity = entity_serial.deserialize(T, data[0..VALUE_SIZE]);
             try self.cache.put(key, .{ .entity = entity, .dirty = false });
             return entity;
