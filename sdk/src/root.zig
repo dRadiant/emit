@@ -1,51 +1,68 @@
 /// emit sdk. Library for user indexer projects.
 ///
-/// Built on top of core (flat-store reading) and lmdbx (entity stores +
-/// filtered index).
+/// User code should reach for `sdk.run`, `sdk.init`, `sdk.mutable`,
+/// `sdk.appendOnly`, the manifest types (`Manifest`, `ContractDef`,
+/// `FactoryDef`, `AddressParam`), `DecodedLog`, `Context`, `Options`, and
+/// `RunStats`. Everything else is implementation detail.
 const std = @import("std");
 
-// Submodules.
-pub const append_store = @import("append_store.zig");
-pub const block_context = @import("block_context.zig");
-pub const cached_store = @import("cached_store.zig");
-pub const entity_serial = @import("entity_serial.zig");
-pub const filter_builder = @import("filter_builder.zig");
-pub const handler = @import("handler.zig");
+// Implementation modules. Kept private so the user-facing surface stays
+// small. Reach for the re-exports below instead.
+const append_store = @import("append_store.zig");
+const cached_store = @import("cached_store.zig");
+const entity_serial = @import("entity_serial.zig");
+const entry = @import("entry.zig");
+const filter_builder = @import("filter_builder.zig");
+const handler = @import("handler.zig");
+const scanner = @import("scanner.zig");
+
+// Public submodules: handler-helper utilities the user calls by name.
 pub const humanize = @import("humanize.zig");
 pub const manifest = @import("manifest.zig");
-pub const scanner = @import("scanner.zig");
 
-// Top-level re-exports for the user-facing API.
+// User-facing top-level surface.
 pub const AddressParam = manifest.AddressParam;
-pub const AppendError = append_store.AppendError;
-pub const AppendStore = append_store.AppendStore;
-pub const BlockContext = block_context.BlockContext;
-pub const CachedStore = cached_store.CachedStore;
+pub const Context = entry.Context;
 pub const ContractDef = manifest.ContractDef;
 pub const DecodedLog = handler.DecodedLog;
 pub const FactoryDef = manifest.FactoryDef;
+pub const init = entry.init;
 pub const Manifest = manifest.Manifest;
+pub const Options = entry.Options;
+pub const run = entry.run;
+pub const RunStats = entry.RunStats;
 
-/// Storage-mode marker for a mutable entity. The user passes
-/// `sdk.mutable(Account)` in the entities tuple at the `sdk.run()` call
-/// site. `BlockContext` reads `marker.Store` to generate a
-/// `CachedStore(Account)` field at comptime.
+/// Storage-mode marker for a mutable entity. Pass `sdk.mutable(Account)`
+/// in the entities tuple at the `sdk.run` call site; the SDK reads
+/// `marker.Store` to generate the `Context.stores.<name>` field at
+/// comptime.
 pub fn mutable(comptime T: type) type {
     validateEntity(T);
     return struct {
         pub const Entity = T;
-        pub const Store = CachedStore(T);
+        pub const Store = cached_store.CachedStore(T);
     };
 }
 
 /// Storage-mode marker for an append-only entity. See `mutable` for the
-/// usage shape. `Store` resolves to `AppendStore(T)`.
+/// usage shape. `Store` resolves to `AppendStore(T)` (writes use
+/// `MDBX_APPEND`; `load` is a `@compileError`).
 pub fn appendOnly(comptime T: type) type {
     validateEntity(T);
     return struct {
         pub const Entity = T;
-        pub const Store = AppendStore(T);
+        pub const Store = append_store.AppendStore(T);
     };
+}
+
+/// Comptime check that `Handler` exposes the required `handle<EventName>`
+/// methods for every event declared in `m`. `sdk.run` runs the same check
+/// internally; this helper lets users surface the error at the top of their
+/// build (e.g. in a `comptime { sdk.validateHandler(...) }` block) instead
+/// of waiting for the full dependency graph to compile.
+pub fn validateHandler(comptime m: Manifest, comptime Handler: type) void {
+    const D = handler.dispatcherFor(m);
+    D.validateHandler(Handler);
 }
 
 /// Comptime check that `T` is a non-empty struct. Per-field type checks
@@ -61,26 +78,6 @@ fn validateEntity(comptime T: type) void {
     );
 }
 
-/// Comptime check that every element of `entities` is a marker produced by
-/// `mutable` or `appendOnly`. A marker is identified by the presence of
-/// both `Entity` and `Store` decls.
-pub fn validateEntityTuple(comptime entities: anytype) void {
-    const E = @TypeOf(entities);
-    const info = @typeInfo(E);
-    if (info != .@"struct" or !info.@"struct".is_tuple) @compileError(
-        "sdk: entities argument must be a tuple of sdk.mutable(T) / sdk.appendOnly(T) markers, got '" ++ @typeName(E) ++ "'",
-    );
-    inline for (info.@"struct".fields, 0..) |f, i| {
-        const Marker = @field(entities, f.name);
-        if (@TypeOf(Marker) != type or !@hasDecl(Marker, "Entity") or !@hasDecl(Marker, "Store")) {
-            @compileError(std.fmt.comptimePrint(
-                "sdk: entities[{d}] is not a marker produced by sdk.mutable() or sdk.appendOnly()",
-                .{i},
-            ));
-        }
-    }
-}
-
 test {
     _ = entity_serial;
     _ = append_store;
@@ -88,9 +85,9 @@ test {
     _ = manifest;
     _ = humanize;
     _ = handler;
-    _ = block_context;
     _ = filter_builder;
     _ = scanner;
+    _ = entry;
 }
 
 test "mutable and appendOnly produce distinct Store aliases" {
@@ -99,21 +96,15 @@ test "mutable and appendOnly produce distinct Store aliases" {
     const App = appendOnly(E);
     try std.testing.expectEqual(E, Mut.Entity);
     try std.testing.expectEqual(E, App.Entity);
-    try std.testing.expectEqual(CachedStore(E), Mut.Store);
-    try std.testing.expectEqual(AppendStore(E), App.Store);
+    try std.testing.expectEqual(cached_store.CachedStore(E), Mut.Store);
+    try std.testing.expectEqual(append_store.AppendStore(E), App.Store);
 }
 
-test "validateEntityTuple accepts a valid mix of markers" {
+test "Context.stores derives one typed field per entity" {
     const A = struct { id: [20]u8, balance: u256 };
     const B = struct { id: [8]u8, value: u64 };
-    validateEntityTuple(.{ mutable(A), appendOnly(B) });
-}
-
-test "BlockContext built from mutable + appendOnly exposes typed stores" {
-    const A = struct { id: [20]u8, balance: u256 };
-    const B = struct { id: [8]u8, value: u64 };
-    const Ctx = BlockContext(.{ mutable(A), appendOnly(B) });
+    const Ctx = Context(.{ mutable(A), appendOnly(B) });
     const Stores = std.meta.fieldInfo(Ctx, .stores).type;
-    try std.testing.expectEqual(CachedStore(A), @FieldType(Stores, "as"));
-    try std.testing.expectEqual(AppendStore(B), @FieldType(Stores, "bs"));
+    try std.testing.expectEqual(cached_store.CachedStore(A), @FieldType(Stores, "as"));
+    try std.testing.expectEqual(append_store.AppendStore(B), @FieldType(Stores, "bs"));
 }

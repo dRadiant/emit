@@ -1,6 +1,6 @@
 // expected: both derive store field name 'items'. Rename one of the entity types.
 //
-// BlockContext rejects two entity types whose basenames lowercase-collide.
+// sdk.Context rejects two entity types whose basenames lowercase-collide.
 
 const sdk = @import("sdk");
 
@@ -13,7 +13,7 @@ const Holder2 = struct {
 };
 
 comptime {
-    _ = sdk.BlockContext(.{
+    _ = sdk.Context(.{
         sdk.mutable(Holder1.Item),
         sdk.mutable(Holder2.Item),
     });

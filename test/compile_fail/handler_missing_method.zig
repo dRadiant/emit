@@ -1,6 +1,6 @@
 // expected: is missing method `handleTransfer` for event `Transfer(address,address,uint256)`. Add `pub fn handleTransfer(log: sdk.DecodedLog, ctx: *Ctx) !void { ... }`.
 //
-// dispatcher's validateHandler rejects handlers missing required methods.
+// The SDK rejects handlers missing required methods at compile time.
 
 const sdk = @import("sdk");
 
@@ -22,6 +22,5 @@ const TestManifest: sdk.Manifest = .{
 const Bad = struct {};
 
 comptime {
-    const D = sdk.handler.dispatcherFor(TestManifest);
-    D.validateHandler(Bad);
+    sdk.validateHandler(TestManifest, Bad);
 }
