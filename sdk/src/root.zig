@@ -13,6 +13,7 @@ pub const filter_builder = @import("filter_builder.zig");
 pub const handler = @import("handler.zig");
 pub const humanize = @import("humanize.zig");
 pub const manifest = @import("manifest.zig");
+pub const scanner = @import("scanner.zig");
 
 // Top-level re-exports for the user-facing API.
 pub const AddressParam = manifest.AddressParam;
@@ -89,6 +90,7 @@ test {
     _ = handler;
     _ = block_context;
     _ = filter_builder;
+    _ = scanner;
 }
 
 test "mutable and appendOnly produce distinct Store aliases" {
