@@ -19,6 +19,7 @@ pub fn CachedStore(comptime T: type) type {
     if (fields.len == 0) @compileError("CachedStore: entity '" ++ @typeName(T) ++ "' has no fields. The first field must be the primary key.");
 
     const KeyField = fields[0].type;
+    const key_field_name = fields[0].name;
     const KEY_SIZE = entity_serial.fixedSize(KeyField, @typeName(T) ++ "." ++ fields[0].name);
     const VALUE_SIZE = entity_serial.entitySize(T);
 
@@ -66,7 +67,27 @@ pub fn CachedStore(comptime T: type) type {
             return entity;
         }
 
-        pub fn save(self: *Self, key: KeyField, entity: T) !void {
+        /// Load `key`, or initialize a fresh entity with all fields zeroed
+        /// and the primary-key field set to `key`. The fresh entity is
+        /// inserted dirty so it persists at the next flush.
+        ///
+        /// Use this for the common "credit/debit a counter" pattern where
+        /// the per-field starting value is zero (balances, counters, etc.).
+        /// For richer defaults, fall back to `(try load(k)) orelse build(k)`
+        /// and explicit `save`.
+        pub fn loadOrInit(self: *Self, key: KeyField) !T {
+            if (try self.load(key)) |existing| return existing;
+            var entity = std.mem.zeroes(T);
+            @field(entity, key_field_name) = key;
+            try self.cache.put(key, .{ .entity = entity, .dirty = true });
+            return entity;
+        }
+
+        /// Save derives the primary key from `entity`'s first field. Single-arg
+        /// save matches `AppendStore.save(entity)` so the two store types feel
+        /// uniform from a handler's perspective.
+        pub fn save(self: *Self, entity: T) !void {
+            const key = @field(entity, key_field_name);
             try self.cache.put(key, .{ .entity = entity, .dirty = true });
         }
 
@@ -118,7 +139,7 @@ test "load after save returns cached value without touching MDBX" {
     defer store.deinit();
 
     const alice = [_]u8{0xAA} ** 20;
-    try store.save(alice, .{ .id = alice, .balance = 100 });
+    try store.save(.{ .id = alice, .balance = 100 });
     // Nothing flushed yet, so MDBX is empty. If load went to MDBX it would
     // miss. The cache hit is the only path that returns a value.
     const got = (try store.load(alice)).?;
@@ -142,7 +163,7 @@ test "flush writes only dirty entries" {
         var store = try S.open(std.testing.allocator, &current_txn, "accounts");
         defer store.deinit();
 
-        try store.save(alice, .{ .id = alice, .balance = 100 });
+        try store.save(.{ .id = alice, .balance = 100 });
         try store.flush();
         try current_txn.commit();
     }
@@ -158,7 +179,7 @@ test "flush writes only dirty entries" {
         const alice_loaded = (try store.load(alice)).?;
         try std.testing.expectEqual(@as(u256, 100), alice_loaded.balance);
 
-        try store.save(bob, .{ .id = bob, .balance = 200 });
+        try store.save(.{ .id = bob, .balance = 200 });
         try store.flush();
 
         // Read both keys directly from MDBX (bypassing the cache) to verify
@@ -187,7 +208,7 @@ test "cache survives flush, commit, and a new transaction" {
     var store = try S.open(std.testing.allocator, &current_txn, "accounts");
     defer store.deinit();
 
-    try store.save(alice, .{ .id = alice, .balance = 100 });
+    try store.save(.{ .id = alice, .balance = 100 });
     try std.testing.expectEqual(@as(u32, 1), store.count());
     try store.flush();
     try current_txn.commit();
@@ -200,5 +221,36 @@ test "cache survives flush, commit, and a new transaction" {
     current_txn = try env.transaction(.{});
     const got = (try store.load(alice)).?;
     try std.testing.expectEqual(@as(u256, 100), got.balance);
+    try current_txn.abort();
+}
+
+test "loadOrInit returns existing entity, else zeroed entity with key set" {
+    const S = CachedStore(Account);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const env = try openTestEnv(&tmp);
+    defer env.deinit() catch {};
+
+    var current_txn = try env.transaction(.{});
+    var store = try S.open(std.testing.allocator, &current_txn, "accounts");
+    defer store.deinit();
+
+    const alice = [_]u8{0xAA} ** 20;
+    const bob = [_]u8{0xBB} ** 20;
+
+    try store.save(.{ .id = alice, .balance = 100 });
+
+    // Existing key returns existing entity unchanged.
+    const got_alice = try store.loadOrInit(alice);
+    try std.testing.expectEqual(@as(u256, 100), got_alice.balance);
+
+    // Missing key returns a zeroed entity with the primary key field set,
+    // and inserts it dirty so a subsequent load finds it.
+    const got_bob = try store.loadOrInit(bob);
+    try std.testing.expectEqualSlices(u8, &bob, &got_bob.id);
+    try std.testing.expectEqual(@as(u256, 0), got_bob.balance);
+    const reload = (try store.load(bob)).?;
+    try std.testing.expectEqualSlices(u8, &bob, &reload.id);
+
     try current_txn.abort();
 }

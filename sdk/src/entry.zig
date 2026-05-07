@@ -339,13 +339,13 @@ const TransferHandler = struct {
         const value: u64 = std.mem.readInt(u64, log.data[24..32], .big);
 
         if (!std.mem.eql(u8, &from, &([_]u8{0} ** 20))) {
-            var sender = (try ctx.stores.accounts.load(from)) orelse Account{ .id = from, .balance = 0 };
+            var sender = try ctx.stores.accounts.loadOrInit(from);
             sender.balance -%= value;
-            try ctx.stores.accounts.save(from, sender);
+            try ctx.stores.accounts.save(sender);
         }
-        var receiver = (try ctx.stores.accounts.load(to)) orelse Account{ .id = to, .balance = 0 };
+        var receiver = try ctx.stores.accounts.loadOrInit(to);
         receiver.balance +%= value;
-        try ctx.stores.accounts.save(to, receiver);
+        try ctx.stores.accounts.save(receiver);
     }
 };
 
