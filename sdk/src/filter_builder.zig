@@ -1,15 +1,20 @@
 /// Filtered-index builder. Reads the engine's flat log store via `core`,
-/// keeps logs that match the manifest's static address-and-topic union OR
-/// the manifest's factory child-event topic union, and writes the matching
-/// blocks (LZ4-compressed) into a single MDBX BLOCKS DBI keyed by block
-/// number (u64 BE). Per ADR-002.
+/// keeps logs that match the manifest, and writes them into the
+/// `filtered_index.mdbx` env's BLOCKS_PRIMARY (and optional BLOCKS_CHILDREN)
+/// DBI keyed by block number (u64 BE). Per ADR-002.
 ///
-/// Per-log keep rule:
-///   keep = (log.address ∈ knownAddresses AND log.topics[0] ∈ allEventTopics)
-///        OR (log.topics[0] ∈ childEventTopics)
-/// The first branch catches static and factory-creation events. The second
-/// admits child events from any address; Group 6's main pass narrows by the
-/// pre-pass-discovered child set.
+/// Two entry points:
+///   - `build`: phase 1, writes BLOCKS_PRIMARY for static + factory addresses.
+///   - `appendChildren`: phase 3, writes BLOCKS_CHILDREN for addresses
+///     discovered by the scanner's factory pre-pass. No-op when the
+///     discovered set is empty.
+///
+/// Per-log keep rule (uniform across both phases via the `Filter` struct):
+///   keep = (address ∈ filter.match_addrs)
+///       AND (topic0 ∈ filter.match_topics)
+///       AND (address ∉ filter.exclude_addrs)
+/// Phase 1 sets exclude_addrs empty; phase 3 sets it to static∪factory so a
+/// static contract that's also a factory child does not appear in both DBIs.
 const std = @import("std");
 const builtin = @import("builtin");
 const lmdbx = @import("lmdbx");
@@ -35,6 +40,9 @@ pub const COMMIT_BLOCKS = 10_000;
 /// thread spin-up cost is larger than the parallel speedup.
 pub const PARALLEL_THRESHOLD = 1_000;
 
+pub const DBI_PRIMARY = "blocks_primary";
+pub const DBI_CHILDREN = "blocks_children";
+
 pub const BuildResult = struct {
     blocks_scanned: u64 = 0,
     blocks_matched: u64 = 0,
@@ -52,8 +60,17 @@ pub fn blockFromKey(key: []const u8) u64 {
     return std.mem.readInt(u64, key[0..KEY_SIZE], .big);
 }
 
-/// Build the filtered index at `dest_path` (an MDBX env directory) from the
-/// engine's flat store. Caller owns `reader`. The destination directory
+/// Per-log keep predicate. `match_addrs` and `match_topics` are positive
+/// match sets; `exclude_addrs` is a negative filter applied after positives
+/// pass. Used by both `build` (phase 1) and `appendChildren` (phase 3).
+const Filter = struct {
+    match_addrs: []const [20]u8,
+    match_topics: []const [32]u8,
+    exclude_addrs: []const [20]u8,
+};
+
+/// Phase 1: build BLOCKS_PRIMARY at `dest_path` from the manifest's static
+/// and factory addresses. Caller owns `reader`. The destination directory
 /// must exist; if it already contains data the build will fail at
 /// `MDBX_APPEND` time.
 pub fn build(
@@ -62,23 +79,81 @@ pub fn build(
     dest_path: [*:0]const u8,
     allocator: std.mem.Allocator,
 ) !BuildResult {
+    const known_addresses = comptime collectKnownAddresses(m);
+    const all_topics = comptime collectAllTopics(m);
+    return runPhase(
+        reader,
+        known_addresses,
+        m.start_block,
+        .{
+            .match_addrs = known_addresses,
+            .match_topics = all_topics,
+            .exclude_addrs = &.{},
+        },
+        dest_path,
+        DBI_PRIMARY,
+        allocator,
+    );
+}
+
+/// Phase 3: walk the engine's flat store filtered by the
+/// scanner-discovered child addresses, write matching child-event logs to
+/// `BLOCKS_CHILDREN` in the existing env at `dest_path`. Returns a zero
+/// BuildResult immediately when `child_addresses` is empty. The per-log
+/// filter excludes addresses already in `static∪factory` so a static
+/// contract that's also a factory child does not produce duplicate entries
+/// across DBIs.
+pub fn appendChildren(
+    reader: *const FlatStoreReader,
+    comptime m: sdk_manifest.Manifest,
+    child_addresses: []const [20]u8,
+    dest_path: [*:0]const u8,
+    allocator: std.mem.Allocator,
+) !BuildResult {
+    if (child_addresses.len == 0) return .{};
+
+    const known_addresses = comptime collectKnownAddresses(m);
+    const child_topics = comptime collectChildTopics(m);
+    if (child_topics.len == 0) return .{};
+
+    return runPhase(
+        reader,
+        child_addresses,
+        m.start_block,
+        .{
+            .match_addrs = child_addresses,
+            .match_topics = child_topics,
+            .exclude_addrs = known_addresses,
+        },
+        dest_path,
+        DBI_CHILDREN,
+        allocator,
+    );
+}
+
+/// Shared phase runner. `bloom_addresses` is what we feed the bloom scan
+/// (block-level prefilter); `filter` is the per-log keep predicate
+/// (post-decompression precision filter). `dbi_name` is the DBI to write
+/// into; the env at `dest_path` is opened with `max_dbs = 2`.
+fn runPhase(
+    reader: *const FlatStoreReader,
+    bloom_addresses: []const [20]u8,
+    start_block: u64,
+    filter: Filter,
+    dest_path: [*:0]const u8,
+    dbi_name: [*:0]const u8,
+    allocator: std.mem.Allocator,
+) !BuildResult {
     var result = BuildResult{};
     var timer = try std.time.Timer.start();
 
-    const known_addresses = comptime collectKnownAddresses(m);
-    const all_topics = comptime collectAllTopics(m);
-    const child_topics = comptime collectChildTopics(m);
-
-    // Phase 1: bloom scan over the engine's blooms.bin. Single pass with
-    // the (addr ∈ knownAddresses) OR (topic ∈ childTopics) predicate.
     var matching = std.ArrayListUnmanaged(u64){};
     defer matching.deinit(allocator);
 
     try block_filter.scanBloomsParallel(
         reader,
-        known_addresses,
-        child_topics,
-        m.start_block,
+        bloom_addresses,
+        start_block,
         std.math.maxInt(u64),
         &matching,
         &result.blocks_scanned,
@@ -90,7 +165,6 @@ pub fn build(
         return result;
     }
 
-    // Phase 2: parallel decompress + per-log filter + recompress.
     const num_workers = parallel.workerCount(matching.items.len, PARALLEL_THRESHOLD);
     const ranges = parallel.chunkRanges(matching.items.len, num_workers);
 
@@ -104,9 +178,7 @@ pub fn build(
         worker_args[i] = .{
             .reader = reader,
             .matching_blocks = matching.items[ranges[i][0]..ranges[i][1]],
-            .known_addresses = known_addresses,
-            .all_topics = all_topics,
-            .child_topics = child_topics,
+            .filter = filter,
             .results = &worker_results[i],
             .allocator = worker_arenas[i].allocator(),
         };
@@ -115,16 +187,11 @@ pub fn build(
 
     try parallel.run(FilterWorkerArgs, worker_args[0..num_workers], num_workers, filterWorker);
 
-    // Phase 3: write to MDBX BLOCKS DBI in ascending block-number order.
-    // Worker chunks are non-overlapping ascending ranges of the bloom-scan
-    // output; per-worker sort restores order after io_uring completion
-    // reordering, so iterating workers 0..N yields globally ascending keys
-    // for MDBX_APPEND.
-    const env = try lmdbx.Environment.init(dest_path, .{ .max_dbs = 1 });
+    const env = try lmdbx.Environment.init(dest_path, .{ .max_dbs = 2 });
     defer env.deinit() catch {};
 
     var txn = try env.transaction(.{});
-    var dbi = (try lmdbx.Database.open(txn, "blocks", .{ .create = true })).dbi;
+    var dbi = (try lmdbx.Database.open(txn, dbi_name, .{ .create = true })).dbi;
     var writes_since_commit: u32 = 0;
 
     for (0..num_workers) |i| {
@@ -138,7 +205,7 @@ pub fn build(
             if (writes_since_commit >= COMMIT_BLOCKS) {
                 try txn.commit();
                 txn = try env.transaction(.{});
-                dbi = (try lmdbx.Database.open(txn, "blocks", .{ .create = true })).dbi;
+                dbi = (try lmdbx.Database.open(txn, dbi_name, .{ .create = true })).dbi;
                 writes_since_commit = 0;
             }
         }
@@ -173,10 +240,6 @@ fn collectAllTopics(comptime m: sdk_manifest.Manifest) []const [32]u8 {
         for (m.factories) |f| {
             const t = sdk_manifest.eventTopic0(f.create_event);
             if (!containsTopic(out, &t)) out = out ++ &[_][32]u8{t};
-            for (f.child_events) |E| {
-                const t2 = sdk_manifest.eventTopic0(E);
-                if (!containsTopic(out, &t2)) out = out ++ &[_][32]u8{t2};
-            }
         }
         return out;
     }
@@ -216,9 +279,7 @@ const FilteredBlock = struct {
 const FilterWorkerArgs = struct {
     reader: *const FlatStoreReader,
     matching_blocks: []const u64,
-    known_addresses: []const [20]u8,
-    all_topics: []const [32]u8,
-    child_topics: []const [32]u8,
+    filter: Filter,
     results: *std.ArrayListUnmanaged(FilteredBlock),
     allocator: std.mem.Allocator,
 };
@@ -305,7 +366,7 @@ fn processBlockEntry(
 
     var keep_count: usize = 0;
     for (log_buf[0..log_count]) |*log| {
-        if (!keepLog(log, args.known_addresses, args.all_topics, args.child_topics)) continue;
+        if (!keepLog(log, args.filter)) continue;
         log.block_number = block_number;
         keep_buf[keep_count] = log.*;
         keep_count += 1;
@@ -325,18 +386,12 @@ fn processBlockEntry(
     }) catch {};
 }
 
-inline fn keepLog(
-    log: *const RawLog,
-    known_addresses: []const [20]u8,
-    all_topics: []const [32]u8,
-    child_topics: []const [32]u8,
-) bool {
+inline fn keepLog(log: *const RawLog, filter: Filter) bool {
     if (log.topic_count == 0) return false;
-    const topic0 = &log.topics[0];
-    const addr_known = containsAddress(known_addresses, &log.address);
-    if (addr_known and containsTopic(all_topics, topic0)) return true;
-    if (containsTopic(child_topics, topic0)) return true;
-    return false;
+    if (!containsAddress(filter.match_addrs, &log.address)) return false;
+    if (!containsTopic(filter.match_topics, &log.topics[0])) return false;
+    if (containsAddress(filter.exclude_addrs, &log.address)) return false;
+    return true;
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -446,10 +501,10 @@ const SmallManifest: sdk_manifest.Manifest = .{
     },
 };
 
-fn dumpDecodedBlocks(env: lmdbx.Environment, allocator: std.mem.Allocator) !std.ArrayListUnmanaged(DecodedBlock) {
+fn dumpDecodedBlocks(env: lmdbx.Environment, dbi_name: [*:0]const u8, allocator: std.mem.Allocator) !std.ArrayListUnmanaged(DecodedBlock) {
     const txn = try env.transaction(.{ .mode = .ReadOnly });
     defer txn.abort() catch {};
-    const db = try lmdbx.Database.open(txn, "blocks", .{});
+    const db = try lmdbx.Database.open(txn, dbi_name, .{});
     var cursor = try db.cursor();
     defer cursor.deinit();
 
@@ -550,9 +605,9 @@ test "build: filters multi-contract flat store, MDBX contains exactly the matche
     try testing.expectEqual(matching_log_total, result.total_logs);
     try testing.expectEqual(N, result.blocks_scanned);
 
-    const env = try lmdbx.Environment.init(@ptrCast(&dst_path_z), .{ .max_dbs = 1 });
+    const env = try lmdbx.Environment.init(@ptrCast(&dst_path_z), .{ .max_dbs = 2 });
     defer env.deinit() catch {};
-    var decoded = try dumpDecodedBlocks(env, allocator);
+    var decoded = try dumpDecodedBlocks(env, DBI_PRIMARY, allocator);
     defer freeDecoded(&decoded, allocator);
 
     try testing.expectEqual(matching_count, @as(u64, decoded.items.len));
@@ -636,18 +691,19 @@ fn buildIntoNewTmp(
 
     _ = try build(reader, m, @ptrCast(&path_z), allocator);
 
-    const env = try lmdbx.Environment.init(@ptrCast(&path_z), .{ .max_dbs = 1 });
+    const env = try lmdbx.Environment.init(@ptrCast(&path_z), .{ .max_dbs = 2 });
     defer env.deinit() catch {};
-    const decoded = try dumpDecodedBlocks(env, allocator);
+    const decoded = try dumpDecodedBlocks(env, DBI_PRIMARY, allocator);
     return .{ .tmp = tmp, .decoded = decoded };
 }
 
-test "build: factory child topics admit logs from any address" {
+test "build + appendChildren: primary holds creations, children holds child events, no duplication" {
     const allocator = testing.allocator;
 
     const FactoryAddr: [20]u8 = [_]u8{0xF0} ** 20;
     const ChildAddr1: [20]u8 = [_]u8{0xC1} ** 20;
     const ChildAddr2: [20]u8 = [_]u8{0xC2} ** 20;
+    const ChildAddr3: [20]u8 = [_]u8{0xC3} ** 20;
 
     const Create = struct {
         pub const signature = "PairCreated(address,address,address)";
@@ -678,28 +734,27 @@ test "build: factory child topics admit logs from any address" {
     defer log_arena.deinit();
     const arena = log_arena.allocator();
 
-    // Block numbers are contiguous because FlatStoreReader.getBlockLoc
-    // computes idx = block_number - first_block and assumes a dense index.
     // Block 100: factory emits a creation event.
     const create_logs = try arena.alloc(TestLog, 1);
     create_logs[0] = .{ .address = FactoryAddr, .topic0 = create_topic };
     try blocks_list.append(allocator, .{ .block_number = 100, .logs = create_logs });
 
-    // Block 101: child 1 emits Sync.
+    // Blocks 101..103: child contracts emit Sync.
     const sync1_logs = try arena.alloc(TestLog, 1);
     sync1_logs[0] = .{ .address = ChildAddr1, .topic0 = sync_topic };
     try blocks_list.append(allocator, .{ .block_number = 101, .logs = sync1_logs });
-
-    // Block 102: child 2 emits Sync.
     const sync2_logs = try arena.alloc(TestLog, 1);
     sync2_logs[0] = .{ .address = ChildAddr2, .topic0 = sync_topic };
     try blocks_list.append(allocator, .{ .block_number = 102, .logs = sync2_logs });
+    const sync3_logs = try arena.alloc(TestLog, 1);
+    sync3_logs[0] = .{ .address = ChildAddr3, .topic0 = sync_topic };
+    try blocks_list.append(allocator, .{ .block_number = 103, .logs = sync3_logs });
 
-    // Block 103: unrelated address with unrelated topic — must NOT appear.
+    // Block 104: unrelated address with unrelated topic — must NOT appear in either DBI.
     const noise_topic = topicOf(Other);
     const noise_logs = try arena.alloc(TestLog, 1);
     noise_logs[0] = .{ .address = ADDR_C, .topic0 = noise_topic };
-    try blocks_list.append(allocator, .{ .block_number = 103, .logs = noise_logs });
+    try blocks_list.append(allocator, .{ .block_number = 104, .logs = noise_logs });
 
     var src_tmp = testing.tmpDir(.{});
     defer src_tmp.cleanup();
@@ -717,22 +772,87 @@ test "build: factory child topics admit logs from any address" {
     @memcpy(dst_path_z[0..dst_path.len], dst_path);
     dst_path_z[dst_path.len] = 0;
 
-    const result = try build(&reader, FactoryManifest, @ptrCast(&dst_path_z), allocator);
-    try testing.expectEqual(@as(u64, 3), result.blocks_matched);
-    try testing.expectEqual(@as(u64, 3), result.total_logs);
+    // Phase 1: build primary. Only the factory creation event qualifies
+    // because child addresses are not yet known.
+    const primary = try build(&reader, FactoryManifest, @ptrCast(&dst_path_z), allocator);
+    try testing.expectEqual(@as(u64, 1), primary.blocks_matched);
+    try testing.expectEqual(@as(u64, 1), primary.total_logs);
 
-    const env = try lmdbx.Environment.init(@ptrCast(&dst_path_z), .{ .max_dbs = 1 });
+    // Phase 3: append children for the addresses the (would-be) pre-pass
+    // discovered. Stand-in for `scanner.scanCreations` until Group 6 lands.
+    const discovered = [_][20]u8{ ChildAddr1, ChildAddr2, ChildAddr3 };
+    const children = try appendChildren(&reader, FactoryManifest, &discovered, @ptrCast(&dst_path_z), allocator);
+    try testing.expectEqual(@as(u64, 3), children.blocks_matched);
+    try testing.expectEqual(@as(u64, 3), children.total_logs);
+
+    const env = try lmdbx.Environment.init(@ptrCast(&dst_path_z), .{ .max_dbs = 2 });
     defer env.deinit() catch {};
-    var decoded = try dumpDecodedBlocks(env, allocator);
-    defer freeDecoded(&decoded, allocator);
 
-    try testing.expectEqual(@as(usize, 3), decoded.items.len);
-    try testing.expectEqual(@as(u64, 100), decoded.items[0].block_number);
-    try testing.expectEqualSlices(u8, &FactoryAddr, &decoded.items[0].logs[0].address);
-    try testing.expectEqual(@as(u64, 101), decoded.items[1].block_number);
-    try testing.expectEqualSlices(u8, &ChildAddr1, &decoded.items[1].logs[0].address);
-    try testing.expectEqual(@as(u64, 102), decoded.items[2].block_number);
-    try testing.expectEqualSlices(u8, &ChildAddr2, &decoded.items[2].logs[0].address);
+    var primary_blocks = try dumpDecodedBlocks(env, DBI_PRIMARY, allocator);
+    defer freeDecoded(&primary_blocks, allocator);
+    var child_blocks = try dumpDecodedBlocks(env, DBI_CHILDREN, allocator);
+    defer freeDecoded(&child_blocks, allocator);
+
+    try testing.expectEqual(@as(usize, 1), primary_blocks.items.len);
+    try testing.expectEqual(@as(u64, 100), primary_blocks.items[0].block_number);
+    try testing.expectEqualSlices(u8, &FactoryAddr, &primary_blocks.items[0].logs[0].address);
+    try testing.expectEqualSlices(u8, &create_topic, &primary_blocks.items[0].logs[0].topic0);
+
+    try testing.expectEqual(@as(usize, 3), child_blocks.items.len);
+    try testing.expectEqual(@as(u64, 101), child_blocks.items[0].block_number);
+    try testing.expectEqualSlices(u8, &ChildAddr1, &child_blocks.items[0].logs[0].address);
+    try testing.expectEqualSlices(u8, &sync_topic, &child_blocks.items[0].logs[0].topic0);
+    try testing.expectEqual(@as(u64, 102), child_blocks.items[1].block_number);
+    try testing.expectEqualSlices(u8, &ChildAddr2, &child_blocks.items[1].logs[0].address);
+    try testing.expectEqual(@as(u64, 103), child_blocks.items[2].block_number);
+    try testing.expectEqualSlices(u8, &ChildAddr3, &child_blocks.items[2].logs[0].address);
+}
+
+test "appendChildren: returns zero-result for empty discovered set" {
+    const allocator = testing.allocator;
+
+    const FactoryAddr: [20]u8 = [_]u8{0xF0} ** 20;
+    const Create = struct {
+        pub const signature = "PairCreated(address,address,address)";
+    };
+    const Sync = struct {
+        pub const signature = "Sync(uint112,uint112)";
+    };
+    const FactoryManifest: sdk_manifest.Manifest = .{
+        .name = "factory",
+        .chain_id = 1,
+        .start_block = 0,
+        .factories = &.{.{
+            .name = "F",
+            .address = FactoryAddr,
+            .create_event = Create,
+            .address_param = .{ .data = 0 },
+            .child_events = &.{Sync},
+        }},
+    };
+
+    var src_tmp = testing.tmpDir(.{});
+    defer src_tmp.cleanup();
+    var blocks: [1]TestBlock = .{.{ .block_number = 100, .logs = &.{} }};
+    blocks[0].logs = &[_]TestLog{.{ .address = FactoryAddr, .topic0 = topicOf(Create) }};
+    try writeFlatStore(src_tmp.dir, &blocks, allocator);
+    var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
+    var reader = try FlatStoreReader.open(src_path);
+    defer reader.close();
+
+    var dst_tmp = testing.tmpDir(.{});
+    defer dst_tmp.cleanup();
+    var dst_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dst_path = try dst_tmp.dir.realpath(".", &dst_path_buf);
+    var dst_path_z: [std.fs.max_path_bytes:0]u8 = undefined;
+    @memcpy(dst_path_z[0..dst_path.len], dst_path);
+    dst_path_z[dst_path.len] = 0;
+
+    _ = try build(&reader, FactoryManifest, @ptrCast(&dst_path_z), allocator);
+    const result = try appendChildren(&reader, FactoryManifest, &.{}, @ptrCast(&dst_path_z), allocator);
+    try testing.expectEqual(@as(u64, 0), result.blocks_scanned);
+    try testing.expectEqual(@as(u64, 0), result.blocks_matched);
 }
 
 test "blockKey/blockFromKey roundtrip and ordering" {
