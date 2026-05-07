@@ -31,18 +31,27 @@ pub fn AppendStore(comptime T: type) type {
         pub const value_size = VALUE_SIZE;
 
         dbi: lmdbx.Database.DBI,
+        /// Borrow into the owning Context's `active_txn` field. Updated
+        /// implicitly when the Context replaces its txn at commit
+        /// boundaries; the store reads through the pointer at every save.
+        active_txn: *const lmdbx.Transaction,
 
-        pub fn open(txn: lmdbx.Transaction, name: [*:0]const u8) !Self {
-            const db = try lmdbx.Database.open(txn, name, .{ .create = true });
-            return .{ .dbi = db.dbi };
+        /// `allocator` is unused; the parameter exists so the signature
+        /// matches `CachedStore(T).open` and the SDK orchestration layer
+        /// can iterate the entities tuple with a single store.open call.
+        pub fn open(_: std.mem.Allocator, txn_ref: *const lmdbx.Transaction, name: [*:0]const u8) !Self {
+            const db = try lmdbx.Database.open(txn_ref.*, name, .{ .create = true });
+            return .{ .dbi = db.dbi, .active_txn = txn_ref };
         }
 
-        pub fn save(self: Self, txn: lmdbx.Transaction, entity: T) AppendError!void {
+        pub fn deinit(_: *Self) void {}
+
+        pub fn save(self: Self, entity: T) AppendError!void {
             var key_buf: [KEY_SIZE]u8 = undefined;
             var val_buf: [VALUE_SIZE]u8 = undefined;
             entity_serial.serializeKey(T, entity, &key_buf);
             entity_serial.serialize(T, entity, &val_buf);
-            const db = lmdbx.Database{ .txn = txn, .dbi = self.dbi };
+            const db = lmdbx.Database{ .txn = self.active_txn.*, .dbi = self.dbi };
             db.set(&key_buf, &val_buf, .Append) catch |err| switch (err) {
                 error.MDBX_EKEYMISMATCH, error.MDBX_KEYEXIST => return error.KeyOutOfOrder,
                 else => return err,
@@ -53,11 +62,11 @@ pub fn AppendStore(comptime T: type) type {
         /// in CachedStore exists for the mutable case; calling load on an
         /// AppendStore is almost always a CachedStore/AppendStore mixup, so
         /// catch it at compile time.
-        pub fn load(_: Self, _: lmdbx.Transaction, _: anytype) !?T {
+        pub fn load(_: Self, _: anytype) !?T {
             @compileError("AppendStore.load is not supported: cannot load append-only entities during backfill");
         }
 
-        pub fn flush(_: Self, _: lmdbx.Transaction) void {}
+        pub fn flush(_: *Self) !void {}
     };
 }
 
@@ -88,18 +97,18 @@ test "save monotonic and out-of-order against MDBX" {
     const env = try lmdbx.Environment.init(@ptrCast(&path_z), .{ .max_dbs = 4 });
     defer env.deinit() catch {};
 
-    const txn = try env.transaction(.{});
-    const store = try S.open(txn, "events");
+    var current_txn = try env.transaction(.{});
+    const store = try S.open(std.testing.allocator, &current_txn, "events");
 
-    try store.save(txn, .{ .id = idKey(1, 0), .value = 100 });
-    try store.save(txn, .{ .id = idKey(1, 1), .value = 101 });
-    try store.save(txn, .{ .id = idKey(2, 0), .value = 200 });
+    try store.save(.{ .id = idKey(1, 0), .value = 100 });
+    try store.save(.{ .id = idKey(1, 1), .value = 101 });
+    try store.save(.{ .id = idKey(2, 0), .value = 200 });
 
     // Out-of-order: id (1, 2) is less than the just-inserted (2, 0).
-    const out_of_order = store.save(txn, .{ .id = idKey(1, 2), .value = 102 });
+    const out_of_order = store.save(.{ .id = idKey(1, 2), .value = 102 });
     try std.testing.expectError(error.KeyOutOfOrder, out_of_order);
 
-    try txn.commit();
+    try current_txn.commit();
 }
 
 fn idKey(block: u32, log_index: u32) [8]u8 {

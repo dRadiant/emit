@@ -33,12 +33,19 @@ pub fn CachedStore(comptime T: type) type {
 
         dbi: lmdbx.Database.DBI,
         cache: std.AutoHashMap(KeyField, CacheEntry),
+        /// Borrow into the owning Context's `active_txn` field. The
+        /// Context replaces its own `active_txn` value on every commit
+        /// boundary, so reading through this pointer always sees the
+        /// transaction that's currently active. Stores never own or
+        /// rebind the txn themselves.
+        active_txn: *const lmdbx.Transaction,
 
-        pub fn open(allocator: std.mem.Allocator, txn: lmdbx.Transaction, name: [*:0]const u8) !Self {
-            const db = try lmdbx.Database.open(txn, name, .{ .create = true });
+        pub fn open(allocator: std.mem.Allocator, txn_ref: *const lmdbx.Transaction, name: [*:0]const u8) !Self {
+            const db = try lmdbx.Database.open(txn_ref.*, name, .{ .create = true });
             return .{
                 .dbi = db.dbi,
                 .cache = std.AutoHashMap(KeyField, CacheEntry).init(allocator),
+                .active_txn = txn_ref,
             };
         }
 
@@ -46,12 +53,12 @@ pub fn CachedStore(comptime T: type) type {
             self.cache.deinit();
         }
 
-        pub fn load(self: *Self, txn: lmdbx.Transaction, key: KeyField) !?T {
+        pub fn load(self: *Self, key: KeyField) !?T {
             if (self.cache.get(key)) |entry| return entry.entity;
 
             var key_buf: [KEY_SIZE]u8 = undefined;
             entity_serial.encodeKey(KeyField, key, &key_buf);
-            const db = lmdbx.Database{ .txn = txn, .dbi = self.dbi };
+            const db = lmdbx.Database{ .txn = self.active_txn.*, .dbi = self.dbi };
             const data = (try db.get(&key_buf)) orelse return null;
             if (data.len != VALUE_SIZE) return error.MalformedEntity;
             const entity = entity_serial.deserialize(T, data[0..VALUE_SIZE]);
@@ -63,8 +70,8 @@ pub fn CachedStore(comptime T: type) type {
             try self.cache.put(key, .{ .entity = entity, .dirty = true });
         }
 
-        pub fn flush(self: *Self, txn: lmdbx.Transaction) !void {
-            const db = lmdbx.Database{ .txn = txn, .dbi = self.dbi };
+        pub fn flush(self: *Self) !void {
+            const db = lmdbx.Database{ .txn = self.active_txn.*, .dbi = self.dbi };
             var it = self.cache.iterator();
             while (it.next()) |entry| {
                 if (!entry.value_ptr.dirty) continue;
@@ -106,18 +113,18 @@ test "load after save returns cached value without touching MDBX" {
     const env = try openTestEnv(&tmp);
     defer env.deinit() catch {};
 
-    const txn = try env.transaction(.{});
-    var store = try S.open(std.testing.allocator, txn, "accounts");
+    var current_txn = try env.transaction(.{});
+    var store = try S.open(std.testing.allocator, &current_txn, "accounts");
     defer store.deinit();
 
     const alice = [_]u8{0xAA} ** 20;
     try store.save(alice, .{ .id = alice, .balance = 100 });
     // Nothing flushed yet, so MDBX is empty. If load went to MDBX it would
     // miss. The cache hit is the only path that returns a value.
-    const got = (try store.load(txn, alice)).?;
+    const got = (try store.load(alice)).?;
     try std.testing.expectEqual(@as(u256, 100), got.balance);
 
-    try txn.abort();
+    try current_txn.abort();
 }
 
 test "flush writes only dirty entries" {
@@ -131,40 +138,40 @@ test "flush writes only dirty entries" {
     const bob = [_]u8{0xBB} ** 20;
 
     {
-        const txn = try env.transaction(.{});
-        var store = try S.open(std.testing.allocator, txn, "accounts");
+        var current_txn = try env.transaction(.{});
+        var store = try S.open(std.testing.allocator, &current_txn, "accounts");
         defer store.deinit();
 
         try store.save(alice, .{ .id = alice, .balance = 100 });
-        try store.flush(txn);
-        try txn.commit();
+        try store.flush();
+        try current_txn.commit();
     }
 
     // Re-open: load alice (clean, dirty=false), save bob (dirty), flush.
     // Both keys must be present in MDBX after flush, and alice's bytes must
     // be unchanged from the first commit.
     {
-        const txn = try env.transaction(.{});
-        var store = try S.open(std.testing.allocator, txn, "accounts");
+        var current_txn = try env.transaction(.{});
+        var store = try S.open(std.testing.allocator, &current_txn, "accounts");
         defer store.deinit();
 
-        const alice_loaded = (try store.load(txn, alice)).?;
+        const alice_loaded = (try store.load(alice)).?;
         try std.testing.expectEqual(@as(u256, 100), alice_loaded.balance);
 
         try store.save(bob, .{ .id = bob, .balance = 200 });
-        try store.flush(txn);
+        try store.flush();
 
         // Read both keys directly from MDBX (bypassing the cache) to verify
         // the flush actually wrote them. Avoids lmdbx-zig's `dbi_stat`
         // wrapper bug (CLAUDE.md "lmdbx-zig has wrapper bugs").
-        const db = lmdbx.Database{ .txn = txn, .dbi = store.dbi };
+        const db = lmdbx.Database{ .txn = current_txn, .dbi = store.dbi };
         var key_buf: [S.key_size]u8 = undefined;
         entity_serial.encodeKey(S.Key, alice, &key_buf);
         try std.testing.expect((try db.get(&key_buf)) != null);
         entity_serial.encodeKey(S.Key, bob, &key_buf);
         try std.testing.expect((try db.get(&key_buf)) != null);
 
-        try txn.commit();
+        try current_txn.commit();
     }
 }
 
@@ -176,22 +183,22 @@ test "cache survives flush, commit, and a new transaction" {
     defer env.deinit() catch {};
 
     const alice = [_]u8{0xAA} ** 20;
-    const txn1 = try env.transaction(.{});
-    var store = try S.open(std.testing.allocator, txn1, "accounts");
+    var current_txn = try env.transaction(.{});
+    var store = try S.open(std.testing.allocator, &current_txn, "accounts");
     defer store.deinit();
 
     try store.save(alice, .{ .id = alice, .balance = 100 });
     try std.testing.expectEqual(@as(u32, 1), store.count());
-    try store.flush(txn1);
-    try txn1.commit();
+    try store.flush();
+    try current_txn.commit();
 
     // Cache survives the commit; only dirty flags reset.
     try std.testing.expectEqual(@as(u32, 1), store.count());
 
-    // A subsequent load on a new txn returns the cached value without
-    // consulting MDBX. Sanity-check the value matches.
-    const txn2 = try env.transaction(.{});
-    const got = (try store.load(txn2, alice)).?;
+    // Reassign current_txn to a fresh read txn; the store sees it through
+    // its `active_txn` pointer without re-opening.
+    current_txn = try env.transaction(.{});
+    const got = (try store.load(alice)).?;
     try std.testing.expectEqual(@as(u256, 100), got.balance);
-    try txn2.abort();
+    try current_txn.abort();
 }
