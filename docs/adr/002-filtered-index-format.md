@@ -4,6 +4,8 @@
 **Date**: 2026-05-07
 **Context**: The SDK ships `sdk/src/filter_builder.zig`, which materializes a per-manifest subset of the engine's flat log store into a scanner-friendly artifact at `<entity_data_dir>/filtered_index.mdbx`. The chosen format affects build cost, scan cost, the SDK's MDBX surface, and what future features (multi-manifest serving, pure-Zig storage) cost to add.
 
+For factory manifests the build runs in two passes (build static-and-factory blocks → pre-pass to discover child addresses → build child blocks). The format must accommodate either one bucket of blocks (no factories) or two (factories with discovered children) with no semantic difference at scan time.
+
 ## Problem
 
 The filter builder produces an artifact that the scanner walks in block order, decompresses, and dispatches per log. The artifact must:
@@ -21,16 +23,23 @@ It does not need:
 
 ## Options
 
-### A: Single MDBX DBI keyed by block number
+### A: One MDBX env with `BLOCKS_PRIMARY` plus optional `BLOCKS_CHILDREN`
 
-One `BLOCKS` DBI inside `filtered_index.mdbx`. Key = `block_number` as u64 big-endian (8 bytes). Value = `lz4_len(u32 LE) || lz4_data`, identical to the engine's `blocks.dat` entry format. Empty blocks (matched the bloom but had no qualifying logs after per-log filtering) are not written. Use `MDBX_APPEND` since the writer feeds keys in ascending order.
+Single env at `<entity_data_dir>/filtered_index.mdbx` containing one or two DBIs:
+
+- `BLOCKS_PRIMARY` (always present): keyed by `block_number` as u64 big-endian (8 bytes). Value = `lz4_len(u32 LE) || lz4_data`, identical to the engine's `blocks.dat` entry format. Holds logs from the manifest's static contracts and factory addresses (creation events live here).
+- `BLOCKS_CHILDREN` (created only when the factory pre-pass discovers at least one child contract): same key/value shape. Holds logs from factory-discovered child addresses, with the per-log filter excluding addresses already covered by `BLOCKS_PRIMARY` so the same log never appears in both DBIs.
+
+Empty blocks (matched the bloom but had no qualifying logs after per-log filtering) are not written. Both DBIs use `MDBX_APPEND` since their writers feed keys in ascending order.
 
 **Pros**
-- Cursor walk by block order is `cursor.goToFirst` then `goToNext` until `null`. ~3 lines.
+- Cursor walk by block order is `cursor.goToFirst` then `goToNext` until `null`. ~3 lines per DBI.
 - `MDBX_APPEND` skips B-tree traversal — about 5x faster than `MDBX_UPSERT` per insert.
 - Crash-safe partial builds via transaction commit cadence (every 10K block writes).
-- Scanner needs zero metadata: the BLOCKS table itself carries first/last via cursor extremes.
+- Scanner needs zero metadata: each DBI carries first/last via cursor extremes.
 - Format is stable across rebuilds (decoded contents are identical run-to-run).
+- Two DBIs in one env keeps the scanner simple: single open call, single `max_dbs = 2` config, k-way merge across two cursors under one read transaction.
+- Factory and non-factory manifests share the same code path. Scanner conditionally opens `BLOCKS_CHILDREN`; nothing else changes.
 
 **Cons**
 - One MDBX consumer in the SDK. Pure-Zig users pay one C dependency they would not otherwise need.
@@ -80,14 +89,14 @@ Mirror the engine's `blocks.dat` / `blocks.idx` layout: an append-only LZ4 file 
 
 ## Decision
 
-**A — single `BLOCKS` DBI keyed by `block_number` as u64 big-endian, value = LZ4 entry matching `blocks.dat`'s per-block format.**
+**A — single env, `BLOCKS_PRIMARY` always present plus `BLOCKS_CHILDREN` when factories discover children. Both DBIs keyed by `block_number` as u64 big-endian, value = LZ4 entry matching `blocks.dat`'s per-block format.**
 
 Drop `TOPIC_INDEX` and `META` from the prototype's layout. The scanner reads first/last via cursor extremes and topic-filters per log inline.
 
 ## Consequences
 
-- `filter_builder.zig` opens `filtered_index.mdbx` with `max_dbs = 1`, opens BLOCKS with `.create = true`, writes via `set(key, entry, .Append)`, commits every 10K block writes.
-- The handler-replay scanner opens the same env read-only, opens BLOCKS, walks via cursor, decompresses each entry, deserializes logs via `core.log_serial.deserializeLogs`, dispatches.
+- `filter_builder.zig` opens `filtered_index.mdbx` with `max_dbs = 2`. `build()` opens `BLOCKS_PRIMARY` with `.create = true` and writes via `set(key, entry, .Append)`. `appendChildren()` opens `BLOCKS_CHILDREN` similarly, writes a second pass, and is invoked only when the pre-pass discovers at least one child address. Both commit every 10K block writes.
+- The handler-replay scanner opens the same env read-only and conditionally opens `BLOCKS_CHILDREN` based on whether the manifest declares factories. With one DBI it walks one cursor; with two DBIs it k-way merges by `(block_number, tx_index, log_index)`.
 - The idempotency test asserts decoded-content equality across rebuilds, not byte-equality (MDBX page metadata varies run-to-run; the data semantics do not).
-- If a future change adopts ADR-003 option D for the filtered index, the migration touches only `filter_builder.zig` and the scanner. The handler API and entity-storage contract are unaffected. Build flag or wholesale swap, both viable.
-- If multi-manifest serving lands, gate `TOPIC_INDEX` behind a comptime flag in `filter_builder.zig`. Format A's data file is forward-compatible — the new layout adds a sibling DBI without touching BLOCKS.
+- If a future change adopts ADR-003 option D for the filtered index, the migration touches only `filter_builder.zig` and the scanner. The handler API and entity-storage contract are unaffected. Build flag or wholesale swap, both viable. The two-bucket layout maps cleanly to two pure-Zig flat files (`filtered_primary.dat` + `filtered_children.dat`) if D lands.
+- If multi-manifest serving lands, gate `TOPIC_INDEX` behind a comptime flag in `filter_builder.zig`. Format A's data files are forward-compatible — the new layout adds a sibling DBI without touching BLOCKS_PRIMARY or BLOCKS_CHILDREN.
