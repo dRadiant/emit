@@ -95,9 +95,9 @@ pub fn replay(
     ctx: anytype,
     options: ReplayOptions,
 ) !ReplayResult {
-    _ = options; // commit cadence is wired in once entity stores land here.
     var result = ReplayResult{};
     var timer = try std.time.Timer.start();
+    var events_since_commit: u32 = 0;
 
     const Dispatcher = handler_mod.dispatcherFor(m);
     comptime Dispatcher.validateHandler(Handler);
@@ -165,11 +165,26 @@ pub fn replay(
             const decoded = handler_mod.DecodedLog.fromRawLog(log);
             try Dispatcher.dispatch(Handler, decoded, ctx);
             result.logs_dispatched += 1;
+            events_since_commit += 1;
+            if (events_since_commit >= options.commit_interval) {
+                try maybeCommit(ctx);
+                events_since_commit = 0;
+            }
         }
     }
 
     result.elapsed_ns = timer.read();
     return result;
+}
+
+/// Calls `ctx.commitCycle()` if the context type defines one. Tests using
+/// a counter-shaped ctx (no entity stores) skip the commit; entry.zig's
+/// Context type provides commitCycle and gets the every-N-events flush.
+inline fn maybeCommit(ctx: anytype) !void {
+    const T = std.meta.Child(@TypeOf(ctx));
+    if (comptime @hasDecl(T, "commitCycle")) {
+        try ctx.commitCycle();
+    }
 }
 
 fn pickMin(a: ?u64, b: ?u64) u64 {
@@ -224,7 +239,6 @@ const CursorWalker = struct {
 // ── Tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-const block_context = @import("block_context.zig");
 const FlatStoreReader = core.FlatStoreReader;
 
 const TestLog = struct {
