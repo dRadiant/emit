@@ -7,10 +7,10 @@ const manifest = @import("manifest.zig");
 /// scanner's per-block decompression buffer and is valid only for the
 /// duration of the handler invocation.
 ///
-/// TODO: higher-level decoder helpers (`indexedAddress(i)`,
-/// `dataU256(offset)`, comptime-derived per-event typed decoder) live here.
-/// concrete usage patterns from examples/erc20 will
-/// inform the right shape.
+/// The `indexedAddress` / `dataU256` / `eventId` helpers cover the common
+/// ERC20-class decode paths. Per-event typed decoders (envio's
+/// `event.params.<name>` shape) are deferred — they need a comptime
+/// ABI-codegen pass that lands with the M3 token registry.
 pub const DecodedLog = struct {
     block_number: u64,
     tx_index: u16,
@@ -32,6 +32,35 @@ pub const DecodedLog = struct {
             .topic_count = raw.topic_count,
             .data = raw.data,
         };
+    }
+
+    /// Read the i-th indexed event parameter as an address. Indexed
+    /// parameters live in `topics[i + 1]` (topic0 is the event selector).
+    /// EVM addresses are right-padded inside their 32-byte word; the
+    /// trailing 20 bytes are the address.
+    pub fn indexedAddress(self: DecodedLog, i: u8) [20]u8 {
+        return self.topics[i + 1][12..32].*;
+    }
+
+    /// Read the `word`-th 32-byte slot of `data` as a big-endian u256.
+    /// Most ERC20-class events pack each non-indexed parameter in one
+    /// word; `dataU256(0)` reads the value from a Transfer or Approval log.
+    pub fn dataU256(self: DecodedLog, word: u8) u256 {
+        const start = @as(usize, word) * 32;
+        return std.mem.readInt(u256, self.data[start..][0..32], .big);
+    }
+
+    /// Canonical 16-byte event id: `block_number(BE u64) ++ tx_index(BE u32) ++ log_index(BE u32)`.
+    /// Big-endian so MDBX byte order matches dispatch order, satisfying
+    /// `MDBX_APPEND` for append-only event entities. The same construction
+    /// underpins envio's `${block.number}-${logIndex}` string id without
+    /// the runtime concat.
+    pub fn eventId(self: DecodedLog) [16]u8 {
+        var id: [16]u8 = undefined;
+        std.mem.writeInt(u64, id[0..8], self.block_number, .big);
+        std.mem.writeInt(u32, id[8..12], self.tx_index, .big);
+        std.mem.writeInt(u32, id[12..16], self.log_index, .big);
+        return id;
     }
 };
 
