@@ -86,6 +86,7 @@ pub fn build(b: *std.Build) void {
         .{ .path = "test/compile_fail/entities_not_marker.zig", .expected = "is not a marker produced by sdk.mutable() or sdk.appendOnly()" },
         .{ .path = "test/compile_fail/event_missing_signature.zig", .expected = "must declare `pub const signature = \"Name(types,...)\";`. The SDK derives topic0 and name from it." },
         .{ .path = "test/compile_fail/handler_missing_method.zig", .expected = "is missing method `handleTransfer` for event `Transfer(address,address,uint256)`. Add `pub fn handleTransfer(log: sdk.DecodedLog, ctx: *Ctx) !void { ... }`." },
+        .{ .path = "test/compile_fail/block_context_name_collision.zig", .expected = "both derive store field name 'items'. Rename one of the entity types." },
     };
     for (compile_fail) |s| {
         const obj = b.addObject(.{

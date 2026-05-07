@@ -6,6 +6,7 @@ const std = @import("std");
 
 // Submodules.
 pub const append_store = @import("append_store.zig");
+pub const block_context = @import("block_context.zig");
 pub const cached_store = @import("cached_store.zig");
 pub const entity_serial = @import("entity_serial.zig");
 pub const handler = @import("handler.zig");
@@ -16,6 +17,7 @@ pub const manifest = @import("manifest.zig");
 pub const AddressParam = manifest.AddressParam;
 pub const AppendError = append_store.AppendError;
 pub const AppendStore = append_store.AppendStore;
+pub const BlockContext = block_context.BlockContext;
 pub const CachedStore = cached_store.CachedStore;
 pub const ContractDef = manifest.ContractDef;
 pub const DecodedLog = handler.DecodedLog;
@@ -84,6 +86,7 @@ test {
     _ = manifest;
     _ = humanize;
     _ = handler;
+    _ = block_context;
 }
 
 test "mutable and appendOnly produce distinct Store aliases" {
@@ -100,4 +103,13 @@ test "validateEntityTuple accepts a valid mix of markers" {
     const A = struct { id: [20]u8, balance: u256 };
     const B = struct { id: [8]u8, value: u64 };
     validateEntityTuple(.{ mutable(A), appendOnly(B) });
+}
+
+test "BlockContext built from mutable + appendOnly exposes typed stores" {
+    const A = struct { id: [20]u8, balance: u256 };
+    const B = struct { id: [8]u8, value: u64 };
+    const Ctx = BlockContext(.{ mutable(A), appendOnly(B) });
+    const Stores = std.meta.fieldInfo(Ctx, .stores).type;
+    try std.testing.expectEqual(CachedStore(A), @FieldType(Stores, "as"));
+    try std.testing.expectEqual(AppendStore(B), @FieldType(Stores, "bs"));
 }
