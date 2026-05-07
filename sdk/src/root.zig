@@ -5,6 +5,7 @@
 /// `FactoryDef`, `AddressParam`), `DecodedLog`, `Context`, `Options`, and
 /// `RunStats`. Everything else is implementation detail.
 const std = @import("std");
+const eth = @import("eth");
 
 // Implementation modules. Kept private so the user-facing surface stays
 // small. Reach for the re-exports below instead.
@@ -31,6 +32,45 @@ pub const Manifest = manifest.Manifest;
 pub const Options = entry.Options;
 pub const run = entry.run;
 pub const RunStats = entry.RunStats;
+
+/// Parse a 20-byte Ethereum address from its hex string at compile time.
+/// Accepts an optional `0x` prefix. If the input contains any uppercase
+/// hex digit, it is interpreted as an EIP-55 checksum and rejected at
+/// compile time when the checksum doesn't match. All-lowercase or
+/// all-uppercase inputs skip checksum validation (consistent with EIP-55,
+/// which makes mixed case the validation signal).
+///
+/// Use at the manifest call site:
+/// `.address = sdk.address("0xae78736Cd615f374D3085123A210448E74Fc6393")`.
+pub fn address(comptime hex: []const u8) [20]u8 {
+    return comptime blk: {
+        const parsed = eth.primitives.addressFromHex(hex) catch |err| @compileError(
+            "sdk.address: failed to parse '" ++ hex ++ "': " ++ @errorName(err),
+        );
+
+        // Detect mixed case (the EIP-55 signal). All-lower or all-upper
+        // means the user opted out of the checksum check.
+        const body: []const u8 = if (hex.len >= 2 and hex[0] == '0' and (hex[1] == 'x' or hex[1] == 'X'))
+            hex[2..]
+        else
+            hex;
+        var has_upper = false;
+        var has_lower = false;
+        for (body) |c| {
+            if (c >= 'a' and c <= 'f') has_lower = true;
+            if (c >= 'A' and c <= 'F') has_upper = true;
+        }
+        if (has_upper and has_lower) {
+            const checksum = eth.primitives.addressToChecksum(&parsed);
+            // checksum is always "0x" + 40 hex chars; compare against body
+            // so the comparison works whether the input had a "0x" prefix.
+            if (!std.mem.eql(u8, body, checksum[2..])) @compileError(
+                "sdk.address: '" ++ hex ++ "' fails EIP-55 checksum. Expected '" ++ checksum ++ "'.",
+            );
+        }
+        break :blk parsed;
+    };
+}
 
 /// Storage-mode marker for a mutable entity. Pass `sdk.mutable(Account)`
 /// in the entities tuple at the `sdk.run` call site; the SDK reads
@@ -98,6 +138,21 @@ test "mutable and appendOnly produce distinct Store aliases" {
     try std.testing.expectEqual(E, App.Entity);
     try std.testing.expectEqual(cached_store.CachedStore(E), Mut.Store);
     try std.testing.expectEqual(append_store.AppendStore(E), App.Store);
+}
+
+test "address parses lowercase, EIP-55, and rejects bad checksum" {
+    // EIP-55 checksum: vitalik.eth.
+    const a = address("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045");
+    try std.testing.expectEqual(@as(u8, 0xd8), a[0]);
+    try std.testing.expectEqual(@as(u8, 0x45), a[19]);
+
+    // All-lowercase: skips the checksum check.
+    const b = address("0xd8da6bf26964af9d7eed9e03e53415d37aa96045");
+    try std.testing.expectEqualSlices(u8, &a, &b);
+
+    // No-prefix lowercase: also accepted.
+    const c = address("d8da6bf26964af9d7eed9e03e53415d37aa96045");
+    try std.testing.expectEqualSlices(u8, &a, &c);
 }
 
 test "Context.stores derives one typed field per entity" {
