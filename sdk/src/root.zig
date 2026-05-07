@@ -4,18 +4,23 @@
 /// filtered index).
 const std = @import("std");
 
-pub const entity_serial = @import("entity_serial.zig");
+// Submodules.
 pub const append_store = @import("append_store.zig");
 pub const cached_store = @import("cached_store.zig");
-pub const manifest = @import("manifest.zig");
+pub const entity_serial = @import("entity_serial.zig");
+pub const handler = @import("handler.zig");
 pub const humanize = @import("humanize.zig");
-pub const AppendStore = append_store.AppendStore;
-pub const AppendError = append_store.AppendError;
-pub const CachedStore = cached_store.CachedStore;
-pub const Manifest = manifest.Manifest;
-pub const ContractDef = manifest.ContractDef;
-pub const FactoryDef = manifest.FactoryDef;
+pub const manifest = @import("manifest.zig");
+
+// Top-level re-exports for the user-facing API.
 pub const AddressParam = manifest.AddressParam;
+pub const AppendError = append_store.AppendError;
+pub const AppendStore = append_store.AppendStore;
+pub const CachedStore = cached_store.CachedStore;
+pub const ContractDef = manifest.ContractDef;
+pub const DecodedLog = handler.DecodedLog;
+pub const FactoryDef = manifest.FactoryDef;
+pub const Manifest = manifest.Manifest;
 
 /// Storage-mode marker for a mutable entity. The user passes
 /// `sdk.mutable(Account)` in the entities tuple at the `sdk.run()` call
@@ -78,6 +83,7 @@ test {
     _ = cached_store;
     _ = manifest;
     _ = humanize;
+    _ = handler;
 }
 
 test "mutable and appendOnly produce distinct Store aliases" {

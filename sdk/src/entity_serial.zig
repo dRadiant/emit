@@ -10,7 +10,7 @@ const std = @import("std");
 pub fn fixedSize(comptime F: type, comptime ctx: []const u8) comptime_int {
     return switch (@typeInfo(F)) {
         .int => @sizeOf(F),
-        .array => |a| if (@typeInfo(a.child) == .int and @sizeOf(a.child) == 1) a.len else @compileError(
+        .array => |a| if (a.child == u8) a.len else @compileError(
             "entity field '" ++ ctx ++ "' is array of '" ++ @typeName(a.child) ++ "'; only [N]u8 arrays are supported",
         ),
         else => @compileError(
@@ -19,7 +19,7 @@ pub fn fixedSize(comptime F: type, comptime ctx: []const u8) comptime_int {
     };
 }
 
-pub fn writeField(comptime F: type, value: F, out: []u8, endian: std.builtin.Endian) void {
+fn writeField(comptime F: type, value: F, out: []u8, endian: std.builtin.Endian) void {
     switch (@typeInfo(F)) {
         .int => std.mem.writeInt(F, out[0..@sizeOf(F)], value, endian),
         .array => @memcpy(out[0..@sizeOf(F)], &value),
@@ -27,7 +27,7 @@ pub fn writeField(comptime F: type, value: F, out: []u8, endian: std.builtin.End
     }
 }
 
-pub fn readField(comptime F: type, in: []const u8, endian: std.builtin.Endian) F {
+fn readField(comptime F: type, in: []const u8, endian: std.builtin.Endian) F {
     return switch (@typeInfo(F)) {
         .int => std.mem.readInt(F, in[0..@sizeOf(F)], endian),
         .array => in[0..@sizeOf(F)].*,
