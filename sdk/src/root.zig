@@ -9,6 +9,7 @@ pub const append_store = @import("append_store.zig");
 pub const block_context = @import("block_context.zig");
 pub const cached_store = @import("cached_store.zig");
 pub const entity_serial = @import("entity_serial.zig");
+pub const filter_builder = @import("filter_builder.zig");
 pub const handler = @import("handler.zig");
 pub const humanize = @import("humanize.zig");
 pub const manifest = @import("manifest.zig");
@@ -87,6 +88,7 @@ test {
     _ = humanize;
     _ = handler;
     _ = block_context;
+    _ = filter_builder;
 }
 
 test "mutable and appendOnly produce distinct Store aliases" {

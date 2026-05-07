@@ -280,7 +280,8 @@ test "bloom scan finds written blocks" {
     defer matching.deinit(std.testing.allocator);
     var scanned: u64 = 0;
 
-    core.block_filter.scanBlooms(&reader, target_addr, 0, 200, &matching, &scanned, std.testing.allocator);
+    const targets = [_][20]u8{target_addr};
+    try core.block_filter.scanBlooms(&reader, &targets, &.{}, 0, 200, &matching, &scanned, std.testing.allocator);
 
     try std.testing.expectEqual(@as(u64, 3), scanned);
     try std.testing.expectEqual(@as(usize, 2), matching.items.len);
