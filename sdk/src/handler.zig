@@ -52,6 +52,15 @@ pub const DecodedLog = struct {
         return std.mem.readInt(u256, self.data[start..][0..32], .big);
     }
 
+    /// Read the `word`-th 32-byte slot of `data` as an address. EVM
+    /// addresses are right-padded inside their 32-byte word; the trailing
+    /// 20 bytes are the address. Symmetric with `indexedAddress` for the
+    /// non-indexed case (e.g., Uniswap V2 `PairCreated`'s `pair`).
+    pub fn dataAddress(self: DecodedLog, word: u8) [20]u8 {
+        const start = @as(usize, word) * 32;
+        return self.data[start + 12 .. start + 32].*;
+    }
+
     /// Canonical 16-byte event id: `block_number(BE u64) ++ tx_index(BE u32) ++ log_index(BE u32)`.
     /// Big-endian so MDBX byte order matches dispatch order, satisfying
     /// `MDBX_APPEND` for immutable event entities. The same construction
