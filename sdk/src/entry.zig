@@ -243,8 +243,11 @@ fn entitiesLen(comptime entities: anytype) u32 {
 /// Comptime-build the inner struct that holds one entity store per tuple
 /// element, used as the type of `Context.stores`. Field names derive from
 /// the entity type's basename: lowercase the first byte and append `s`
-/// (e.g. `Account` → `accounts`). Two entity types whose basenames
-/// lowercase-collide raise `@compileError`.
+/// (e.g. `Account` → `accounts`). An entity type may override this with
+/// `pub const store_name = "balances";` — useful when the auto-derived
+/// name is ugly (`LBTCBalance` → `lBTCBalances`) or collides with another
+/// entity. Two entities whose effective store names collide raise
+/// `@compileError`.
 fn StoresStruct(comptime entities: anytype) type {
     const E = @TypeOf(entities);
     const info = @typeInfo(E);
@@ -302,11 +305,18 @@ fn StoresStruct(comptime entities: anytype) type {
 
 fn entityFieldName(comptime T: type) [:0]const u8 {
     return comptime blk: {
+        if (@hasDecl(T, "store_name")) {
+            const override: []const u8 = T.store_name;
+            if (override.len == 0) @compileError(
+                "sdk.Context: entity type '" ++ @typeName(T) ++ "' declared `pub const store_name` but it is empty.",
+            );
+            break :blk std.fmt.comptimePrint("{s}", .{override});
+        }
         const full = @typeName(T);
         const start = if (std.mem.lastIndexOfScalar(u8, full, '.')) |idx| idx + 1 else 0;
         const basename = full[start..];
         if (basename.len == 0) @compileError(
-            "sdk.Context: entity type '" ++ full ++ "' has empty basename. Cannot derive store field name.",
+            "sdk.Context: entity type '" ++ full ++ "' has empty basename. Cannot derive store field name. Add `pub const store_name = \"...\";` to override.",
         );
         break :blk std.fmt.comptimePrint("{c}{s}s", .{ std.ascii.toLower(basename[0]), basename[1..] });
     };
@@ -330,7 +340,20 @@ const Account = struct {
     balance: u64,
 };
 
+const LBTCBalance = struct {
+    pub const store_name = "balances";
+    id: [20]u8,
+    amount: u64,
+};
+
 const ADDR_TOKEN: [20]u8 = [_]u8{0xAE} ** 20;
+
+test "store_name override beats the default basename derivation" {
+    const Ctx = Context(.{root.mutable(LBTCBalance)});
+    const Stores = std.meta.fieldInfo(Ctx, .stores).type;
+    try testing.expect(@hasField(Stores, "balances"));
+    try testing.expect(!@hasField(Stores, "lBTCBalances"));
+}
 
 const TransferHandler = struct {
     pub fn handleTransfer(log: @import("handler.zig").DecodedLog, ctx: anytype) !void {
