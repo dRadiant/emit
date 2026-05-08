@@ -58,7 +58,7 @@ pub const DecodedLog = struct {
     /// non-indexed case (e.g., Uniswap V2 `PairCreated`'s `pair`).
     pub fn dataAddress(self: DecodedLog, word: u8) [20]u8 {
         const start = @as(usize, word) * 32;
-        return self.data[start + 12 .. start + 32].*;
+        return self.data[start + 12 ..][0..20].*;
     }
 
     /// Canonical 16-byte event id: `block_number(BE u64) ++ tx_index(BE u32) ++ log_index(BE u32)`.
@@ -200,6 +200,38 @@ test "dispatch propagates handler errors" {
     var f = Failing{};
     const res = D.dispatch(Failing, makeLog(comptime manifest.eventTopic0(Transfer)), &f);
     try std.testing.expectError(error.HandlerFailed, res);
+}
+
+test "DecodedLog decoder helpers extract addresses and u256 from data" {
+    // Mimic Uniswap V2 PairCreated layout: token0/token1 indexed in topics,
+    // pair non-indexed in data[0..32], a uint256 count in data[32..64].
+    const TOKEN0 = [_]u8{0xAA} ** 20;
+    const TOKEN1 = [_]u8{0xBB} ** 20;
+    const PAIR = [_]u8{0xCC} ** 20;
+
+    var topics: [4][32]u8 = std.mem.zeroes([4][32]u8);
+    @memcpy(topics[1][12..32], &TOKEN0);
+    @memcpy(topics[2][12..32], &TOKEN1);
+
+    var data_buf: [64]u8 = std.mem.zeroes([64]u8);
+    @memcpy(data_buf[12..32], &PAIR);
+    std.mem.writeInt(u256, data_buf[32..64], 12345, .big);
+
+    const log: DecodedLog = .{
+        .block_number = 1,
+        .tx_index = 0,
+        .log_index = 0,
+        .tx_hash = [_]u8{0} ** 32,
+        .address = [_]u8{0} ** 20,
+        .topics = topics,
+        .topic_count = 3,
+        .data = &data_buf,
+    };
+
+    try std.testing.expectEqualSlices(u8, &TOKEN0, &log.indexedAddress(0));
+    try std.testing.expectEqualSlices(u8, &TOKEN1, &log.indexedAddress(1));
+    try std.testing.expectEqualSlices(u8, &PAIR, &log.dataAddress(0));
+    try std.testing.expectEqual(@as(u256, 12345), log.dataU256(1));
 }
 
 test "DecodedLog.fromRawLog preserves all fields" {
