@@ -10,7 +10,7 @@ The SDK has two storage surfaces with different requirements.
 
 **Filtered index** is an internal artifact. It is rebuildable from the engine's flat store, append-only during build, read-only during scan, has no durability requirement, and is never accessed by the user. The current design stores it in `filtered_index.mdbx` because the prototype did.
 
-**Entity stores** are the user-facing output. They hold mutable state (`Account`, `Allowance`) and append-only event records (`Transfer`, `Approval`). They need durability, point lookups during indexing, and (for the user's API server) point lookups, range scans, and concurrent reads after indexing. The current design stores them in MDBX behind `CachedStore(T)` and `AppendStore(T)`.
+**Entity stores** are the user-facing output. They hold mutable state (`Account`, `Allowance`) and append-only event records (`Transfer`, `Approval`). They need durability, point lookups during indexing, and (for the user's API server) point lookups, range scans, and concurrent reads after indexing. The current design stores them in MDBX behind `MutableStore(T)` and `ImmutableStore(T)`.
 
 Three forces motivate revisiting this:
 
@@ -18,7 +18,7 @@ Three forces motivate revisiting this:
 2. **Cross-language friction.** A user wanting to read entity stores from Python, Rust, or JavaScript must install MDBX bindings. Coverage is uneven across ecosystems. SQLite is more universal but slower. A documented binary format readable with `struct.unpack` is the lowest-friction option.
 3. **Dependency footprint.** Pure Zig means fewer C libraries, fewer transitive dependencies, faster builds, easier auditing.
 
-The CachedStore pattern moves the indexer's hot path entirely into a HashMap. The storage backend matters only at commit boundaries (every 100K events) and during cold reads. This shrinks the performance gap between MDBX and any alternative.
+The MutableStore pattern moves the indexer's hot path entirely into a HashMap. The storage backend matters only at commit boundaries (every 100K events) and during cold reads. This shrinks the performance gap between MDBX and any alternative.
 
 ## Options
 
@@ -66,7 +66,7 @@ Filtered index becomes pure-Zig flat files matching the engine's `blocks.dat` / 
 
 **Cons**
 - SQLite is C, not Zig. Drops one C dep, adds another.
-- ~3-5x slower than MDBX on raw KV. CachedStore mitigates for the hot path; flush cost is the open question.
+- ~3-5x slower than MDBX on raw KV. MutableStore mitigates for the hot path; flush cost is the open question.
 - For very large entity counts (~5M+), SQLite write amplification becomes a real cost.
 
 ### D: Pure Zig sorted snapshot files for entity stores, flat files for filtered index
@@ -106,7 +106,7 @@ No library required. A Python reader is ~12 lines using `struct.unpack` and `bis
 
 **Pros**
 - Pure Zig. Zero C dependencies for the SDK's core storage.
-- Lowest LoC. Roughly 200 lines for both `CachedStore` and `AppendStore` combined, including the comptime serializer carried from the prototype.
+- Lowest LoC. Roughly 200 lines for both `MutableStore` and `ImmutableStore` combined, including the comptime serializer carried from the prototype.
 - Eliminates lmdbx-zig entirely from the SDK.
 - File format is documented and stable. A user with a hex editor can decode any record.
 - Beats MDBX on commit latency at the expected scales because sequential `pwrite` of contiguous bytes is faster than B-tree page modification + WAL.
@@ -121,7 +121,7 @@ No library required. A Python reader is ~12 lines using `struct.unpack` and `bis
 
 ## Considerations
 
-**Performance at the expected workloads.** With CachedStore fronting both MDBX and pure-Zig snapshot, the hot path is identical (HashMap operations). The difference is at flush boundaries.
+**Performance at the expected workloads.** With MutableStore fronting both MDBX and pure-Zig snapshot, the hot path is identical (HashMap operations). The difference is at flush boundaries.
 
 | Entity count | Sort cost | Snapshot write | MDBX commit (estimate) |
 |---|---|---|---|
@@ -132,7 +132,7 @@ No library required. A Python reader is ~12 lines using `struct.unpack` and `bis
 
 Pure-Zig wins or ties on commit latency up through ~2M entities. At ~5M+ the full-rewrite cost dominates and an incremental scheme becomes necessary.
 
-**Range-scan complexity.** Sorted by primary key. Point lookup is binary search (`O(log N)`). Range scans on the primary key are binary search to start + sequential read until end (`O(log N + K)`). For AppendStore (event records keyed by `block_number || log_index`), this gives efficient block-range queries naturally. For CachedStore (state keyed by entity identity), it gives prefix scans.
+**Range-scan complexity.** Sorted by primary key. Point lookup is binary search (`O(log N)`). Range scans on the primary key are binary search to start + sequential read until end (`O(log N + K)`). For ImmutableStore (event records keyed by `block_number || log_index`), this gives efficient block-range queries naturally. For MutableStore (state keyed by entity identity), it gives prefix scans.
 
 **Secondary indexes.** Not provided. Three honest options for users who need them:
 
@@ -169,7 +169,7 @@ Triggers for adopting option D in a follow-up change:
 **Adopting D later (likely):**
 
 - The handler API and entity-storage-spec contract stay the same.
-- `CachedStore` and `AppendStore` get new internal implementations, swapped via build flag or migrated wholesale.
+- `MutableStore` and `ImmutableStore` get new internal implementations, swapped via build flag or migrated wholesale.
 - lmdbx-zig is removed from the SDK's dependencies.
 - New deliverable: `docs/entity-format.md` documenting the binary file format.
 - New deliverable: reference C and Python readers in `examples/readers/`.

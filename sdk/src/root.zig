@@ -1,20 +1,21 @@
 /// emit sdk. Library for user indexer projects.
 ///
-/// User code should reach for `sdk.run`, `sdk.init`, `sdk.mutable`,
-/// `sdk.appendOnly`, the manifest types (`Manifest`, `ContractDef`,
-/// `FactoryDef`, `AddressParam`), `DecodedLog`, `Context`, `Options`, and
-/// `RunStats`. Everything else is implementation detail.
+/// User code should reach for `sdk.run`, `sdk.init`, the manifest types
+/// (`Manifest`, `ContractDef`, `FactoryDef`, `AddressParam`),
+/// `DecodedLog`, `Context`, `Options`, `RunStats`, `StorageMode`,
+/// `address`, `concat`, and `validateHandler`. Everything else is
+/// implementation detail.
 const std = @import("std");
 const eth = @import("eth");
 
 // Implementation modules. Kept private so the user-facing surface stays
 // small. Reach for the re-exports below instead.
-const append_store = @import("append_store.zig");
-const cached_store = @import("cached_store.zig");
+const mutable_store = @import("mutable_store.zig");
 const entity_serial = @import("entity_serial.zig");
 const entry = @import("entry.zig");
 const filter_builder = @import("filter_builder.zig");
 const handler = @import("handler.zig");
+const immutable_store = @import("immutable_store.zig");
 const scanner = @import("scanner.zig");
 
 // Public submodules: handler-helper utilities the user calls by name.
@@ -32,6 +33,16 @@ pub const Manifest = manifest.Manifest;
 pub const Options = entry.Options;
 pub const run = entry.run;
 pub const RunStats = entry.RunStats;
+
+/// Storage mode declared per-entity via `pub const storage: sdk.StorageMode`.
+/// `mutable` → MutableStore (HashMap-fronted, dirty-flag flush, supports
+/// `load` / `loadOrInit` / `save`). `immutable` → ImmutableStore
+/// (`MDBX_APPEND`, monotonic key invariant, `load` is a `@compileError`).
+///
+/// Each entity must declare its mode explicitly — there is no default.
+/// The choice is a real design decision per entity (mutable counter vs.
+/// append-only event log) and silent defaulting would mask mistakes.
+pub const StorageMode = enum { mutable, immutable };
 
 /// Parse a 20-byte Ethereum address from its hex string at compile time.
 /// Accepts an optional `0x` prefix. If the input contains any uppercase
@@ -109,37 +120,20 @@ fn concatLen(comptime T: type) comptime_int {
     return total;
 }
 
-/// Storage-mode marker for a mutable entity. Pass `sdk.mutable(Account)`
-/// in the entities tuple at the `sdk.run` call site; the SDK reads
-/// `marker.Store` to generate the `Context.stores.<name>` field at
-/// comptime.
-pub fn mutable(comptime T: type) type {
+/// Resolve the store type for entity `T`. The entity must declare
+/// `pub const storage: sdk.StorageMode = .mutable | .immutable;` —
+/// no default is provided. Used internally by `Context` and exposed for
+/// users writing their own context shapes.
+pub fn storeFor(comptime T: type) type {
     validateEntity(T);
-    return struct {
-        pub const Entity = T;
-        pub const Store = cached_store.CachedStore(T);
+    if (!@hasDecl(T, "storage")) @compileError(
+        "sdk: entity '" ++ @typeName(T) ++ "' must declare `pub const storage: sdk.StorageMode = .mutable;` or `.immutable;`. The choice is per-entity and intentional.",
+    );
+    const mode: StorageMode = T.storage;
+    return switch (mode) {
+        .mutable => mutable_store.MutableStore(T),
+        .immutable => immutable_store.ImmutableStore(T),
     };
-}
-
-/// Storage-mode marker for an append-only entity. See `mutable` for the
-/// usage shape. `Store` resolves to `AppendStore(T)` (writes use
-/// `MDBX_APPEND`; `load` is a `@compileError`).
-pub fn appendOnly(comptime T: type) type {
-    validateEntity(T);
-    return struct {
-        pub const Entity = T;
-        pub const Store = append_store.AppendStore(T);
-    };
-}
-
-/// Comptime check that `Handler` exposes the required `handle<EventName>`
-/// methods for every event declared in `m`. `sdk.run` runs the same check
-/// internally; this helper lets users surface the error at the top of their
-/// build (e.g. in a `comptime { sdk.validateHandler(...) }` block) instead
-/// of waiting for the full dependency graph to compile.
-pub fn validateHandler(comptime m: Manifest, comptime Handler: type) void {
-    const D = handler.dispatcherFor(m);
-    D.validateHandler(Handler);
 }
 
 /// Comptime check that `T` is a non-empty struct. Per-field type checks
@@ -155,26 +149,26 @@ fn validateEntity(comptime T: type) void {
     );
 }
 
+/// Comptime check that `Handler` exposes the required `handle<EventName>`
+/// methods for every event declared in `m`. `sdk.run` runs the same check
+/// internally; this helper lets users surface the error at the top of their
+/// build (e.g. in a `comptime { sdk.validateHandler(...) }` block) instead
+/// of waiting for the full dependency graph to compile.
+pub fn validateHandler(comptime m: Manifest, comptime Handler: type) void {
+    const D = handler.dispatcherFor(m);
+    D.validateHandler(Handler);
+}
+
 test {
     _ = entity_serial;
-    _ = append_store;
-    _ = cached_store;
+    _ = immutable_store;
+    _ = mutable_store;
     _ = manifest;
     _ = humanize;
     _ = handler;
     _ = filter_builder;
     _ = scanner;
     _ = entry;
-}
-
-test "mutable and appendOnly produce distinct Store aliases" {
-    const E = struct { id: [8]u8, value: u64 };
-    const Mut = mutable(E);
-    const App = appendOnly(E);
-    try std.testing.expectEqual(E, Mut.Entity);
-    try std.testing.expectEqual(E, App.Entity);
-    try std.testing.expectEqual(cached_store.CachedStore(E), Mut.Store);
-    try std.testing.expectEqual(append_store.AppendStore(E), App.Store);
 }
 
 test "concat composes fixed-size byte arrays" {
@@ -210,11 +204,34 @@ test "address parses lowercase, EIP-55, and rejects bad checksum" {
     try std.testing.expectEqualSlices(u8, &a, &c);
 }
 
+test "storeFor picks MutableStore vs ImmutableStore by entity.storage" {
+    const M = struct {
+        pub const storage: StorageMode = .mutable;
+        id: [20]u8,
+        balance: u256,
+    };
+    const I = struct {
+        pub const storage: StorageMode = .immutable;
+        id: [16]u8,
+        value: u64,
+    };
+    try std.testing.expectEqual(mutable_store.MutableStore(M), storeFor(M));
+    try std.testing.expectEqual(immutable_store.ImmutableStore(I), storeFor(I));
+}
+
 test "Context.stores derives one typed field per entity" {
-    const A = struct { id: [20]u8, balance: u256 };
-    const B = struct { id: [8]u8, value: u64 };
-    const Ctx = Context(.{ mutable(A), appendOnly(B) });
+    const A = struct {
+        pub const storage: StorageMode = .mutable;
+        id: [20]u8,
+        balance: u256,
+    };
+    const B = struct {
+        pub const storage: StorageMode = .immutable;
+        id: [8]u8,
+        value: u64,
+    };
+    const Ctx = Context(.{ A, B });
     const Stores = std.meta.fieldInfo(Ctx, .stores).type;
-    try std.testing.expectEqual(cached_store.CachedStore(A), @FieldType(Stores, "as"));
-    try std.testing.expectEqual(append_store.AppendStore(B), @FieldType(Stores, "bs"));
+    try std.testing.expectEqual(mutable_store.MutableStore(A), @FieldType(Stores, "as"));
+    try std.testing.expectEqual(immutable_store.ImmutableStore(B), @FieldType(Stores, "bs"));
 }

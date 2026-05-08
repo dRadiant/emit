@@ -1,12 +1,23 @@
-/// CachedStore(T): comptime-generated MDBX wrapper with HashMap-fronted reads
-/// for mutable entities (accounts, allowances, pool reserves).
+/// MutableStore(T): comptime-generated MDBX wrapper for mutable entities
+/// (accounts, allowances, pool reserves).
 ///
-/// Reads hit the cache (~50ns) before MDBX (~1µs). Writes update the cache
-/// only and set a dirty flag. flush() drains dirty entries to MDBX. The
-/// cache persists across commits and only dirty flags are reset, so a
-/// Transfer handler that touches the same Account in many blocks pays one
-/// MDBX read, not one per touch. Measured 3.3x handler speedup in the
-/// prototype.
+/// The "mutable" name pairs with `ImmutableStore` and matches the user-
+/// facing `StorageMode.mutable` declared on the entity type. The
+/// "mutable" semantics — repeated `load` → mutate → `save` over the same
+/// primary key without paying an MDBX read every time — are made
+/// practical by an in-memory HashMap cache in front of the MDBX DBI:
+///
+///   - `load` hits the cache (~50ns) before falling through to MDBX (~1µs).
+///   - `save` updates the cache only and sets a dirty flag.
+///   - `flush` drains dirty entries to MDBX in bulk.
+///   - The cache persists across commits; only dirty flags are reset.
+///
+/// Without the cache, a Transfer handler that touches the same Account in
+/// many blocks would pay one MDBX read per touch. With it, that becomes
+/// one MDBX read for the lifetime of the backfill. Measured 3.3× handler
+/// speedup in the prototype. The cache is the *implementation* that makes
+/// the mutable storage mode performant; the type's name reflects the
+/// concept users reason about.
 ///
 /// Not thread-safe. Stage 2 dispatch is single-threaded. Entity-store
 /// mutations from parallel handlers would need a separate sharding scheme.
@@ -14,9 +25,9 @@ const std = @import("std");
 const lmdbx = @import("lmdbx");
 const entity_serial = @import("entity_serial.zig");
 
-pub fn CachedStore(comptime T: type) type {
+pub fn MutableStore(comptime T: type) type {
     const fields = @typeInfo(T).@"struct".fields;
-    if (fields.len == 0) @compileError("CachedStore: entity '" ++ @typeName(T) ++ "' has no fields. The first field must be the primary key.");
+    if (fields.len == 0) @compileError("MutableStore: entity '" ++ @typeName(T) ++ "' has no fields. The first field must be the primary key.");
 
     const KeyField = fields[0].type;
     const key_field_name = fields[0].name;
@@ -34,8 +45,8 @@ pub fn CachedStore(comptime T: type) type {
 
         dbi: lmdbx.Database.DBI,
         cache: std.AutoHashMap(KeyField, CacheEntry),
-        /// Borrow into the owning Context's `active_txn` field. The
-        /// Context replaces its own `active_txn` value on every commit
+        /// Borrow into the owning Context's `_active_txn` field. The
+        /// Context replaces its own `_active_txn` value on every commit
         /// boundary, so reading through this pointer always sees the
         /// transaction that's currently active. Stores never own or
         /// rebind the txn themselves.
@@ -84,8 +95,8 @@ pub fn CachedStore(comptime T: type) type {
         }
 
         /// Save derives the primary key from `entity`'s first field. Single-arg
-        /// save matches `AppendStore.save(entity)` so the two store types feel
-        /// uniform from a handler's perspective.
+        /// save matches `ImmutableStore.save(entity)` so the two store types
+        /// feel uniform from a handler's perspective.
         pub fn save(self: *Self, entity: T) !void {
             const key = @field(entity, key_field_name);
             try self.cache.put(key, .{ .entity = entity, .dirty = true });
@@ -128,7 +139,7 @@ fn openTestEnv(tmp: *std.testing.TmpDir) !lmdbx.Environment {
 }
 
 test "load after save returns cached value without touching MDBX" {
-    const S = CachedStore(Account);
+    const S = MutableStore(Account);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const env = try openTestEnv(&tmp);
@@ -149,7 +160,7 @@ test "load after save returns cached value without touching MDBX" {
 }
 
 test "flush writes only dirty entries" {
-    const S = CachedStore(Account);
+    const S = MutableStore(Account);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const env = try openTestEnv(&tmp);
@@ -197,7 +208,7 @@ test "flush writes only dirty entries" {
 }
 
 test "cache survives flush, commit, and a new transaction" {
-    const S = CachedStore(Account);
+    const S = MutableStore(Account);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const env = try openTestEnv(&tmp);
@@ -225,7 +236,7 @@ test "cache survives flush, commit, and a new transaction" {
 }
 
 test "loadOrInit returns existing entity, else zeroed entity with key set" {
-    const S = CachedStore(Account);
+    const S = MutableStore(Account);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const env = try openTestEnv(&tmp);

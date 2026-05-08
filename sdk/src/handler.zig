@@ -52,7 +52,7 @@ pub const DecodedLog = struct {
 
     /// Canonical 16-byte event id: `block_number(BE u64) ++ tx_index(BE u32) ++ log_index(BE u32)`.
     /// Big-endian so MDBX byte order matches dispatch order, satisfying
-    /// `MDBX_APPEND` for append-only event entities. The same construction
+    /// `MDBX_APPEND` for immutable event entities. The same construction
     /// underpins envio's `${block.number}-${logIndex}` string id without
     /// the runtime concat.
     pub fn eventId(self: DecodedLog) [16]u8 {

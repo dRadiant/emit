@@ -15,8 +15,7 @@ const core = @import("core");
 const sdk_manifest = @import("manifest.zig");
 const filter_builder = @import("filter_builder.zig");
 const scanner = @import("scanner.zig");
-const cached_store = @import("cached_store.zig");
-const append_store = @import("append_store.zig");
+const root = @import("root.zig");
 
 pub const Options = struct {
     /// Directory containing the engine's flat store
@@ -46,7 +45,8 @@ pub const RunStats = struct {
 };
 
 /// Comptime-generate the long-lived context type. `entities` is the user's
-/// tuple of `sdk.mutable(T) / sdk.appendOnly(T)` markers.
+/// tuple of entity types; each entity declares
+/// `pub const storage: sdk.StorageMode = .mutable | .immutable;`.
 ///
 /// Heap-allocated by `init` so each store can hold a stable
 /// `*const lmdbx.Transaction` pointer into `self._active_txn`. When
@@ -210,9 +210,9 @@ pub fn init(
 
     // Phase 4 store open.
     inline for (std.meta.fields(@TypeOf(entities))) |entity_field| {
-        const Marker = @field(entities, entity_field.name);
-        const StoreT = Marker.Store;
-        const dbi_name = comptime entityFieldName(Marker.Entity);
+        const T = @field(entities, entity_field.name);
+        const StoreT = root.storeFor(T);
+        const dbi_name = comptime entityFieldName(T);
         @field(ctx.stores, dbi_name) = try StoreT.open(allocator, &ctx._active_txn, dbi_name);
     }
 
@@ -252,29 +252,29 @@ fn StoresStruct(comptime entities: anytype) type {
     const E = @TypeOf(entities);
     const info = @typeInfo(E);
     if (info != .@"struct" or !info.@"struct".is_tuple) @compileError(
-        "sdk.Context: entities must be a tuple of sdk.mutable(T) or sdk.appendOnly(T) markers, got '" ++ @typeName(E) ++ "'",
+        "sdk.Context: entities must be a tuple of entity types, got '" ++ @typeName(E) ++ "'",
     );
 
     const tuple_fields = info.@"struct".fields;
 
     comptime var derived: [tuple_fields.len][:0]const u8 = undefined;
     inline for (tuple_fields, 0..) |f, i| {
-        const Marker = @field(entities, f.name);
-        if (@TypeOf(Marker) != type or !@hasDecl(Marker, "Entity") or !@hasDecl(Marker, "Store")) {
-            @compileError(std.fmt.comptimePrint(
-                "sdk.Context: entities[{d}] is not a marker produced by sdk.mutable() or sdk.appendOnly()",
-                .{i},
-            ));
-        }
-        derived[i] = entityFieldName(Marker.Entity);
+        const T = @field(entities, f.name);
+        if (@TypeOf(T) != type) @compileError(std.fmt.comptimePrint(
+            "sdk.Context: entities[{d}] is not a type. Pass entity types directly: `.{{ Account, Allowance, Transfer, Approval }}`.",
+            .{i},
+        ));
+        // storeFor enforces the `pub const storage: sdk.StorageMode` decl.
+        _ = root.storeFor(T);
+        derived[i] = entityFieldName(T);
     }
 
     inline for (derived, 0..) |a, i| {
         if (i + 1 >= derived.len) break;
         inline for (derived[i + 1 ..], i + 1..) |b, j| {
             if (std.mem.eql(u8, a, b)) {
-                const Ai = @field(entities, tuple_fields[i].name).Entity;
-                const Aj = @field(entities, tuple_fields[j].name).Entity;
+                const Ai = @field(entities, tuple_fields[i].name);
+                const Aj = @field(entities, tuple_fields[j].name);
                 @compileError(std.fmt.comptimePrint(
                     "sdk.Context: entity types '{s}' and '{s}' both derive store field name '{s}'. Rename one of the entity types.",
                     .{ @typeName(Ai), @typeName(Aj), a },
@@ -285,13 +285,14 @@ fn StoresStruct(comptime entities: anytype) type {
 
     var struct_fields: [tuple_fields.len]std.builtin.Type.StructField = undefined;
     inline for (tuple_fields, 0..) |f, i| {
-        const Marker = @field(entities, f.name);
+        const T = @field(entities, f.name);
+        const StoreT = root.storeFor(T);
         struct_fields[i] = .{
             .name = derived[i],
-            .type = Marker.Store,
+            .type = StoreT,
             .default_value_ptr = null,
             .is_comptime = false,
-            .alignment = @alignOf(Marker.Store),
+            .alignment = @alignOf(StoreT),
         };
     }
 
@@ -325,7 +326,6 @@ fn entityFieldName(comptime T: type) [:0]const u8 {
 // ── Tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-const root = @import("root.zig");
 const types = core.types;
 const log_serial = core.log_serial;
 const flat_reader = core.flat_reader;
@@ -336,11 +336,13 @@ const Transfer = struct {
 };
 
 const Account = struct {
+    pub const storage: root.StorageMode = .mutable;
     id: [20]u8,
     balance: u64,
 };
 
 const LBTCBalance = struct {
+    pub const storage: root.StorageMode = .mutable;
     pub const store_name = "balances";
     id: [20]u8,
     amount: u64,
@@ -349,7 +351,7 @@ const LBTCBalance = struct {
 const ADDR_TOKEN: [20]u8 = [_]u8{0xAE} ** 20;
 
 test "store_name override beats the default basename derivation" {
-    const Ctx = Context(.{root.mutable(LBTCBalance)});
+    const Ctx = Context(.{LBTCBalance});
     const Stores = std.meta.fieldInfo(Ctx, .stores).type;
     try testing.expect(@hasField(Stores, "balances"));
     try testing.expect(!@hasField(Stores, "lBTCBalances"));
@@ -486,7 +488,7 @@ test "init: backfills planted Transfers and final balances match" {
     const ctx = try init(
         Manifest,
         TransferHandler,
-        .{root.mutable(Account)},
+        .{Account},
         .{
             .engine_data_dir = src_path,
             .data_dir = data_path,
@@ -542,7 +544,7 @@ test "run: returns stats and tears down without leaking" {
     const stats = try run(
         Manifest,
         TransferHandler,
-        .{root.mutable(Account)},
+        .{Account},
         .{
             .engine_data_dir = src_path,
             .data_dir = data_path,
@@ -592,7 +594,7 @@ test "init + replay commit batching: ctx.commitCycle fires per commit_interval" 
     const ctx = try init(
         Manifest,
         TransferHandler,
-        .{root.mutable(Account)},
+        .{Account},
         .{
             .engine_data_dir = src_path,
             .data_dir = data_path,

@@ -1,4 +1,4 @@
-/// Comptime serialization helpers shared by AppendStore and CachedStore.
+/// Comptime serialization helpers shared by MutableStore and ImmutableStore.
 ///
 /// Entities are pure data structs whose fields are integers or fixed-size
 /// `[N]u8` arrays. Keys (the first field) are big-endian so MDBX byte order

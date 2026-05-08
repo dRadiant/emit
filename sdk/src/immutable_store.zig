@@ -1,14 +1,15 @@
-/// AppendStore(T): comptime-generated MDBX writer for append-only entities.
+/// ImmutableStore(T): comptime-generated MDBX writer for immutable
+/// entities (event records, audit logs).
 ///
-/// Writes use MDBX_APPEND (sequential insert, no B-tree traversal,
-/// ~5x faster than upsert). load() is a @compileError. The API exists so a
-/// typo on a CachedStore vs AppendStore choice fails at compile time, not
-/// at runtime.
+/// Writes use `MDBX_APPEND` (sequential insert, no B-tree traversal,
+/// ~5x faster than upsert). `load` is a `@compileError`. The API exists
+/// so a typo on a MutableStore-vs-ImmutableStore choice fails at compile
+/// time, not at runtime.
 ///
-/// Key encoding is big-endian for integer fields so MDBX byte order matches
-/// numeric order. Fixed-size arrays pass through unchanged: callers
-/// construct their primary keys (event IDs, addresses) with the byte layout
-/// they want.
+/// Key encoding is big-endian for integer fields so MDBX byte order
+/// matches numeric order. Fixed-size arrays pass through unchanged:
+/// callers construct their primary keys (event IDs, addresses) with the
+/// byte layout they want.
 const std = @import("std");
 const lmdbx = @import("lmdbx");
 const entity_serial = @import("entity_serial.zig");
@@ -17,9 +18,9 @@ const entity_serial = @import("entity_serial.zig");
 /// MDBX_EKEYMISMATCH so wrapper or upstream renames don't leak.
 pub const AppendError = error{KeyOutOfOrder} || lmdbx.Error;
 
-pub fn AppendStore(comptime T: type) type {
+pub fn ImmutableStore(comptime T: type) type {
     const fields = @typeInfo(T).@"struct".fields;
-    if (fields.len == 0) @compileError("AppendStore: entity '" ++ @typeName(T) ++ "' has no fields. The first field must be the primary key.");
+    if (fields.len == 0) @compileError("ImmutableStore: entity '" ++ @typeName(T) ++ "' has no fields. The first field must be the primary key.");
 
     const KEY_SIZE = entity_serial.fixedSize(fields[0].type, @typeName(T) ++ "." ++ fields[0].name);
     const VALUE_SIZE = entity_serial.entitySize(T);
@@ -31,14 +32,14 @@ pub fn AppendStore(comptime T: type) type {
         pub const value_size = VALUE_SIZE;
 
         dbi: lmdbx.Database.DBI,
-        /// Borrow into the owning Context's `active_txn` field. Updated
+        /// Borrow into the owning Context's `_active_txn` field. Updated
         /// implicitly when the Context replaces its txn at commit
         /// boundaries; the store reads through the pointer at every save.
         active_txn: *const lmdbx.Transaction,
 
         /// `allocator` is unused; the parameter exists so the signature
-        /// matches `CachedStore(T).open` and the SDK orchestration layer
-        /// can iterate the entities tuple with a single store.open call.
+        /// matches `MutableStore(T).open` and the SDK orchestration layer
+        /// can iterate the entities tuple with a single `store.open` call.
         pub fn open(_: std.mem.Allocator, txn_ref: *const lmdbx.Transaction, name: [*:0]const u8) !Self {
             const db = try lmdbx.Database.open(txn_ref.*, name, .{ .create = true });
             return .{ .dbi = db.dbi, .active_txn = txn_ref };
@@ -58,12 +59,12 @@ pub fn AppendStore(comptime T: type) type {
             };
         }
 
-        /// Append-only entities are never loaded during backfill. The cache
-        /// in CachedStore exists for the mutable case; calling load on an
-        /// AppendStore is almost always a CachedStore/AppendStore mixup, so
-        /// catch it at compile time.
+        /// Immutable entities are never loaded during backfill. The cache
+        /// in MutableStore exists for the mutable case; calling `load` on
+        /// an ImmutableStore is almost always a MutableStore/ImmutableStore
+        /// mixup, so catch it at compile time.
         pub fn load(_: Self, _: anytype) !?T {
-            @compileError("AppendStore.load is not supported: cannot load append-only entities during backfill");
+            @compileError("ImmutableStore.load is not supported: cannot load immutable entities during backfill");
         }
 
         pub fn flush(_: *Self) !void {}
@@ -74,7 +75,7 @@ pub fn AppendStore(comptime T: type) type {
 
 test "comptime sizes" {
     const E = struct { id: [8]u8, addr: [20]u8, value: u256, block: u64 };
-    const S = AppendStore(E);
+    const S = ImmutableStore(E);
     try std.testing.expectEqual(@as(usize, 8), S.key_size);
     try std.testing.expectEqual(@as(usize, 8 + 20 + 32 + 8), S.value_size);
 }
@@ -84,7 +85,7 @@ test "save monotonic and out-of-order against MDBX" {
         id: [8]u8,
         value: u64,
     };
-    const S = AppendStore(E);
+    const S = ImmutableStore(E);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
