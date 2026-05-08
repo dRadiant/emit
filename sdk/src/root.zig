@@ -72,6 +72,43 @@ pub fn address(comptime hex: []const u8) [20]u8 {
     };
 }
 
+/// Concatenate a tuple of fixed-size `[N]u8` arrays into a single
+/// `[total]u8`. Use to build composite primary keys without spelling out
+/// `@memcpy` calls — e.g.,
+///
+///     const id = sdk.concat(.{ owner, spender }); // [40]u8
+///     try ctx.stores.allowances.save(.{ .id = id, .value = value });
+///
+/// All parts must be `[N]u8` arrays. Length is checked at comptime; the
+/// return type is the sum of the parts' lengths.
+pub fn concat(parts: anytype) [concatLen(@TypeOf(parts))]u8 {
+    const T = @TypeOf(parts);
+    var out: [concatLen(T)]u8 = undefined;
+    var off: usize = 0;
+    inline for (std.meta.fields(T)) |f| {
+        const p = @field(parts, f.name);
+        @memcpy(out[off..][0..p.len], &p);
+        off += p.len;
+    }
+    return out;
+}
+
+fn concatLen(comptime T: type) comptime_int {
+    const info = @typeInfo(T);
+    if (info != .@"struct" or !info.@"struct".is_tuple) @compileError(
+        "sdk.concat: parts must be a tuple of [N]u8 arrays, got '" ++ @typeName(T) ++ "'",
+    );
+    var total: comptime_int = 0;
+    for (info.@"struct".fields) |f| {
+        const ft_info = @typeInfo(f.type);
+        if (ft_info != .array or ft_info.array.child != u8) @compileError(
+            "sdk.concat: every part must be a [N]u8 array; field '" ++ f.name ++ "' has type '" ++ @typeName(f.type) ++ "'",
+        );
+        total += ft_info.array.len;
+    }
+    return total;
+}
+
 /// Storage-mode marker for a mutable entity. Pass `sdk.mutable(Account)`
 /// in the entities tuple at the `sdk.run` call site; the SDK reads
 /// `marker.Store` to generate the `Context.stores.<name>` field at
@@ -138,6 +175,24 @@ test "mutable and appendOnly produce distinct Store aliases" {
     try std.testing.expectEqual(E, App.Entity);
     try std.testing.expectEqual(cached_store.CachedStore(E), Mut.Store);
     try std.testing.expectEqual(append_store.AppendStore(E), App.Store);
+}
+
+test "concat composes fixed-size byte arrays" {
+    const a: [3]u8 = .{ 1, 2, 3 };
+    const b: [2]u8 = .{ 4, 5 };
+    const c: [4]u8 = .{ 6, 7, 8, 9 };
+    const out = concat(.{ a, b, c });
+    try std.testing.expectEqual(@as(usize, 9), out.len);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9 }, &out);
+}
+
+test "concat builds owner+spender allowance key" {
+    const owner: [20]u8 = [_]u8{0xAA} ** 20;
+    const spender: [20]u8 = [_]u8{0xBB} ** 20;
+    const key = concat(.{ owner, spender });
+    try std.testing.expectEqual(@as(usize, 40), key.len);
+    try std.testing.expectEqualSlices(u8, &owner, key[0..20]);
+    try std.testing.expectEqualSlices(u8, &spender, key[20..40]);
 }
 
 test "address parses lowercase, EIP-55, and rejects bad checksum" {
