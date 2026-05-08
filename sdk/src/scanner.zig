@@ -122,11 +122,21 @@ pub fn replay(
     }
     defer if (children) |c| c.deinit();
 
-    var decompress_primary: [types.BLOCK_BUF_SIZE]u8 = undefined;
-    var decompress_children: [types.BLOCK_BUF_SIZE]u8 = undefined;
-    var log_buf_primary: [types.MAX_LOGS_PER_BLOCK]RawLog = undefined;
-    var log_buf_children: [types.MAX_LOGS_PER_BLOCK]RawLog = undefined;
-    var merge_buf: [2 * types.MAX_LOGS_PER_BLOCK]RawLog = undefined;
+    // Heap-allocated to keep replay safely within the main thread's stack
+    // limit (Linux default 8 MB). The five buffers below sum to ~15 MB on
+    // a 64-bit target with MAX_LOGS_PER_BLOCK=8192, and replay always runs
+    // on the calling thread.
+    const allocator = ctxAllocator(ctx);
+    const decompress_primary = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
+    defer allocator.free(decompress_primary);
+    const log_buf_primary = try allocator.alloc(RawLog, types.MAX_LOGS_PER_BLOCK);
+    defer allocator.free(log_buf_primary);
+    const merge_buf = try allocator.alloc(RawLog, 2 * types.MAX_LOGS_PER_BLOCK);
+    defer allocator.free(merge_buf);
+    const decompress_children = if (has_children) try allocator.alloc(u8, types.BLOCK_BUF_SIZE) else &[_]u8{};
+    defer if (has_children) allocator.free(decompress_children);
+    const log_buf_children = if (has_children) try allocator.alloc(RawLog, types.MAX_LOGS_PER_BLOCK) else &[_]RawLog{};
+    defer if (has_children) allocator.free(log_buf_children);
 
     while (true) {
         const next_p: ?u64 = primary.peek();
@@ -137,7 +147,7 @@ pub fn replay(
 
         var merge_count: usize = 0;
         if (next_p) |bn| if (bn == block_number) {
-            const logs = try primary.consume(block_number, &decompress_primary, &log_buf_primary);
+            const logs = try primary.consume(block_number, decompress_primary, log_buf_primary);
             for (logs) |log| {
                 merge_buf[merge_count] = log;
                 merge_count += 1;
@@ -145,7 +155,7 @@ pub fn replay(
         };
         if (children) |c| {
             if (next_c) |bn| if (bn == block_number) {
-                const logs = try c.consume(block_number, &decompress_children, &log_buf_children);
+                const logs = try c.consume(block_number, decompress_children, log_buf_children);
                 for (logs) |log| {
                     merge_buf[merge_count] = log;
                     merge_count += 1;
@@ -176,6 +186,16 @@ pub fn replay(
 
     result.elapsed_ns = timer.read();
     return result;
+}
+
+/// Pull an allocator off the ctx. `entry.Context` exposes it as
+/// `_allocator`; the test `Counter` uses the bare name `allocator`. Either
+/// works.
+inline fn ctxAllocator(ctx: anytype) std.mem.Allocator {
+    const T = std.meta.Child(@TypeOf(ctx));
+    if (comptime @hasField(T, "_allocator")) return ctx._allocator;
+    if (comptime @hasField(T, "allocator")) return ctx.allocator;
+    @compileError("scanner.replay: ctx of type '" ++ @typeName(T) ++ "' must expose `_allocator` or `allocator` so replay can size its merge buffers off the heap.");
 }
 
 /// Calls `ctx.commitCycle()` if the context type defines one. Tests using

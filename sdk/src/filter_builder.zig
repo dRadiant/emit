@@ -290,9 +290,14 @@ const FilterWorkerArgs = struct {
 };
 
 fn filterWorker(args: *FilterWorkerArgs) void {
-    var decompress_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
-    var log_buf: [types.MAX_LOGS_PER_BLOCK]RawLog = undefined;
-    var keep_buf: [types.MAX_LOGS_PER_BLOCK]RawLog = undefined;
+    // Heap-allocate the per-worker scratch. Combined size is ~12 MB (4 MB
+    // decompress + 2 MB log_buf + 2 MB keep_buf + 4 MB read_buf), which
+    // exceeds the typical 8 MB main-thread stack on Linux. `parallel.run`
+    // executes inline on the caller thread when num_workers <= 1, so we
+    // can't rely on the larger Zig-spawned worker stack to absorb this.
+    const decompress_buf = args.allocator.alloc(u8, types.BLOCK_BUF_SIZE) catch return;
+    const log_buf = args.allocator.alloc(RawLog, types.MAX_LOGS_PER_BLOCK) catch return;
+    const keep_buf = args.allocator.alloc(RawLog, types.MAX_LOGS_PER_BLOCK) catch return;
     const serialize_buf = args.allocator.alloc(u8, types.BLOCK_BUF_SIZE) catch return;
     const compress_buf = args.allocator.alloc(u8, types.BLOCK_BUF_SIZE) catch return;
 
@@ -329,7 +334,7 @@ fn filterWorker(args: *FilterWorkerArgs) void {
             for (done[0..n]) |c| {
                 const entry_data = pipeline.getBuffer(c);
                 if (entry_data.len > 0) {
-                    processBlockEntry(entry_data, c.block_number, args, &decompress_buf, &log_buf, &keep_buf, serialize_buf, compress_buf);
+                    processBlockEntry(entry_data, c.block_number, args, decompress_buf, log_buf, keep_buf, serialize_buf, compress_buf);
                 }
                 pipeline.releaseSlot(c.buf_slot);
                 completed += 1;
@@ -344,10 +349,10 @@ fn filterWorker(args: *FilterWorkerArgs) void {
 
     // pread fallback (non-Linux). Reads in matching_blocks order, no sort
     // needed but we sort anyway for path-uniform output.
-    var read_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
+    const read_buf = args.allocator.alloc(u8, types.BLOCK_BUF_SIZE) catch return;
     for (args.matching_blocks) |bn| {
-        const entry_data = reader.readBlock(bn, &read_buf) catch continue;
-        processBlockEntry(entry_data, bn, args, &decompress_buf, &log_buf, &keep_buf, serialize_buf, compress_buf);
+        const entry_data = reader.readBlock(bn, read_buf) catch continue;
+        processBlockEntry(entry_data, bn, args, decompress_buf, log_buf, keep_buf, serialize_buf, compress_buf);
     }
     std.mem.sort(FilteredBlock, args.results.items, {}, blockNumberLessThan);
 }
