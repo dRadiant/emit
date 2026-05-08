@@ -1,6 +1,8 @@
 /// Handler-side log shape and comptime topic0 dispatch.
 const std = @import("std");
+
 const core = @import("core");
+
 const manifest = @import("manifest.zig");
 
 /// View of a single log presented to a handler. `data` borrows from the

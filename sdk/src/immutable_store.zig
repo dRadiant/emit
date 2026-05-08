@@ -11,7 +11,9 @@
 /// callers construct their primary keys (event IDs, addresses) with the
 /// byte layout they want.
 const std = @import("std");
+
 const lmdbx = @import("lmdbx");
+
 const entity_serial = @import("entity_serial.zig");
 
 /// SDK-stable error for an out-of-order save. Decoupled from lmdbx-zig's

@@ -9,13 +9,14 @@
 /// performs the same backfill but returns a live `Context` whose entity
 /// stores stay open so the caller (e.g. an HTTP server) can read entities.
 const std = @import("std");
-const lmdbx = @import("lmdbx");
-const core = @import("core");
 
-const sdk_manifest = @import("manifest.zig");
+const core = @import("core");
+const lmdbx = @import("lmdbx");
+
 const filter_builder = @import("filter_builder.zig");
-const scanner = @import("scanner.zig");
 const root = @import("root.zig");
+const scanner = @import("scanner.zig");
+const sdk_manifest = @import("manifest.zig");
 
 pub const Options = struct {
     /// Directory containing the engine's flat store

@@ -22,7 +22,9 @@
 /// Not thread-safe. Stage 2 dispatch is single-threaded. Entity-store
 /// mutations from parallel handlers would need a separate sharding scheme.
 const std = @import("std");
+
 const lmdbx = @import("lmdbx");
+
 const entity_serial = @import("entity_serial.zig");
 
 pub fn MutableStore(comptime T: type) type {

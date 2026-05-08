@@ -5,6 +5,7 @@
 /// method suffix (defaults to the prefix before `(`, override with
 /// `pub const name = "...";`).
 const std = @import("std");
+
 const eth = @import("eth");
 
 pub const Manifest = struct {

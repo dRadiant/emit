@@ -6,7 +6,9 @@
 ///   follow --rpc <url> --data-dir <path>        Follow chain head (HTTP polling)
 ///   status --data-dir <path>                    Print flat store status
 const std = @import("std");
+
 const core = @import("core");
+
 const head_follower = @import("head_follower.zig");
 
 pub fn main() !void {

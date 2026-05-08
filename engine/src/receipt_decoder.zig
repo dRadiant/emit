@@ -2,7 +2,9 @@
 /// Extracts log entries from receipt byte arrays. Used by rocksdb_import
 /// and potentially rpc_import (if receipts arrive in compact form).
 const std = @import("std");
+
 const core = @import("core");
+
 const Rlp = @import("rlp.zig").Rlp;
 
 const types = core.types;

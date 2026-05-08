@@ -2,9 +2,12 @@
 /// Comptime-generic on queue depth so each worker thread gets its own ring.
 /// Linux-only — non-Linux platforms use the pread fallback in filter workers.
 const std = @import("std");
+
 const builtin = @import("builtin");
-const posix = std.posix;
+
 const types = @import("types.zig");
+
+const posix = std.posix;
 
 pub const supported = builtin.target.os.tag == .linux;
 

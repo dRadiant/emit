@@ -3,6 +3,7 @@
 /// Writer lives in engine; this module is read-only infrastructure shared by
 /// engine (status/validation) and sdk (filtered index builds).
 const std = @import("std");
+
 const bloom = @import("bloom.zig");
 
 // ── Flat store format constants ──────────────────────────────────────────

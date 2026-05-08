@@ -6,6 +6,7 @@
 /// the block level is address-based throughout the SDK; per-log topic
 /// filtering happens after decompression.
 const std = @import("std");
+
 const bloom = @import("bloom.zig");
 const flat_reader = @import("flat_reader.zig");
 const parallel = @import("parallel.zig");

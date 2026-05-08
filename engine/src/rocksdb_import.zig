@@ -9,8 +9,10 @@
 /// Only compiled when the rocksdb lazy dependency is available (`zig build import`).
 /// Decode logic lives in receipt_decoder.zig (testable without rocksdb).
 const std = @import("std");
+
 const c = @import("rocksdb");
 const core = @import("core");
+
 const flat_writer = @import("flat_writer.zig");
 const receipt_decoder = @import("receipt_decoder.zig");
 

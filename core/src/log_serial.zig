@@ -3,7 +3,9 @@
 /// LogEntry: tx_index(u16) || log_index(u16) || address(20) || topic_count(u8)
 ///           || topics(count×32) || data_len(u32) || data(var) || tx_hash(32)
 const std = @import("std");
+
 const lz4 = @import("lz4");
+
 const types = @import("types.zig");
 
 const RawLog = types.RawLog;

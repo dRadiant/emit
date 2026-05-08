@@ -14,13 +14,14 @@
 /// therefore that DBI names match `filter_builder.DBI_PRIMARY` and
 /// `filter_builder.DBI_CHILDREN`.
 const std = @import("std");
-const lmdbx = @import("lmdbx");
-const core = @import("core");
 
-const sdk_manifest = @import("manifest.zig");
+const core = @import("core");
+const lmdbx = @import("lmdbx");
+
 const filter_builder = @import("filter_builder.zig");
 const handler_mod = @import("handler.zig");
 const humanize = @import("humanize.zig");
+const sdk_manifest = @import("manifest.zig");
 
 const RawLog = core.RawLog;
 const log_serial = core.log_serial;

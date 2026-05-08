@@ -16,10 +16,12 @@
 /// Phase 1 sets exclude_addrs empty; phase 3 sets it to static∪factory so a
 /// static contract that's also a factory child does not appear in both DBIs.
 const std = @import("std");
+
 const builtin = @import("builtin");
+const core = @import("core");
 const lmdbx = @import("lmdbx");
 const lz4 = @import("lz4");
-const core = @import("core");
+
 const sdk_manifest = @import("manifest.zig");
 
 const RawLog = core.RawLog;

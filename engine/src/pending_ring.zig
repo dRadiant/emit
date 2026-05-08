@@ -17,7 +17,9 @@
 ///     lz4_len(u32 LE)
 ///     lz4_data(lz4_len)
 const std = @import("std");
+
 const core = @import("core");
+
 const bloom = core.bloom;
 
 pub const FINALITY_DEPTH: u64 = 64;

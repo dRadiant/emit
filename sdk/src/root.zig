@@ -6,16 +6,17 @@
 /// `address`, `concat`, and `validateHandler`. Everything else is
 /// implementation detail.
 const std = @import("std");
+
 const eth = @import("eth");
 
 // Implementation modules. Kept private so the user-facing surface stays
 // small. Reach for the re-exports below instead.
-const mutable_store = @import("mutable_store.zig");
 const entity_serial = @import("entity_serial.zig");
 const entry = @import("entry.zig");
 const filter_builder = @import("filter_builder.zig");
 const handler = @import("handler.zig");
 const immutable_store = @import("immutable_store.zig");
+const mutable_store = @import("mutable_store.zig");
 const scanner = @import("scanner.zig");
 
 // Public submodules: handler-helper utilities the user calls by name.

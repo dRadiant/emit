@@ -5,11 +5,13 @@
 /// Falls back to HTTP polling (~1s interval) if --ws not provided.
 /// Both use eth.zig for transport and JSON-RPC parsing.
 const std = @import("std");
-const eth = @import("eth");
+
 const core = @import("core");
+const eth = @import("eth");
 
 const FlatStoreWriter = @import("flat_writer.zig").FlatStoreWriter;
 const pending_ring = @import("pending_ring.zig");
+
 const PendingRing = pending_ring.PendingRing;
 const log_serial = core.log_serial;
 const types = core.types;
