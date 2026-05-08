@@ -25,6 +25,7 @@ const sdk_manifest = @import("manifest.zig");
 
 const RawLog = core.RawLog;
 const log_serial = core.log_serial;
+const parallel = core.parallel;
 const types = core.types;
 
 pub const ReplayOptions = struct {
@@ -58,15 +59,20 @@ pub fn scanCreations(
     var cursor = try db.cursor();
     defer cursor.deinit();
 
-    var decompress_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
-    var log_buf: [types.MAX_LOGS_PER_BLOCK]RawLog = undefined;
+    // Heap-allocated per the project rule (see `core.parallel`): no
+    // BLOCK_BUF_SIZE / MAX_LOGS_PER_BLOCK buffers on the stack. Caller
+    // (entry.zig) runs scanCreations on the main thread.
+    const decompress_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
+    defer allocator.free(decompress_buf);
+    const log_buf = try allocator.alloc(RawLog, types.MAX_LOGS_PER_BLOCK);
+    defer allocator.free(log_buf);
 
     var key_opt = cursor.goToFirst() catch return discovered;
     while (key_opt) |k| : (key_opt = try cursor.goToNext()) {
         const block_number = filter_builder.blockFromKey(k);
         const value = try cursor.getCurrentValue();
-        const decoded = log_serial.decompressEntry(value, &decompress_buf) catch continue;
-        const log_count = log_serial.deserializeLogs(decoded, &log_buf);
+        const decoded = log_serial.decompressEntry(value, decompress_buf) catch continue;
+        const log_count = log_serial.deserializeLogs(decoded, log_buf);
 
         for (log_buf[0..log_count]) |*log| {
             log.block_number = block_number;
@@ -89,6 +95,14 @@ pub fn scanCreations(
 /// order, dispatching each log via the comptime topic0 dispatcher. Logs
 /// with no matching event in the manifest (bloom false positives that
 /// slipped through) are silently skipped by the dispatcher, not by us.
+///
+/// `replay` reserves ~15 MB of working buffers, which exceeds the default
+/// 8 MB main-thread stack on Linux. We can't hoist the body to a worker
+/// thread (MDBX binds write transactions to their owning thread, and
+/// `ctx._active_txn` was opened by the caller) — so the buffers live on
+/// the heap, sized off whatever allocator the ctx exposes. The cost is
+/// one mmap/munmap pair for ~15 MB per run; ~1s of page-fault time on
+/// rETH-class workloads, dwarfed by the I/O.
 pub fn replay(
     env: lmdbx.Environment,
     comptime m: sdk_manifest.Manifest,
@@ -122,10 +136,6 @@ pub fn replay(
     }
     defer if (children) |c| c.deinit();
 
-    // Heap-allocated to keep replay safely within the main thread's stack
-    // limit (Linux default 8 MB). The five buffers below sum to ~15 MB on
-    // a 64-bit target with MAX_LOGS_PER_BLOCK=8192, and replay always runs
-    // on the calling thread.
     const allocator = ctxAllocator(ctx);
     const decompress_primary = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
     defer allocator.free(decompress_primary);
@@ -189,8 +199,7 @@ pub fn replay(
 }
 
 /// Pull an allocator off the ctx. `entry.Context` exposes it as
-/// `_allocator`; the test `Counter` uses the bare name `allocator`. Either
-/// works.
+/// `_allocator`; the test `Counter` uses the bare name `allocator`.
 inline fn ctxAllocator(ctx: anytype) std.mem.Allocator {
     const T = std.meta.Child(@TypeOf(ctx));
     if (comptime @hasField(T, "_allocator")) return ctx._allocator;

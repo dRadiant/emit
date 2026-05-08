@@ -290,11 +290,12 @@ const FilterWorkerArgs = struct {
 };
 
 fn filterWorker(args: *FilterWorkerArgs) void {
-    // Heap-allocate the per-worker scratch. Combined size is ~12 MB (4 MB
-    // decompress + 2 MB log_buf + 2 MB keep_buf + 4 MB read_buf), which
-    // exceeds the typical 8 MB main-thread stack on Linux. `parallel.run`
-    // executes inline on the caller thread when num_workers <= 1, so we
-    // can't rely on the larger Zig-spawned worker stack to absorb this.
+    // Per the project rule (see `core.parallel`): every buffer sized off
+    // BLOCK_BUF_SIZE or MAX_LOGS_PER_BLOCK lives on the heap, regardless of
+    // which thread runs the function. That makes filter and replay code
+    // immune to caller-stack changes — `parallel.run` spawns at
+    // `WORKER_STACK_SIZE` as defense-in-depth, but correctness no longer
+    // depends on it.
     const decompress_buf = args.allocator.alloc(u8, types.BLOCK_BUF_SIZE) catch return;
     const log_buf = args.allocator.alloc(RawLog, types.MAX_LOGS_PER_BLOCK) catch return;
     const keep_buf = args.allocator.alloc(RawLog, types.MAX_LOGS_PER_BLOCK) catch return;

@@ -53,21 +53,34 @@ const Slot = struct {
     const DONE: u8 = 2;
 };
 
+const WorkerArgs = struct {
+    slots: *[SLOT_COUNT]Slot,
+    worker_id: usize,
+    allocator: std.mem.Allocator,
+};
+
 /// Worker: decode RLP receipts → build blooms → serialize → LZ4 compress.
-/// Each worker has stack-local buffers — no sharing, no allocation.
-fn workerFn(slots: *[SLOT_COUNT]Slot, worker_id: usize) void {
-    var log_buf: [types.MAX_LOGS_PER_BLOCK]types.RawLog = undefined;
-    var data_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
-    var serialize_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
+/// Buffers are heap-allocated per the project rule (see `core.parallel`):
+/// any buffer sized off BLOCK_BUF_SIZE / MAX_LOGS_PER_BLOCK lives on the
+/// heap so the function is safe regardless of where it's spawned. Each
+/// worker holds its own buffers for the run's lifetime — one alloc pair
+/// total, no churn.
+fn workerFn(args: *WorkerArgs) void {
+    const log_buf = args.allocator.alloc(types.RawLog, types.MAX_LOGS_PER_BLOCK) catch return;
+    defer args.allocator.free(log_buf);
+    const data_buf = args.allocator.alloc(u8, types.BLOCK_BUF_SIZE) catch return;
+    defer args.allocator.free(data_buf);
+    const serialize_buf = args.allocator.alloc(u8, types.BLOCK_BUF_SIZE) catch return;
+    defer args.allocator.free(serialize_buf);
 
     while (true) {
         for (0..SLOT_COUNT) |i| {
-            if (i % parallel.MAX_WORKERS != worker_id) continue;
-            const slot = &slots[i];
+            if (i % parallel.MAX_WORKERS != args.worker_id) continue;
+            const slot = &args.slots[i];
             if (slot.state.load(.acquire) != Slot.FILLED) continue;
 
             const log_count = receipt_decoder.decodeReceipts(
-                slot.block_number, slot.raw_value[0..slot.raw_len], &log_buf, &data_buf,
+                slot.block_number, slot.raw_value[0..slot.raw_len], log_buf, data_buf,
             ) catch {
                 slot.has_error = true;
                 slot.log_count = 0;
@@ -85,7 +98,7 @@ fn workerFn(slots: *[SLOT_COUNT]Slot, worker_id: usize) void {
 
             const topic_bloom = log_serial.buildTopicBloom(log_buf[0..log_count]);
             const addr_bloom = log_serial.buildAddrBloom(log_buf[0..log_count]);
-            const serialized_len = log_serial.serializeLogs(log_buf[0..log_count], &serialize_buf);
+            const serialized_len = log_serial.serializeLogs(log_buf[0..log_count], serialize_buf);
 
             slot.entry_len = log_serial.compressEntry(serialize_buf[0..serialized_len], &slot.entry) catch {
                 slot.has_error = true;
@@ -100,7 +113,7 @@ fn workerFn(slots: *[SLOT_COUNT]Slot, worker_id: usize) void {
         }
 
         // Shutdown signal: reader sets slot 0's block_number to max after iterator exhausted
-        if (slots[0].block_number == std.math.maxInt(u64)) break;
+        if (args.slots[0].block_number == std.math.maxInt(u64)) break;
         std.atomic.spinLoopHint();
     }
 }
@@ -205,8 +218,12 @@ pub fn run(receipts_path: [*:0]const u8, output_path: []const u8) !void {
         c.rocksdb_iter_seek_to_first(iter);
     }
 
+    var worker_args: [parallel.MAX_WORKERS]WorkerArgs = undefined;
     var workers: [parallel.MAX_WORKERS]std.Thread = undefined;
-    for (0..parallel.MAX_WORKERS) |i| workers[i] = try std.Thread.spawn(.{}, workerFn, .{ slots, i });
+    for (0..parallel.MAX_WORKERS) |i| {
+        worker_args[i] = .{ .slots = slots, .worker_id = i, .allocator = allocator };
+        workers[i] = try std.Thread.spawn(.{ .stack_size = parallel.WORKER_STACK_SIZE }, workerFn, .{&worker_args[i]});
+    }
 
     // Single-threaded reader + writer loop. Reads ahead into empty slots,
     // then drains the next completed slot in order (preserves block ordering).
