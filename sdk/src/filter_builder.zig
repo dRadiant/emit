@@ -87,6 +87,7 @@ pub fn build(
         reader,
         known_addresses,
         m.start_block,
+        m.end_block orelse std.math.maxInt(u64),
         .{
             .match_addrs = known_addresses,
             .match_topics = all_topics,
@@ -122,6 +123,7 @@ pub fn appendChildren(
         reader,
         child_addresses,
         m.start_block,
+        m.end_block orelse std.math.maxInt(u64),
         .{
             .match_addrs = child_addresses,
             .match_topics = child_topics,
@@ -141,6 +143,7 @@ fn runPhase(
     reader: *const FlatStoreReader,
     bloom_addresses: []const [20]u8,
     start_block: u64,
+    end_block: u64,
     filter: Filter,
     dest_path: [*:0]const u8,
     dbi_name: [*:0]const u8,
@@ -156,7 +159,7 @@ fn runPhase(
         reader,
         bloom_addresses,
         start_block,
-        std.math.maxInt(u64),
+        end_block,
         &matching,
         &result.blocks_scanned,
         allocator,
@@ -855,6 +858,62 @@ test "appendChildren: returns zero-result for empty discovered set" {
     const result = try appendChildren(&reader, FactoryManifest, &.{}, @ptrCast(&dst_path_z), allocator);
     try testing.expectEqual(@as(u64, 0), result.blocks_scanned);
     try testing.expectEqual(@as(u64, 0), result.blocks_matched);
+}
+
+test "build: end_block clamps the scan range to a fixed window" {
+    const allocator = testing.allocator;
+
+    // Plant 50 contiguous blocks; every block has a matching ContractA log.
+    // With end_block = 119 (start_block 0, first block 100), the build
+    // should match exactly 20 blocks (100..=119) and ignore 120..=149.
+    const a_topic = topicOf(ContractA);
+    var blocks_list: std.ArrayListUnmanaged(TestBlock) = .{};
+    defer blocks_list.deinit(allocator);
+    var log_arena = std.heap.ArenaAllocator.init(allocator);
+    defer log_arena.deinit();
+    const arena = log_arena.allocator();
+    for (0..50) |i| {
+        const buf = try arena.alloc(TestLog, 1);
+        buf[0] = .{ .address = ADDR_A, .topic0 = a_topic };
+        try blocks_list.append(allocator, .{ .block_number = 100 + i, .logs = buf });
+    }
+
+    var src_tmp = testing.tmpDir(.{});
+    defer src_tmp.cleanup();
+    try writeFlatStore(src_tmp.dir, blocks_list.items, allocator);
+    var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
+    var reader = try FlatStoreReader.open(src_path);
+    defer reader.close();
+
+    const ClampedManifest: sdk_manifest.Manifest = .{
+        .name = "clamped",
+        .chain_id = 1,
+        .start_block = 0,
+        .end_block = 119,
+        .contracts = &.{.{ .name = "A", .address = ADDR_A, .events = &.{ContractA} }},
+    };
+
+    var dst_tmp = testing.tmpDir(.{});
+    defer dst_tmp.cleanup();
+    var dst_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dst_path = try dst_tmp.dir.realpath(".", &dst_path_buf);
+    var dst_path_z: [std.fs.max_path_bytes:0]u8 = undefined;
+    @memcpy(dst_path_z[0..dst_path.len], dst_path);
+    dst_path_z[dst_path.len] = 0;
+
+    const result = try build(&reader, ClampedManifest, @ptrCast(&dst_path_z), allocator);
+    try testing.expectEqual(@as(u64, 20), result.blocks_matched);
+    try testing.expectEqual(@as(u64, 20), result.total_logs);
+
+    // Verify the MDBX contents: exactly blocks 100..=119, none past 119.
+    const env = try lmdbx.Environment.init(@ptrCast(&dst_path_z), .{ .max_dbs = 2 });
+    defer env.deinit() catch {};
+    var decoded = try dumpDecodedBlocks(env, DBI_PRIMARY, allocator);
+    defer freeDecoded(&decoded, allocator);
+    try testing.expectEqual(@as(usize, 20), decoded.items.len);
+    try testing.expectEqual(@as(u64, 100), decoded.items[0].block_number);
+    try testing.expectEqual(@as(u64, 119), decoded.items[19].block_number);
 }
 
 test "blockKey/blockFromKey roundtrip and ordering" {

@@ -12,6 +12,12 @@ pub const Manifest = struct {
     name: []const u8,
     chain_id: u64,
     start_block: u64,
+    /// Optional inclusive upper bound on the scan range. `null` (the
+    /// default) scans to the flat store's `latest_block`. Set this to
+    /// pin a benchmark or test to a fixed window — e.g., to compare
+    /// entity counts byte-for-byte against an external reference that
+    /// covers a specific block range.
+    end_block: ?u64 = null,
     contracts: []const ContractDef = &.{},
     factories: []const FactoryDef = &.{},
 };
