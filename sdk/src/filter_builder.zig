@@ -296,8 +296,8 @@ fn filterWorker(args: *FilterWorkerArgs) void {
     var decompress_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
     var log_buf: [types.MAX_LOGS_PER_BLOCK]RawLog = undefined;
     var keep_buf: [types.MAX_LOGS_PER_BLOCK]RawLog = undefined;
-    const serialize_buf = args.allocator.alloc(u8, types.BLOCK_BUF_SIZE) catch return;
-    const compress_buf = args.allocator.alloc(u8, types.BLOCK_BUF_SIZE) catch return;
+    var serialize_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
+    var compress_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
 
     const reader = args.reader;
 
@@ -332,7 +332,7 @@ fn filterWorker(args: *FilterWorkerArgs) void {
             for (done[0..n]) |c| {
                 const entry_data = pipeline.getBuffer(c);
                 if (entry_data.len > 0) {
-                    processBlockEntry(entry_data, c.block_number, args, &decompress_buf, &log_buf, &keep_buf, serialize_buf, compress_buf);
+                    processBlockEntry(entry_data, c.block_number, args, &decompress_buf, &log_buf, &keep_buf, &serialize_buf, &compress_buf);
                 }
                 pipeline.releaseSlot(c.buf_slot);
                 completed += 1;
@@ -350,7 +350,7 @@ fn filterWorker(args: *FilterWorkerArgs) void {
     var read_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
     for (args.matching_blocks) |bn| {
         const entry_data = reader.readBlock(bn, &read_buf) catch continue;
-        processBlockEntry(entry_data, bn, args, &decompress_buf, &log_buf, &keep_buf, serialize_buf, compress_buf);
+        processBlockEntry(entry_data, bn, args, &decompress_buf, &log_buf, &keep_buf, &serialize_buf, &compress_buf);
     }
     std.mem.sort(FilteredBlock, args.results.items, {}, blockNumberLessThan);
 }
