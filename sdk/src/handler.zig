@@ -71,14 +71,29 @@ pub const DecodedLog = struct {
     /// → `uN`, `intN` → `iN`, `bool` → `bool`, `bytesN` → `[N]u8`. Wrong
     /// arg name lists the available args; dynamic types (`bytes`, `string`)
     /// are rejected with a pointer at the slot-positional helpers.
-    pub fn arg(self: DecodedLog, comptime E: type, comptime arg_name: []const u8) ResolvedArgType(E, arg_name) {
+    pub fn arg(self: DecodedLog, comptime E: type, comptime arg_name: []const u8) TypeFor(resolveArg(E, arg_name).type_str) {
         const p = comptime resolveArg(E, arg_name);
-        const T = ResolvedArgType(E, arg_name);
         const word: [32]u8 = switch (comptime p.slot_kind) {
             .topic => self.topics[comptime p.slot_index],
             .data => self.data[comptime p.slot_index..][0..32].*,
         };
-        return decodeWord(T, p.type_str, &word);
+        return decodeWord(TypeFor(p.type_str), p.type_str, &word);
+    }
+
+    /// Decode every named arg of `E.signature` into one struct.
+    /// `ArgsOf(E)` has one field per named arg with the right Zig type
+    /// (see `arg` for the type mapping). Unnamed args are skipped.
+    pub fn decode(self: DecodedLog, comptime E: type) ArgsOf(E) {
+        var out: ArgsOf(E) = undefined;
+        inline for (comptime manifest.parsedEvent(E).params) |p| {
+            if (comptime p.name.len == 0) continue;
+            const word: [32]u8 = switch (comptime p.slot_kind) {
+                .topic => self.topics[comptime p.slot_index],
+                .data => self.data[comptime p.slot_index..][0..32].*,
+            };
+            @field(out, p.name) = decodeWord(TypeFor(p.type_str), p.type_str, &word);
+        }
+        return out;
     }
 
     /// Canonical 16-byte event id: `block_number(BE u64) ++ tx_index(BE u32) ++ log_index(BE u32)`.
@@ -101,10 +116,10 @@ fn resolveArg(comptime E: type, comptime arg_name: []const u8) abi_parse.ParsedP
     return comptime abi_parse.paramByName(manifest.parsedEvent(E), arg_name);
 }
 
-/// Map a parsed Solidity type to the Zig type the decoder returns.
-fn ResolvedArgType(comptime E: type, comptime arg_name: []const u8) type {
-    const p = comptime resolveArg(E, arg_name);
-    const t = p.type_str;
+/// Map a Solidity type string to the Zig type the decoder returns:
+/// `address`→`[20]u8`, `uintN`→`uN`, `intN`→`iN`, `bytesN`→`[N]u8`,
+/// `bool`→`bool`. Dynamic types (`bytes`, `string`) are rejected.
+pub fn TypeFor(comptime t: []const u8) type {
     if (comptime std.mem.eql(u8, t, "address")) return [20]u8;
     if (comptime std.mem.eql(u8, t, "bool")) return bool;
     if (comptime std.mem.startsWith(u8, t, "uint")) return std.meta.Int(.unsigned, parseBits(t["uint".len..]));
@@ -112,7 +127,35 @@ fn ResolvedArgType(comptime E: type, comptime arg_name: []const u8) type {
     if (comptime std.mem.startsWith(u8, t, "bytes") and t.len > "bytes".len) {
         return [parseBits(t["bytes".len..])]u8;
     }
-    @compileError("DecodedLog.arg: type `" ++ t ++ "` not supported by auto-decoder. Read directly from `log.topics[..]` / `log.data[..]`.");
+    @compileError("DecodedLog: type `" ++ t ++ "` not supported by auto-decoder. Use slot-positional helpers.");
+}
+
+/// Comptime struct synthesized from `E.signature`: one field per named
+/// arg with the right Zig type (see `TypeFor`). Unnamed args are
+/// skipped — for fully-positional reads, use `log.arg` / `log.dataU256`.
+pub fn ArgsOf(comptime E: type) type {
+    return comptime blk: {
+        var fields: []const std.builtin.Type.StructField = &.{};
+        for (manifest.parsedEvent(E).params) |p| {
+            if (p.name.len == 0) continue;
+            const T = TypeFor(p.type_str);
+            // StructField.name needs a sentinel; the parser's slice into the
+            // signature has none, so reformat at comptime.
+            fields = fields ++ &[_]std.builtin.Type.StructField{.{
+                .name = std.fmt.comptimePrint("{s}", .{p.name}),
+                .type = T,
+                .default_value_ptr = null,
+                .is_comptime = false,
+                .alignment = @alignOf(T),
+            }};
+        }
+        break :blk @Type(.{ .@"struct" = .{
+            .layout = .auto,
+            .fields = fields,
+            .decls = &.{},
+            .is_tuple = false,
+        } });
+    };
 }
 
 fn decodeWord(comptime T: type, comptime type_str: []const u8, word: *const [32]u8) T {
@@ -359,6 +402,32 @@ test "arg returns the right narrow integer type for sub-256 uintN" {
     try std.testing.expectEqual(u112, @TypeOf(r1));
     try std.testing.expectEqual(@as(u112, 0x1234), r0);
     try std.testing.expectEqual(@as(u112, 0xabcd), r1);
+}
+
+test "decode returns a struct with one field per named arg, correct types" {
+    const Sync = struct {
+        pub const signature = "Sync(uint112 reserve0, uint112 reserve1)";
+    };
+    var data_buf: [64]u8 = std.mem.zeroes([64]u8);
+    std.mem.writeInt(u256, data_buf[0..32], 100, .big);
+    std.mem.writeInt(u256, data_buf[32..64], 200, .big);
+
+    const log: DecodedLog = .{
+        .block_number = 1,
+        .tx_index = 0,
+        .log_index = 0,
+        .tx_hash = [_]u8{0} ** 32,
+        .address = [_]u8{0} ** 20,
+        .topics = std.mem.zeroes([4][32]u8),
+        .topic_count = 1,
+        .data = &data_buf,
+    };
+
+    const a = log.decode(Sync);
+    try std.testing.expectEqual(u112, @TypeOf(a.reserve0));
+    try std.testing.expectEqual(u112, @TypeOf(a.reserve1));
+    try std.testing.expectEqual(@as(u112, 100), a.reserve0);
+    try std.testing.expectEqual(@as(u112, 200), a.reserve1);
 }
 
 test "arg returns bool and bytesN with the right Zig types" {

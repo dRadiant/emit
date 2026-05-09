@@ -24,6 +24,7 @@ pub const humanize = @import("humanize.zig");
 pub const manifest = @import("manifest.zig");
 
 // User-facing top-level surface.
+pub const ArgsOf = handler.ArgsOf;
 pub const Context = entry.Context;
 pub const ContractDef = manifest.ContractDef;
 pub const DecodedLog = handler.DecodedLog;
