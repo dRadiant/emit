@@ -64,6 +64,12 @@ pub const RunStats = struct {
 /// or mutate them. Public surface for handlers is `block_number`,
 /// `timestamp`, `stores`, `stats`, and the `ethCall` / `registerContract`
 /// methods.
+/// `entities` may be either a tuple of entity types — `.{ Account, … }` —
+/// or the entities module itself, e.g. `@import("entities.zig")`. The
+/// module form scans `pub` decls for any struct declaring
+/// `pub const storage: sdk.StorageMode` and uses those, in source-
+/// declaration order. Both forms produce identical Context types when
+/// the entity sets match.
 pub fn Context(comptime entities: anytype) type {
     const Stores = StoresStruct(entities);
     return struct {
@@ -220,8 +226,7 @@ pub fn init(
     }
 
     // Phase 4 store open.
-    inline for (std.meta.fields(@TypeOf(entities))) |entity_field| {
-        const T = @field(entities, entity_field.name);
+    inline for (comptime resolveEntities(entities)) |T| {
         const StoreT = root.storeFor(T);
         const dbi_name = comptime entityFieldName(T);
         @field(ctx.stores, dbi_name) = try StoreT.open(allocator, &ctx._active_txn, dbi_name);
@@ -249,7 +254,7 @@ pub fn init(
 }
 
 fn entitiesLen(comptime entities: anytype) u32 {
-    return @intCast(@typeInfo(@TypeOf(entities)).@"struct".fields.len);
+    return @intCast(comptime resolveEntities(entities).len);
 }
 
 /// Comptime-build the inner struct that holds one entity store per tuple
@@ -261,22 +266,11 @@ fn entitiesLen(comptime entities: anytype) u32 {
 /// entity. Two entities whose effective store names collide raise
 /// `@compileError`.
 fn StoresStruct(comptime entities: anytype) type {
-    const E = @TypeOf(entities);
-    const info = @typeInfo(E);
-    if (info != .@"struct" or !info.@"struct".is_tuple) @compileError(
-        "sdk.Context: entities must be a tuple of entity types, got '" ++ @typeName(E) ++ "'",
-    );
+    const list = comptime resolveEntities(entities);
 
-    const tuple_fields = info.@"struct".fields;
-
-    comptime var derived: [tuple_fields.len][:0]const u8 = undefined;
-    inline for (tuple_fields, 0..) |f, i| {
-        const T = @field(entities, f.name);
-        if (@TypeOf(T) != type) @compileError(std.fmt.comptimePrint(
-            "sdk.Context: entities[{d}] is not a type. Pass entity types directly: `.{{ Account, Allowance, Transfer, Approval }}`.",
-            .{i},
-        ));
-        // storeFor enforces the `pub const storage: sdk.StorageMode` decl.
+    comptime var derived: [list.len][:0]const u8 = undefined;
+    inline for (list, 0..) |T, i| {
+        // storeFor enforces `pub const storage: sdk.StorageMode`.
         _ = root.storeFor(T);
         derived[i] = entityFieldName(T);
     }
@@ -284,20 +278,15 @@ fn StoresStruct(comptime entities: anytype) type {
     inline for (derived, 0..) |a, i| {
         if (i + 1 >= derived.len) break;
         inline for (derived[i + 1 ..], i + 1..) |b, j| {
-            if (std.mem.eql(u8, a, b)) {
-                const Ai = @field(entities, tuple_fields[i].name);
-                const Aj = @field(entities, tuple_fields[j].name);
-                @compileError(std.fmt.comptimePrint(
-                    "sdk.Context: entity types '{s}' and '{s}' both derive store field name '{s}'. Rename one of the entity types.",
-                    .{ @typeName(Ai), @typeName(Aj), a },
-                ));
-            }
+            if (std.mem.eql(u8, a, b)) @compileError(std.fmt.comptimePrint(
+                "sdk.Context: entity types '{s}' and '{s}' both derive store field name '{s}'. Rename one of the entity types.",
+                .{ @typeName(list[i]), @typeName(list[j]), a },
+            ));
         }
     }
 
-    var struct_fields: [tuple_fields.len]std.builtin.Type.StructField = undefined;
-    inline for (tuple_fields, 0..) |f, i| {
-        const T = @field(entities, f.name);
+    var struct_fields: [list.len]std.builtin.Type.StructField = undefined;
+    inline for (list, 0..) |T, i| {
         const StoreT = root.storeFor(T);
         struct_fields[i] = .{
             .name = derived[i],
@@ -314,6 +303,47 @@ fn StoresStruct(comptime entities: anytype) type {
         .decls = &.{},
         .is_tuple = false,
     } });
+}
+
+/// Normalize `entities` to a `[]const type`. Accepts either the tuple
+/// form (`.{ A, B, C }`) or a module type (`@import("entities.zig")`).
+fn resolveEntities(comptime entities: anytype) []const type {
+    const T = @TypeOf(entities);
+
+    // Module form: `entities` is a type whose pub decls include the
+    // entity structs (those declaring `pub const storage`).
+    if (T == type) {
+        var out: []const type = &.{};
+        inline for (@typeInfo(entities).@"struct".decls) |d| {
+            const member = @field(entities, d.name);
+            if (@TypeOf(member) == type and @hasDecl(member, "storage")) {
+                out = out ++ &[_]type{member};
+            }
+        }
+        if (out.len == 0) @compileError(
+            "sdk.Context: module `" ++ @typeName(entities) ++ "` has no entities (no pub structs declaring `pub const storage: StorageMode`)",
+        );
+        return out;
+    }
+
+    // Tuple form: `entities` is a tuple value of entity types.
+    const info = @typeInfo(T);
+    if (info == .@"struct" and info.@"struct".is_tuple) {
+        var out: []const type = &.{};
+        inline for (info.@"struct".fields, 0..) |f, i| {
+            const t = @field(entities, f.name);
+            if (@TypeOf(t) != type) @compileError(std.fmt.comptimePrint(
+                "sdk.Context: entities[{d}] is not a type. Pass entity types: `.{{ Account, Allowance, Transfer, Approval }}`.",
+                .{i},
+            ));
+            out = out ++ &[_]type{t};
+        }
+        return out;
+    }
+
+    @compileError(
+        "sdk.Context: expected tuple of entity types or entities module, got `" ++ @typeName(T) ++ "`",
+    );
 }
 
 fn entityFieldName(comptime T: type) [:0]const u8 {
@@ -367,6 +397,33 @@ test "store_name override beats the default basename derivation" {
     const Stores = std.meta.fieldInfo(Ctx, .stores).type;
     try testing.expect(@hasField(Stores, "balances"));
     try testing.expect(!@hasField(Stores, "lBTCBalances"));
+}
+
+test "Context accepts a module type and produces the same Context as the tuple form" {
+    // Inline module fixture: a struct with two pub entity decls plus a
+    // non-entity helper that the resolver must skip.
+    const FixtureModule = struct {
+        pub const A = struct {
+            pub const storage: root.StorageMode = .mutable;
+            id: [20]u8,
+            balance: u256,
+        };
+        pub const B = struct {
+            pub const storage: root.StorageMode = .immutable;
+            id: [16]u8,
+            value: u64,
+        };
+        // Non-entity decl — must be ignored by the resolver.
+        pub const helper_constant: u32 = 42;
+    };
+
+    const FromModule = Context(FixtureModule);
+    const FromTuple = Context(.{ FixtureModule.A, FixtureModule.B });
+    try testing.expectEqual(FromTuple, FromModule);
+
+    const Stores = std.meta.fieldInfo(FromModule, .stores).type;
+    try testing.expect(@hasField(Stores, "as"));
+    try testing.expect(@hasField(Stores, "bs"));
 }
 
 const TransferHandler = struct {
