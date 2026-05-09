@@ -158,6 +158,7 @@ fn runPhase(
     try block_filter.scanBloomsParallel(
         reader,
         bloom_addresses,
+        filter.match_topics,
         start_block,
         end_block,
         &matching,
@@ -290,15 +291,11 @@ const FilterWorkerArgs = struct {
 };
 
 fn filterWorker(args: *FilterWorkerArgs) void {
-    // Per the project rule (see `core.parallel`): every buffer sized off
-    // BLOCK_BUF_SIZE or MAX_LOGS_PER_BLOCK lives on the heap, regardless of
-    // which thread runs the function. That makes filter and replay code
-    // immune to caller-stack changes — `parallel.run` spawns at
-    // `WORKER_STACK_SIZE` as defense-in-depth, but correctness no longer
-    // depends on it.
-    const decompress_buf = args.allocator.alloc(u8, types.BLOCK_BUF_SIZE) catch return;
-    const log_buf = args.allocator.alloc(RawLog, types.MAX_LOGS_PER_BLOCK) catch return;
-    const keep_buf = args.allocator.alloc(RawLog, types.MAX_LOGS_PER_BLOCK) catch return;
+    // Stack scratch is safe under the buffer rule in `core.parallel`:
+    // `parallel.run` always spawns workers at `WORKER_STACK_SIZE`.
+    var decompress_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
+    var log_buf: [types.MAX_LOGS_PER_BLOCK]RawLog = undefined;
+    var keep_buf: [types.MAX_LOGS_PER_BLOCK]RawLog = undefined;
     const serialize_buf = args.allocator.alloc(u8, types.BLOCK_BUF_SIZE) catch return;
     const compress_buf = args.allocator.alloc(u8, types.BLOCK_BUF_SIZE) catch return;
 
@@ -335,7 +332,7 @@ fn filterWorker(args: *FilterWorkerArgs) void {
             for (done[0..n]) |c| {
                 const entry_data = pipeline.getBuffer(c);
                 if (entry_data.len > 0) {
-                    processBlockEntry(entry_data, c.block_number, args, decompress_buf, log_buf, keep_buf, serialize_buf, compress_buf);
+                    processBlockEntry(entry_data, c.block_number, args, &decompress_buf, &log_buf, &keep_buf, serialize_buf, compress_buf);
                 }
                 pipeline.releaseSlot(c.buf_slot);
                 completed += 1;
@@ -350,10 +347,10 @@ fn filterWorker(args: *FilterWorkerArgs) void {
 
     // pread fallback (non-Linux). Reads in matching_blocks order, no sort
     // needed but we sort anyway for path-uniform output.
-    const read_buf = args.allocator.alloc(u8, types.BLOCK_BUF_SIZE) catch return;
+    var read_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
     for (args.matching_blocks) |bn| {
-        const entry_data = reader.readBlock(bn, read_buf) catch continue;
-        processBlockEntry(entry_data, bn, args, decompress_buf, log_buf, keep_buf, serialize_buf, compress_buf);
+        const entry_data = reader.readBlock(bn, &read_buf) catch continue;
+        processBlockEntry(entry_data, bn, args, &decompress_buf, &log_buf, &keep_buf, serialize_buf, compress_buf);
     }
     std.mem.sort(FilteredBlock, args.results.items, {}, blockNumberLessThan);
 }

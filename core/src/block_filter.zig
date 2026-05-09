@@ -1,10 +1,10 @@
 /// Parallel bloom scan over the flat store's blooms.bin.
 ///
-/// A block matches if any of the target addresses hits its addr bloom.
-/// Used by sdk (filtered index build) and engine (v2 remote streaming).
-/// Topic-bloom matching is intentionally not exposed — bloom filtering at
-/// the block level is address-based throughout the SDK; per-log topic
-/// filtering happens after decompression.
+/// A block matches when every non-empty bloom set hits: any `target_addresses`
+/// against the addr bloom AND any `target_topics` against the topic bloom.
+/// At least one set must be non-empty (asserted). The bloom scan is the
+/// block-level prefilter; per-log filtering after decompression applies the
+/// precise predicate.
 const std = @import("std");
 
 const bloom = @import("bloom.zig");
@@ -12,6 +12,7 @@ const flat_reader = @import("flat_reader.zig");
 const parallel = @import("parallel.zig");
 
 const AddrBloom = bloom.AddrBloom;
+const TopicBloom = bloom.Bloom;
 const FlatStoreReader = flat_reader.FlatStoreReader;
 
 /// Single-threaded bloom scan. Used directly for small datasets and as the
@@ -19,13 +20,14 @@ const FlatStoreReader = flat_reader.FlatStoreReader;
 pub fn scanBlooms(
     reader: *const FlatStoreReader,
     target_addresses: []const [20]u8,
+    target_topics: []const [32]u8,
     start_block: u64,
     end_block: u64,
     matching: *std.ArrayListUnmanaged(u64),
     blocks_scanned: *u64,
     allocator: std.mem.Allocator,
 ) !void {
-    std.debug.assert(target_addresses.len > 0);
+    std.debug.assert(target_addresses.len > 0 or target_topics.len > 0);
 
     const addr_keys = try buildAddrKeys(target_addresses, allocator);
     defer allocator.free(addr_keys);
@@ -33,6 +35,7 @@ pub fn scanBlooms(
     var args = WorkerArgs{
         .reader = reader,
         .addr_keys = addr_keys,
+        .topic_keys = target_topics,
         .start_idx = reader.findBloomStart(start_block),
         .end_idx = reader.blooms_count,
         .end_block = end_block,
@@ -51,17 +54,18 @@ pub fn scanBlooms(
 pub fn scanBloomsParallel(
     reader: *const FlatStoreReader,
     target_addresses: []const [20]u8,
+    target_topics: []const [32]u8,
     start_block: u64,
     end_block: u64,
     matching: *std.ArrayListUnmanaged(u64),
     blocks_scanned: *u64,
     allocator: std.mem.Allocator,
 ) !void {
-    std.debug.assert(target_addresses.len > 0);
+    std.debug.assert(target_addresses.len > 0 or target_topics.len > 0);
 
     const num_workers = parallel.workerCount(reader.blooms_count, 100_000);
     if (num_workers <= 1) {
-        return scanBlooms(reader, target_addresses, start_block, end_block, matching, blocks_scanned, allocator);
+        return scanBlooms(reader, target_addresses, target_topics, start_block, end_block, matching, blocks_scanned, allocator);
     }
 
     const addr_keys = try buildAddrKeys(target_addresses, allocator);
@@ -76,6 +80,7 @@ pub fn scanBloomsParallel(
         worker_args[i] = .{
             .reader = reader,
             .addr_keys = addr_keys,
+            .topic_keys = target_topics,
             .start_idx = scan_start + ranges[i][0],
             .end_idx = scan_start + ranges[i][1],
             .end_block = end_block,
@@ -95,9 +100,9 @@ pub fn scanBloomsParallel(
         worker_args[i].result_matching.deinit(allocator);
     }
 
-    // Release blooms.bin pages after aggregation so the page cache stays
-    // free for upcoming blocks.dat reads.
-    std.posix.madvise(@constCast(reader.blooms_map.ptr), reader.blooms_map.len, std.posix.MADV.DONTNEED) catch {};
+    // No `madvise(DONTNEED)` on blooms.bin: warm reruns avoid a full
+    // re-read of the bloom file. On memory-pressured hosts the kernel
+    // evicts naturally; the hint would only hurt the steady state.
 }
 
 // ── Internal ─────────────────────────────────────────────────────────────
@@ -111,6 +116,7 @@ fn buildAddrKeys(addresses: []const [20]u8, allocator: std.mem.Allocator) ![]con
 const WorkerArgs = struct {
     reader: *const FlatStoreReader,
     addr_keys: []const [32]u8,
+    topic_keys: []const [32]u8,
     start_idx: usize,
     end_idx: usize,
     end_block: u64,
@@ -121,6 +127,8 @@ const WorkerArgs = struct {
 
 fn scanRange(comptime prefetch: bool, args: *WorkerArgs) void {
     const base = args.reader.blooms_map[flat_reader.BLOOM_HEADER_SIZE..];
+    const check_addr = args.addr_keys.len > 0;
+    const check_topic = args.topic_keys.len > 0;
     for (args.start_idx..args.end_idx) |i| {
         const offset = i * flat_reader.BLOOM_ENTRY_SIZE;
         if (offset + flat_reader.BLOOM_ENTRY_SIZE > base.len) break;
@@ -129,15 +137,21 @@ fn scanRange(comptime prefetch: bool, args: *WorkerArgs) void {
         if (block_number > args.end_block) break;
         args.result_scanned += 1;
 
-        const addr_bloom = entry[flat_reader.ADDR_BLOOM_OFFSET..][0..bloom.ADDR_BLOOM_SIZE];
-        if (AddrBloom.bytesContainAny(addr_bloom, args.addr_keys)) {
-            args.result_matching.append(args.alloc, block_number) catch continue;
+        if (check_addr) {
+            const addr_bloom = entry[flat_reader.ADDR_BLOOM_OFFSET..][0..bloom.ADDR_BLOOM_SIZE];
+            if (!AddrBloom.bytesContainAny(addr_bloom, args.addr_keys)) continue;
+        }
+        if (check_topic) {
+            const topic_bloom = entry[flat_reader.TOPIC_BLOOM_OFFSET..][0..bloom.BLOOM_SIZE];
+            if (!TopicBloom.bytesContainAny(topic_bloom, args.topic_keys)) continue;
+        }
 
-            if (comptime prefetch and @import("builtin").os.tag == .linux) {
-                if (args.reader.getBlockLoc(block_number)) |loc| {
-                    _ = std.os.linux.fadvise(args.reader.blocks_file.handle, @intCast(loc.offset), @intCast(loc.length), std.os.linux.POSIX_FADV.WILLNEED);
-                } else |_| {}
-            }
+        args.result_matching.append(args.alloc, block_number) catch continue;
+
+        if (comptime prefetch and @import("builtin").os.tag == .linux) {
+            if (args.reader.getBlockLoc(block_number)) |loc| {
+                _ = std.os.linux.fadvise(args.reader.blocks_file.handle, @intCast(loc.offset), @intCast(loc.length), std.os.linux.POSIX_FADV.WILLNEED);
+            } else |_| {}
         }
     }
 }
@@ -175,7 +189,7 @@ test "scanBlooms: single address matches blocks via addr bloom" {
     var scanned: u64 = 0;
 
     const targets = [_][20]u8{target_addr};
-    try scanBlooms(&reader, &targets, 0, 200, &matching, &scanned, alloc);
+    try scanBlooms(&reader, &targets, &.{}, 0, 200, &matching, &scanned, alloc);
 
     try std.testing.expectEqual(@as(u64, 3), scanned);
     try std.testing.expectEqual(@as(usize, 2), matching.items.len);
@@ -212,10 +226,57 @@ test "scanBlooms: union of multiple addresses" {
     var scanned: u64 = 0;
 
     const targets = [_][20]u8{ addr_a, addr_b };
-    try scanBlooms(&reader, &targets, 0, 200, &matching, &scanned, alloc);
+    try scanBlooms(&reader, &targets, &.{}, 0, 200, &matching, &scanned, alloc);
 
     try std.testing.expectEqual(@as(u64, 3), scanned);
     try std.testing.expectEqual(@as(usize, 2), matching.items.len);
     try std.testing.expectEqual(@as(u64, 100), matching.items[0]);
     try std.testing.expectEqual(@as(u64, 101), matching.items[1]);
+}
+
+test "scanBlooms: dual-bloom AND rejects address hits whose topic bloom doesn't match" {
+    const alloc = std.testing.allocator;
+    const target_addr = [_]u8{0xAE} ** 20;
+    const want_topic = [_]u8{0xCA} ** 32;
+    const noise_topic = [_]u8{0xFE} ** 32;
+
+    const blooms_buf = blk: {
+        const total = flat_reader.BLOOM_HEADER_SIZE + 3 * flat_reader.BLOOM_ENTRY_SIZE;
+        const buf = try alloc.alignedAlloc(u8, .fromByteUnits(page_align), total);
+        std.mem.writeInt(u64, buf[0..8], 3, .little);
+        const block_numbers = [_]u64{ 100, 101, 102 };
+        const topics = [_][32]u8{ want_topic, noise_topic, noise_topic };
+        for (block_numbers, topics, 0..) |bn, t, i| {
+            var ab = AddrBloom.init();
+            ab.insert(AddrBloom.addrToBloomKey(target_addr));
+            var tb = TopicBloom.init();
+            tb.insert(t);
+
+            const off = flat_reader.BLOOM_HEADER_SIZE + i * flat_reader.BLOOM_ENTRY_SIZE;
+            var entry: [flat_reader.BLOOM_ENTRY_SIZE]u8 = std.mem.zeroes([flat_reader.BLOOM_ENTRY_SIZE]u8);
+            std.mem.writeInt(u64, entry[0..8], bn, .big);
+            @memcpy(entry[flat_reader.TOPIC_BLOOM_OFFSET..][0..bloom.BLOOM_SIZE], &tb.bits);
+            @memcpy(entry[flat_reader.ADDR_BLOOM_OFFSET..][0..bloom.ADDR_BLOOM_SIZE], &ab.bits);
+            @memcpy(buf[off..][0..flat_reader.BLOOM_ENTRY_SIZE], &entry);
+        }
+        break :blk buf;
+    };
+    defer alloc.free(blooms_buf);
+
+    var idx: [flat_reader.INDEX_HEADER_SIZE]u8 align(page_align) = undefined;
+    std.mem.writeInt(u64, idx[0..8], 100, .little);
+    std.mem.writeInt(u64, idx[8..16], 0, .little);
+    const reader = flat_reader.testReader(&idx, blooms_buf, undefined);
+
+    var matching = std.ArrayListUnmanaged(u64){};
+    defer matching.deinit(alloc);
+    var scanned: u64 = 0;
+
+    const targets = [_][20]u8{target_addr};
+    const topics = [_][32]u8{want_topic};
+    try scanBlooms(&reader, &targets, &topics, 0, 200, &matching, &scanned, alloc);
+
+    try std.testing.expectEqual(@as(u64, 3), scanned);
+    try std.testing.expectEqual(@as(usize, 1), matching.items.len);
+    try std.testing.expectEqual(@as(u64, 100), matching.items[0]);
 }
