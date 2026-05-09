@@ -1,33 +1,24 @@
 /// Thread pool utility: split a range across N workers, run each, join all.
 ///
-/// **Project rule — no big buffers on the stack.**
+/// **Buffer-allocation rule.** Buffers sized off `core.types.BLOCK_BUF_SIZE`
+/// (4 MB) or `core.types.MAX_LOGS_PER_BLOCK` (~2 MB) overflow Linux's
+/// default 8 MB `RLIMIT_STACK` when a function holds two or three of them.
+/// Functions reachable from the main thread (`scanner.replay`,
+/// `scanner.scanCreations`, anything `sdk.run` calls directly) heap-allocate
+/// such buffers. Functions that only run on a `parallel.run`-spawned worker
+/// (`filter_builder.filterWorker`, `engine/rocksdb_import.workerFn`) may
+/// stack-allocate — workers always receive `WORKER_STACK_SIZE`, and stack
+/// avoids the per-run page-fault cost of fresh mmap.
 ///
-/// Linux's default `RLIMIT_STACK` is 8 MB. Several hot paths in this
-/// codebase use buffers sized off `core.types.BLOCK_BUF_SIZE` (4 MB) and
-/// `core.types.MAX_LOGS_PER_BLOCK` (~2 MB at 216 B/RawLog). A function with
-/// two or three of these on the stack overflows the main-thread ceiling
-/// the moment it's invoked inline (no thread spawn). The first occurrence
-/// segfaulted the Uniswap V2 example only because the static-only paths
-/// happened to skirt the inline branch — a fragile guarantee.
-///
-/// The rule, applied across `core`, `engine`, and `sdk`:
-///   - Any buffer sized off `BLOCK_BUF_SIZE` or `MAX_LOGS_PER_BLOCK` is
-///     **heap-allocated** (via the caller's allocator or a per-worker
-///     arena), never `var x: [N]u8 = undefined;` on the stack.
-///   - Worker threads spawned via `parallel.run` get `WORKER_STACK_SIZE`
-///     anyway, as defense-in-depth against future stack growth.
-///   - Functions that must run on the caller's thread (e.g. `scanner.replay`
-///     because its MDBX write txn is thread-bound) follow the heap rule
-///     unconditionally.
+/// `parallel.run` always spawns, including for `num_workers == 1`. There is
+/// no inline-on-caller path; a worker fn cannot land on the caller's stack.
 const std = @import("std");
 
 pub const MAX_WORKERS = 7;
 
-/// Worker thread stack size. Used both as the explicit `SpawnConfig.stack_size`
-/// for `parallel.run` and elsewhere. Sized comfortably above the largest
-/// observed frame (~15 MB in `replayImpl`'s legacy stack-allocated form, now
-/// removed) so a future regression that introduces a stack-allocated buffer
-/// has a soft landing instead of an immediate SIGSEGV.
+/// Worker thread stack size. Sized above the largest worker frame
+/// (~12 MB in `filter_builder.filterWorker`) so additions to worker scratch
+/// land softly.
 pub const WORKER_STACK_SIZE: usize = 32 * 1024 * 1024;
 
 /// Run `worker_fn` across `num_workers` threads. Even when `num_workers == 1`
