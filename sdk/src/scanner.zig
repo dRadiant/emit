@@ -78,7 +78,7 @@ pub fn scanCreations(
             inline for (m.factories) |f| {
                 const create_topic = comptime sdk_manifest.eventTopic0(f.create_event);
                 if (std.mem.eql(u8, &log.topics[0], &create_topic)) {
-                    const addr = sdk_manifest.extractAddress(&log.topics, log.data, f.address_param);
+                    const addr = sdk_manifest.extractFactoryAddress(f, &log.topics, log.data);
                     try discovered.put(addr, {});
                 }
             }
@@ -285,7 +285,7 @@ const Approval = struct {
     pub const signature = "Approval(address,address,uint256)";
 };
 const PairCreated = struct {
-    pub const signature = "PairCreated(address,address,address,uint256)";
+    pub const signature = "PairCreated(address indexed token0, address indexed token1, address pair, uint256 allPairsLength)";
 };
 const Sync = struct {
     pub const signature = "Sync(uint112,uint112)";
@@ -421,7 +421,7 @@ test "scanCreations: extracts spawned addresses from factory creation events" {
     const allocator = testing.allocator;
 
     // Plant a flat store containing a PairCreated log at block 100 whose
-    // `pair` address (the address_param target) sits at data[0..32].
+    // `pair` address (the spawn_arg target) sits at data[0..32].
     var src_tmp = testing.tmpDir(.{});
     defer src_tmp.cleanup();
 
@@ -429,8 +429,8 @@ test "scanCreations: extracts spawned addresses from factory creation events" {
 
     // Use writeFlatStore for simplicity. Note that writeFlatStore stores an
     // empty `data` field, so we instead skip the helper and craft a single
-    // block manually with the spawned address embedded in topic[1] (indexed
-    // path) — that exercises the indexed AddressParam.
+    // block manually with the spawned address embedded in topic[1] — that
+    // exercises the indexed slot path of extractFactoryAddress.
     const flat_reader = core.flat_reader;
     const bloom = core.bloom;
 
@@ -497,7 +497,7 @@ test "scanCreations: extracts spawned addresses from factory creation events" {
             .name = "F",
             .address = FACTORY_ADDR,
             .create_event = PairCreated,
-            .address_param = .{ .indexed = 0 },
+            .spawn_arg = "token0",
             .child_events = &.{Sync},
         }},
     };
@@ -616,7 +616,7 @@ test "replay: k-way merge across BLOCKS_PRIMARY and BLOCKS_CHILDREN preserves bl
             .name = "F",
             .address = FACTORY_ADDR,
             .create_event = PairCreated,
-            .address_param = .{ .data = 0 },
+            .spawn_arg = "pair",
             .child_events = &.{Sync},
         }},
     };
@@ -755,7 +755,7 @@ test "factory orchestration: build → scanCreations → appendChildren → repl
             .name = "F",
             .address = FACTORY_ADDR,
             .create_event = PairCreated,
-            .address_param = .{ .data = 0 },
+            .spawn_arg = "pair",
             .child_events = &.{Sync},
         }},
     };

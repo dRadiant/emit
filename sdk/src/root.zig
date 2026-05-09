@@ -1,16 +1,16 @@
 /// emit sdk. Library for user indexer projects.
 ///
 /// User code should reach for `sdk.run`, `sdk.init`, the manifest types
-/// (`Manifest`, `ContractDef`, `FactoryDef`, `AddressParam`),
-/// `DecodedLog`, `Context`, `Options`, `RunStats`, `StorageMode`,
-/// `address`, `concat`, and `validateHandler`. Everything else is
-/// implementation detail.
+/// (`Manifest`, `ContractDef`, `FactoryDef`), `DecodedLog`, `Context`,
+/// `Options`, `RunStats`, `StorageMode`, `address`, `concat`, and
+/// `validateHandler`. Everything else is implementation detail.
 const std = @import("std");
 
 const eth = @import("eth");
 
 // Implementation modules. Kept private so the user-facing surface stays
 // small. Reach for the re-exports below instead.
+const abi_parse = @import("abi_parse.zig");
 const entity_serial = @import("entity_serial.zig");
 const entry = @import("entry.zig");
 const filter_builder = @import("filter_builder.zig");
@@ -24,7 +24,6 @@ pub const humanize = @import("humanize.zig");
 pub const manifest = @import("manifest.zig");
 
 // User-facing top-level surface.
-pub const AddressParam = manifest.AddressParam;
 pub const Context = entry.Context;
 pub const ContractDef = manifest.ContractDef;
 pub const DecodedLog = handler.DecodedLog;
@@ -161,6 +160,7 @@ pub fn validateHandler(comptime m: Manifest, comptime Handler: type) void {
 }
 
 test {
+    _ = abi_parse;
     _ = entity_serial;
     _ = immutable_store;
     _ = mutable_store;

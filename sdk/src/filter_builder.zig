@@ -714,7 +714,7 @@ test "build + appendChildren: primary holds creations, children holds child even
     const ChildAddr3: [20]u8 = [_]u8{0xC3} ** 20;
 
     const Create = struct {
-        pub const signature = "PairCreated(address,address,address)";
+        pub const signature = "PairCreated(address indexed token0, address indexed token1, address pair)";
     };
     const Sync = struct {
         pub const signature = "Sync(uint112,uint112)";
@@ -728,7 +728,7 @@ test "build + appendChildren: primary holds creations, children holds child even
             .name = "F",
             .address = FactoryAddr,
             .create_event = Create,
-            .address_param = .{ .data = 0 },
+            .spawn_arg = "pair",
             .child_events = &.{Sync},
         }},
     };
@@ -821,7 +821,7 @@ test "appendChildren: returns zero-result for empty discovered set" {
 
     const FactoryAddr: [20]u8 = [_]u8{0xF0} ** 20;
     const Create = struct {
-        pub const signature = "PairCreated(address,address,address)";
+        pub const signature = "PairCreated(address indexed token0, address indexed token1, address pair)";
     };
     const Sync = struct {
         pub const signature = "Sync(uint112,uint112)";
@@ -834,7 +834,7 @@ test "appendChildren: returns zero-result for empty discovered set" {
             .name = "F",
             .address = FactoryAddr,
             .create_event = Create,
-            .address_param = .{ .data = 0 },
+            .spawn_arg = "pair",
             .child_events = &.{Sync},
         }},
     };

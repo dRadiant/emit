@@ -3,16 +3,21 @@ const std = @import("std");
 
 const core = @import("core");
 
+const abi_parse = @import("abi_parse.zig");
 const manifest = @import("manifest.zig");
 
 /// View of a single log presented to a handler. `data` borrows from the
 /// scanner's per-block decompression buffer and is valid only for the
 /// duration of the handler invocation.
 ///
-/// The `indexedAddress` / `dataU256` / `eventId` helpers cover the common
-/// ERC20-class decode paths. Per-event typed decoders (envio's
-/// `event.params.<name>` shape) are deferred — they need a comptime
-/// ABI-codegen pass that lands with the M3 token registry.
+/// Two decoder layers:
+///
+/// 1. **Slot-positional**: `indexedAddress(i)`, `dataU256(word)`, etc.
+///    For one-off ad-hoc reads or signatures without arg names.
+/// 2. **Name-resolved**: `arg(E, "from")` — single helper whose return
+///    type is comptime-resolved from `E.signature`. `address` → `[20]u8`,
+///    `uintN` → `uN`, `intN` → `iN`, `boolean` → `bool`, `bytesN` → `[N]u8`.
+///    Wrong arg name or unsupported type is a `@compileError`.
 pub const DecodedLog = struct {
     block_number: u64,
     tx_index: u16,
@@ -61,6 +66,21 @@ pub const DecodedLog = struct {
         return self.data[start + 12 ..][0..20].*;
     }
 
+    /// Read a named arg from `E.signature`. The return type is derived
+    /// at comptime from the parsed type — `address` → `[20]u8`, `uintN`
+    /// → `uN`, `intN` → `iN`, `bool` → `bool`, `bytesN` → `[N]u8`. Wrong
+    /// arg name lists the available args; dynamic types (`bytes`, `string`)
+    /// are rejected with a pointer at the slot-positional helpers.
+    pub fn arg(self: DecodedLog, comptime E: type, comptime arg_name: []const u8) ResolvedArgType(E, arg_name) {
+        const p = comptime resolveArg(E, arg_name);
+        const T = ResolvedArgType(E, arg_name);
+        const word: [32]u8 = switch (comptime p.slot_kind) {
+            .topic => self.topics[comptime p.slot_index],
+            .data => self.data[comptime p.slot_index..][0..32].*,
+        };
+        return decodeWord(T, p.type_str, &word);
+    }
+
     /// Canonical 16-byte event id: `block_number(BE u64) ++ tx_index(BE u32) ++ log_index(BE u32)`.
     /// Big-endian so MDBX byte order matches dispatch order, satisfying
     /// `MDBX_APPEND` for immutable event entities. The same construction
@@ -74,6 +94,50 @@ pub const DecodedLog = struct {
         return id;
     }
 };
+
+// ── Comptime arg resolution ──────────────────────────────────────────────
+
+fn resolveArg(comptime E: type, comptime arg_name: []const u8) abi_parse.ParsedParam {
+    return comptime abi_parse.paramByName(manifest.parsedEvent(E), arg_name);
+}
+
+/// Map a parsed Solidity type to the Zig type the decoder returns.
+fn ResolvedArgType(comptime E: type, comptime arg_name: []const u8) type {
+    const p = comptime resolveArg(E, arg_name);
+    const t = p.type_str;
+    if (comptime std.mem.eql(u8, t, "address")) return [20]u8;
+    if (comptime std.mem.eql(u8, t, "bool")) return bool;
+    if (comptime std.mem.startsWith(u8, t, "uint")) return std.meta.Int(.unsigned, parseBits(t["uint".len..]));
+    if (comptime std.mem.startsWith(u8, t, "int")) return std.meta.Int(.signed, parseBits(t["int".len..]));
+    if (comptime std.mem.startsWith(u8, t, "bytes") and t.len > "bytes".len) {
+        return [parseBits(t["bytes".len..])]u8;
+    }
+    @compileError("DecodedLog.arg: type `" ++ t ++ "` not supported by auto-decoder. Read directly from `log.topics[..]` / `log.data[..]`.");
+}
+
+fn decodeWord(comptime T: type, comptime type_str: []const u8, word: *const [32]u8) T {
+    if (comptime std.mem.eql(u8, type_str, "address")) return word[12..32].*;
+    if (comptime std.mem.eql(u8, type_str, "bool")) return word[31] != 0;
+    if (comptime std.mem.startsWith(u8, type_str, "uint")) {
+        return @truncate(std.mem.readInt(u256, word, .big));
+    }
+    if (comptime std.mem.startsWith(u8, type_str, "int")) {
+        const signed: i256 = @bitCast(std.mem.readInt(u256, word, .big));
+        return @truncate(signed);
+    }
+    if (comptime std.mem.startsWith(u8, type_str, "bytes")) {
+        // `bytesN` is left-aligned in the 32-byte word (Solidity ABI §4.1).
+        const len = @typeInfo(T).array.len;
+        return word[0..len].*;
+    }
+    unreachable;
+}
+
+fn parseBits(comptime s: []const u8) comptime_int {
+    var n: comptime_int = 0;
+    for (s) |c| n = n * 10 + @as(comptime_int, c - '0');
+    return n;
+}
 
 /// Build the comptime dispatch table for a manifest. Returns a function
 /// type that switches on `log.topics[0]` against each declared event's
@@ -232,6 +296,102 @@ test "DecodedLog decoder helpers extract addresses and u256 from data" {
     try std.testing.expectEqualSlices(u8, &TOKEN1, &log.indexedAddress(1));
     try std.testing.expectEqualSlices(u8, &PAIR, &log.dataAddress(0));
     try std.testing.expectEqual(@as(u256, 12345), log.dataU256(1));
+}
+
+test "arg resolves indexed addresses and uint256 from data" {
+    const NamedTransfer = struct {
+        pub const signature = "Transfer(address indexed from, address indexed to, uint256 value)";
+    };
+    const FROM = [_]u8{0x11} ** 20;
+    const TO = [_]u8{0x22} ** 20;
+
+    var topics: [4][32]u8 = std.mem.zeroes([4][32]u8);
+    @memcpy(topics[1][12..32], &FROM);
+    @memcpy(topics[2][12..32], &TO);
+
+    var data_buf: [32]u8 = std.mem.zeroes([32]u8);
+    std.mem.writeInt(u256, &data_buf, 0xdead_beef, .big);
+
+    const log: DecodedLog = .{
+        .block_number = 1,
+        .tx_index = 0,
+        .log_index = 0,
+        .tx_hash = [_]u8{0} ** 32,
+        .address = [_]u8{0} ** 20,
+        .topics = topics,
+        .topic_count = 3,
+        .data = &data_buf,
+    };
+
+    const from = log.arg(NamedTransfer, "from");
+    const to = log.arg(NamedTransfer, "to");
+    const value = log.arg(NamedTransfer, "value");
+    try std.testing.expectEqual([20]u8, @TypeOf(from));
+    try std.testing.expectEqual(u256, @TypeOf(value));
+    try std.testing.expectEqualSlices(u8, &FROM, &from);
+    try std.testing.expectEqualSlices(u8, &TO, &to);
+    try std.testing.expectEqual(@as(u256, 0xdead_beef), value);
+}
+
+test "arg returns the right narrow integer type for sub-256 uintN" {
+    // Sync(uint112,uint112) — verifies arg returns u112, not u256
+    const Sync = struct {
+        pub const signature = "Sync(uint112 reserve0, uint112 reserve1)";
+    };
+    var data_buf: [64]u8 = std.mem.zeroes([64]u8);
+    std.mem.writeInt(u256, data_buf[0..32], 0x1234, .big);
+    std.mem.writeInt(u256, data_buf[32..64], 0xabcd, .big);
+
+    const log: DecodedLog = .{
+        .block_number = 1,
+        .tx_index = 0,
+        .log_index = 0,
+        .tx_hash = [_]u8{0} ** 32,
+        .address = [_]u8{0} ** 20,
+        .topics = std.mem.zeroes([4][32]u8),
+        .topic_count = 1,
+        .data = &data_buf,
+    };
+
+    const r0 = log.arg(Sync, "reserve0");
+    const r1 = log.arg(Sync, "reserve1");
+    try std.testing.expectEqual(u112, @TypeOf(r0));
+    try std.testing.expectEqual(u112, @TypeOf(r1));
+    try std.testing.expectEqual(@as(u112, 0x1234), r0);
+    try std.testing.expectEqual(@as(u112, 0xabcd), r1);
+}
+
+test "arg returns bool and bytesN with the right Zig types" {
+    const E = struct {
+        pub const signature = "E(bool indexed flag, bytes4 selector, bytes32 hash)";
+    };
+    var topics: [4][32]u8 = std.mem.zeroes([4][32]u8);
+    topics[1][31] = 1;
+
+    var data_buf: [64]u8 = std.mem.zeroes([64]u8);
+    data_buf[0..4].* = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
+    @memset(data_buf[32..64], 0x77);
+
+    const log: DecodedLog = .{
+        .block_number = 1,
+        .tx_index = 0,
+        .log_index = 0,
+        .tx_hash = [_]u8{0} ** 32,
+        .address = [_]u8{0} ** 20,
+        .topics = topics,
+        .topic_count = 2,
+        .data = &data_buf,
+    };
+
+    const flag = log.arg(E, "flag");
+    const sel = log.arg(E, "selector");
+    const hash = log.arg(E, "hash");
+    try std.testing.expectEqual(bool, @TypeOf(flag));
+    try std.testing.expectEqual([4]u8, @TypeOf(sel));
+    try std.testing.expectEqual([32]u8, @TypeOf(hash));
+    try std.testing.expectEqual(true, flag);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xAA, 0xBB, 0xCC, 0xDD }, &sel);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0x77} ** 32), &hash);
 }
 
 test "DecodedLog.fromRawLog preserves all fields" {
