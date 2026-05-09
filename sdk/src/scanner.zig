@@ -390,7 +390,8 @@ const Counter = struct {
         self.dispatched.deinit(self.allocator);
     }
 
-    fn record(self: *Counter, log: handler_mod.DecodedLog) !void {
+    /// `log` is `anytype` so the same helper accepts every Log(E) shape.
+    fn record(self: *Counter, log: anytype) !void {
         try self.dispatched.append(self.allocator, .{
             .block_number = log.block_number,
             .tx_index = log.tx_index,
@@ -399,19 +400,19 @@ const Counter = struct {
         });
     }
 
-    pub fn handleTransfer(log: handler_mod.DecodedLog, self: *Counter) !void {
+    pub fn handleTransfer(log: handler_mod.Log(Transfer), self: *Counter) !void {
         self.transfers += 1;
         try self.record(log);
     }
-    pub fn handleApproval(log: handler_mod.DecodedLog, self: *Counter) !void {
+    pub fn handleApproval(log: handler_mod.Log(Approval), self: *Counter) !void {
         self.approvals += 1;
         try self.record(log);
     }
-    pub fn handleSync(log: handler_mod.DecodedLog, self: *Counter) !void {
+    pub fn handleSync(log: handler_mod.Log(Sync), self: *Counter) !void {
         self.syncs += 1;
         try self.record(log);
     }
-    pub fn handlePairCreated(log: handler_mod.DecodedLog, self: *Counter) !void {
+    pub fn handlePairCreated(log: handler_mod.Log(PairCreated), self: *Counter) !void {
         self.pair_creations += 1;
         try self.record(log);
     }

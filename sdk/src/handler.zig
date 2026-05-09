@@ -83,13 +83,19 @@ pub const DecodedLog = struct {
     /// Decode every named arg of `E.signature` into one struct.
     /// `ArgsOf(E)` has one field per named arg with the right Zig type
     /// (see `arg` for the type mapping). Unnamed args are skipped.
+    /// Data slots beyond `self.data.len` are zero-filled (matches the
+    /// ABI's zero-padding convention; keeps the dispatcher safe against
+    /// malformed RPC responses or test fixtures with short payloads).
     pub fn decode(self: DecodedLog, comptime E: type) ArgsOf(E) {
         var out: ArgsOf(E) = undefined;
         inline for (comptime manifest.parsedEvent(E).params) |p| {
             if (comptime p.name.len == 0) continue;
             const word: [32]u8 = switch (comptime p.slot_kind) {
                 .topic => self.topics[comptime p.slot_index],
-                .data => self.data[comptime p.slot_index..][0..32].*,
+                .data => if (self.data.len < comptime p.slot_index + 32)
+                    std.mem.zeroes([32]u8)
+                else
+                    self.data[comptime p.slot_index..][0..32].*,
             };
             @field(out, p.name) = decodeWord(TypeFor(p.type_str), p.type_str, &word);
         }
@@ -182,6 +188,46 @@ fn parseBits(comptime s: []const u8) comptime_int {
     return n;
 }
 
+/// Typed log handed to handlers by the dispatcher: same meta shape as
+/// `DecodedLog`, plus a comptime-decoded `args: ArgsOf(E)` so handlers
+/// read named fields directly (`log.args.from`) instead of routing every
+/// access through `log.arg(E, "from")`.
+pub fn Log(comptime E: type) type {
+    return struct {
+        block_number: u64,
+        tx_index: u16,
+        log_index: u16,
+        tx_hash: [32]u8,
+        address: [20]u8,
+        topics: [4][32]u8,
+        topic_count: u8,
+        data: []const u8,
+        args: ArgsOf(E),
+
+        pub fn fromDecoded(d: DecodedLog) @This() {
+            return .{
+                .block_number = d.block_number,
+                .tx_index = d.tx_index,
+                .log_index = d.log_index,
+                .tx_hash = d.tx_hash,
+                .address = d.address,
+                .topics = d.topics,
+                .topic_count = d.topic_count,
+                .data = d.data,
+                .args = d.decode(E),
+            };
+        }
+
+        pub fn eventId(self: @This()) [16]u8 {
+            var id: [16]u8 = undefined;
+            std.mem.writeInt(u64, id[0..8], self.block_number, .big);
+            std.mem.writeInt(u32, id[8..12], self.tx_index, .big);
+            std.mem.writeInt(u32, id[12..16], self.log_index, .big);
+            return id;
+        }
+    };
+}
+
 /// Build the comptime dispatch table for a manifest. Returns a function
 /// type that switches on `log.topics[0]` against each declared event's
 /// topic0 and invokes `Handler.handle ++ event.name`. Logs whose topic0
@@ -199,7 +245,7 @@ pub fn dispatcherFor(comptime m: manifest.Manifest) type {
                 const topic = comptime manifest.eventTopic0(E);
                 if (std.mem.eql(u8, &log.topics[0], &topic)) {
                     const method_name = comptime "handle" ++ manifest.eventName(E);
-                    return @field(Handler, method_name)(log, ctx);
+                    return @field(Handler, method_name)(Log(E).fromDecoded(log), ctx);
                 }
             }
         }
@@ -209,7 +255,7 @@ pub fn dispatcherFor(comptime m: manifest.Manifest) type {
             inline for (events) |E| {
                 const method_name = comptime "handle" ++ manifest.eventName(E);
                 if (!@hasDecl(Handler, method_name)) @compileError(
-                    "handler: type '" ++ @typeName(Handler) ++ "' is missing method `" ++ method_name ++ "` for event `" ++ E.signature ++ "`. Add `pub fn " ++ method_name ++ "(log: sdk.DecodedLog, ctx: *Ctx) !void { ... }`.",
+                    "handler: type '" ++ @typeName(Handler) ++ "' is missing method `" ++ method_name ++ "` for event `" ++ E.signature ++ "`. Add `pub fn " ++ method_name ++ "(log: sdk.Log(@This()), ctx: *Ctx) !void { ... }`.",
                 );
             }
         }
@@ -241,11 +287,11 @@ const Counter = struct {
     transfers: u32 = 0,
     approvals: u32 = 0,
 
-    pub fn handleTransfer(_: DecodedLog, self: *Counter) !void {
+    pub fn handleTransfer(_: Log(Transfer), self: *Counter) !void {
         self.transfers += 1;
     }
 
-    pub fn handleApproval(_: DecodedLog, self: *Counter) !void {
+    pub fn handleApproval(_: Log(Approval), self: *Counter) !void {
         self.approvals += 1;
     }
 };
@@ -298,10 +344,10 @@ test "dispatch skips logs with no topics" {
 
 test "dispatch propagates handler errors" {
     const Failing = struct {
-        pub fn handleTransfer(_: DecodedLog, _: *@This()) !void {
+        pub fn handleTransfer(_: Log(Transfer), _: *@This()) !void {
             return error.HandlerFailed;
         }
-        pub fn handleApproval(_: DecodedLog, _: *@This()) !void {}
+        pub fn handleApproval(_: Log(Approval), _: *@This()) !void {}
     };
     const D = dispatcherFor(TestManifest);
     var f = Failing{};

@@ -28,6 +28,7 @@ pub const ArgsOf = handler.ArgsOf;
 pub const Context = entry.Context;
 pub const ContractDef = manifest.ContractDef;
 pub const DecodedLog = handler.DecodedLog;
+pub const Log = handler.Log;
 pub const FactoryDef = manifest.FactoryDef;
 pub const init = entry.init;
 pub const Manifest = manifest.Manifest;

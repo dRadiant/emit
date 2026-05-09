@@ -370,7 +370,10 @@ test "store_name override beats the default basename derivation" {
 }
 
 const TransferHandler = struct {
-    pub fn handleTransfer(log: @import("handler.zig").DecodedLog, ctx: anytype) !void {
+    pub fn handleTransfer(log: @import("handler.zig").Log(Transfer), ctx: anytype) !void {
+        // Transfer's signature is unnamed, so we still read positionally
+        // here; named-arg access (`log.args.value`) is exercised by the
+        // example indexers and the parser tests.
         const from = log.topics[1][12..32].*;
         const to = log.topics[2][12..32].*;
         const value: u64 = std.mem.readInt(u64, log.data[24..32], .big);

@@ -85,7 +85,7 @@ pub fn build(b: *std.Build) void {
         .{ .path = "test/compile_fail/entity_empty.zig", .expected = "has no fields. The first field must be the primary key." },
         .{ .path = "test/compile_fail/entity_missing_storage.zig", .expected = "must declare `pub const storage: sdk.StorageMode = .mutable;` or `.immutable;`. The choice is per-entity and intentional." },
         .{ .path = "test/compile_fail/event_missing_signature.zig", .expected = "must declare `pub const signature = \"Name(types,...)\";`. The SDK derives topic0 and name from it." },
-        .{ .path = "test/compile_fail/handler_missing_method.zig", .expected = "is missing method `handleTransfer` for event `Transfer(address,address,uint256)`. Add `pub fn handleTransfer(log: sdk.DecodedLog, ctx: *Ctx) !void { ... }`." },
+        .{ .path = "test/compile_fail/handler_missing_method.zig", .expected = "is missing method `handleTransfer` for event `Transfer(address,address,uint256)`. Add `pub fn handleTransfer(log: sdk.Log(@This()), ctx: *Ctx) !void { ... }`." },
         .{ .path = "test/compile_fail/block_context_name_collision.zig", .expected = "both derive store field name 'items'. Rename one of the entity types." },
         .{ .path = "test/compile_fail/arg_unknown_name.zig", .expected = "has no arg named `frmo`. Available: from, to, value" },
         .{ .path = "test/compile_fail/factory_spawn_arg_unknown.zig", .expected = "has no arg named `piar`. Available: token0, token1, pair, allPairsLength" },
