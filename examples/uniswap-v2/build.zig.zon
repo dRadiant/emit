@@ -1,0 +1,14 @@
+.{
+    .name = .uniswap_v2_indexer,
+    .version = "0.0.0",
+    .fingerprint = 0xdff7efe559a142e1,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .emit = .{ .path = "../.." },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
