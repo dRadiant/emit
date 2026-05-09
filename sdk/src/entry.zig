@@ -32,6 +32,8 @@ pub const Options = struct {
 };
 
 /// Result of a backfill run; returned from `run` and embedded in `Context`.
+/// `elapsed_ns - (filter_build_ns + scan_creations_ns + append_children_ns +
+/// replay_ns)` is overhead (entity-store open, final commit, env init).
 pub const RunStats = struct {
     filter_blocks_scanned: u64 = 0,
     filter_blocks_matched: u64 = 0,
@@ -42,6 +44,10 @@ pub const RunStats = struct {
     logs_dispatched: u64 = 0,
     blocks_dispatched: u64 = 0,
     commits_performed: u32 = 0,
+    filter_build_ns: u64 = 0,
+    scan_creations_ns: u64 = 0,
+    append_children_ns: u64 = 0,
+    replay_ns: u64 = 0,
     elapsed_ns: u64 = 0,
 };
 
@@ -180,12 +186,15 @@ pub fn init(
     ctx.stats.filter_blocks_scanned = primary_result.blocks_scanned;
     ctx.stats.filter_blocks_matched = primary_result.blocks_matched;
     ctx.stats.filter_total_logs = primary_result.total_logs;
+    ctx.stats.filter_build_ns = primary_result.elapsed_ns;
 
     // Phases 2 + 3 (factory-only).
     if (comptime m.factories.len > 0) {
         const filter_env = try lmdbx.Environment.init(filter_dir_z, .{ .max_dbs = 2 });
+        var phase23_timer = try std.time.Timer.start();
         var discovered = try scanner.scanCreations(filter_env, m, allocator);
         defer discovered.deinit();
+        ctx.stats.scan_creations_ns = phase23_timer.read();
         filter_env.deinit() catch {};
 
         ctx.stats.discovered_children = discovered.count();
@@ -206,6 +215,7 @@ pub fn init(
             );
             ctx.stats.children_blocks_matched = child_result.blocks_matched;
             ctx.stats.children_total_logs = child_result.total_logs;
+            ctx.stats.append_children_ns = child_result.elapsed_ns;
         }
     }
 
@@ -230,6 +240,7 @@ pub fn init(
     );
     ctx.stats.logs_dispatched = replay_result.logs_dispatched;
     ctx.stats.blocks_dispatched = replay_result.blocks_dispatched;
+    ctx.stats.replay_ns = replay_result.elapsed_ns;
 
     // Final commit so any logs since the last commit boundary land.
     try ctx.commitCycle();

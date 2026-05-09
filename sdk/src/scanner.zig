@@ -59,9 +59,7 @@ pub fn scanCreations(
     var cursor = try db.cursor();
     defer cursor.deinit();
 
-    // Heap-allocated per the project rule (see `core.parallel`): no
-    // BLOCK_BUF_SIZE / MAX_LOGS_PER_BLOCK buffers on the stack. Caller
-    // (entry.zig) runs scanCreations on the main thread.
+    // Heap-allocated; runs on the main thread (see buffer rule in `core.parallel`).
     const decompress_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
     defer allocator.free(decompress_buf);
     const log_buf = try allocator.alloc(RawLog, types.MAX_LOGS_PER_BLOCK);
@@ -96,13 +94,10 @@ pub fn scanCreations(
 /// with no matching event in the manifest (bloom false positives that
 /// slipped through) are silently skipped by the dispatcher, not by us.
 ///
-/// `replay` reserves ~15 MB of working buffers, which exceeds the default
-/// 8 MB main-thread stack on Linux. We can't hoist the body to a worker
-/// thread (MDBX binds write transactions to their owning thread, and
-/// `ctx._active_txn` was opened by the caller) — so the buffers live on
-/// the heap, sized off whatever allocator the ctx exposes. The cost is
-/// one mmap/munmap pair for ~15 MB per run; ~1s of page-fault time on
-/// rETH-class workloads, dwarfed by the I/O.
+/// Working buffers are heap-allocated and pulled from the ctx's allocator.
+/// The body must run on the caller's thread because `ctx._active_txn` is
+/// MDBX-bound to the thread that opened it; the buffer rule in
+/// `core.parallel` then requires heap allocation.
 pub fn replay(
     env: lmdbx.Environment,
     comptime m: sdk_manifest.Manifest,
