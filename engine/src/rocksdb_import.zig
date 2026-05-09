@@ -56,22 +56,15 @@ const Slot = struct {
 const WorkerArgs = struct {
     slots: *[SLOT_COUNT]Slot,
     worker_id: usize,
-    allocator: std.mem.Allocator,
 };
 
 /// Worker: decode RLP receipts → build blooms → serialize → LZ4 compress.
-/// Buffers are heap-allocated per the project rule (see `core.parallel`):
-/// any buffer sized off BLOCK_BUF_SIZE / MAX_LOGS_PER_BLOCK lives on the
-/// heap so the function is safe regardless of where it's spawned. Each
-/// worker holds its own buffers for the run's lifetime — one alloc pair
-/// total, no churn.
+/// Stack scratch is safe under the buffer rule in `core.parallel`: spawned
+/// with `WORKER_STACK_SIZE`.
 fn workerFn(args: *WorkerArgs) void {
-    const log_buf = args.allocator.alloc(types.RawLog, types.MAX_LOGS_PER_BLOCK) catch return;
-    defer args.allocator.free(log_buf);
-    const data_buf = args.allocator.alloc(u8, types.BLOCK_BUF_SIZE) catch return;
-    defer args.allocator.free(data_buf);
-    const serialize_buf = args.allocator.alloc(u8, types.BLOCK_BUF_SIZE) catch return;
-    defer args.allocator.free(serialize_buf);
+    var log_buf: [types.MAX_LOGS_PER_BLOCK]types.RawLog = undefined;
+    var data_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
+    var serialize_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
 
     while (true) {
         for (0..SLOT_COUNT) |i| {
@@ -80,7 +73,7 @@ fn workerFn(args: *WorkerArgs) void {
             if (slot.state.load(.acquire) != Slot.FILLED) continue;
 
             const log_count = receipt_decoder.decodeReceipts(
-                slot.block_number, slot.raw_value[0..slot.raw_len], log_buf, data_buf,
+                slot.block_number, slot.raw_value[0..slot.raw_len], &log_buf, &data_buf,
             ) catch {
                 slot.has_error = true;
                 slot.log_count = 0;
@@ -98,7 +91,7 @@ fn workerFn(args: *WorkerArgs) void {
 
             const topic_bloom = log_serial.buildTopicBloom(log_buf[0..log_count]);
             const addr_bloom = log_serial.buildAddrBloom(log_buf[0..log_count]);
-            const serialized_len = log_serial.serializeLogs(log_buf[0..log_count], serialize_buf);
+            const serialized_len = log_serial.serializeLogs(log_buf[0..log_count], &serialize_buf);
 
             slot.entry_len = log_serial.compressEntry(serialize_buf[0..serialized_len], &slot.entry) catch {
                 slot.has_error = true;
@@ -221,7 +214,7 @@ pub fn run(receipts_path: [*:0]const u8, output_path: []const u8) !void {
     var worker_args: [parallel.MAX_WORKERS]WorkerArgs = undefined;
     var workers: [parallel.MAX_WORKERS]std.Thread = undefined;
     for (0..parallel.MAX_WORKERS) |i| {
-        worker_args[i] = .{ .slots = slots, .worker_id = i, .allocator = allocator };
+        worker_args[i] = .{ .slots = slots, .worker_id = i };
         workers[i] = try std.Thread.spawn(.{ .stack_size = parallel.WORKER_STACK_SIZE }, workerFn, .{&worker_args[i]});
     }
 
