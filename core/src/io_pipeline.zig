@@ -26,7 +26,7 @@ pub fn ReadPipeline(comptime QUEUE_DEPTH: u32) type {
 
         ring: linux.IoUring,
         fd: posix.fd_t,
-        bufs: [QUEUE_DEPTH][types.IO_BUF_SIZE]u8,
+        bufs: [QUEUE_DEPTH][types.BLOCK_BUF_SIZE]u8,
         completions: [QUEUE_DEPTH]Completion,
         free_stack: [QUEUE_DEPTH]u16,
         free_count: u32,
@@ -56,13 +56,14 @@ pub fn ReadPipeline(comptime QUEUE_DEPTH: u32) type {
         }
 
         pub fn submit(self: *Self, slot: u16, block_number: u64, offset: u64, length: u32) !void {
+            // Reject rather than truncate; the prior @min hid an LZ4 failure downstream.
+            if (length > self.bufs[slot].len) return error.EntryExceedsBuffer;
             const sqe = try self.ring.get_sqe();
-            const len = @min(length, @as(u32, @intCast(self.bufs[slot].len)));
-            sqe.prep_read(self.fd, self.bufs[slot][0..len], offset);
+            sqe.prep_read(self.fd, self.bufs[slot][0..length], offset);
             self.completions[slot] = .{
                 .block_number = block_number,
                 .buf_slot = slot,
-                .buf_len = len,
+                .buf_len = length,
             };
             sqe.user_data = @intFromPtr(&self.completions[slot]);
             self.in_flight += 1;

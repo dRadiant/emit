@@ -49,6 +49,9 @@ pub const BuildResult = struct {
     blocks_scanned: u64 = 0,
     blocks_matched: u64 = 0,
     total_logs: u64 = 0,
+    /// Bloom-matched blocks the worker pipeline failed to materialize. Caller
+    /// must treat any non-zero value as a hard failure (incomplete index).
+    dropped_blocks: u64 = 0,
     elapsed_ns: u64 = 0,
 };
 
@@ -193,6 +196,9 @@ fn runPhase(
 
     try parallel.run(FilterWorkerArgs, worker_args[0..num_workers], num_workers, filterWorker);
 
+    // Surface fatal pipeline errors before MDBX writes. Per-block drops accumulate below.
+    for (0..num_workers) |i| if (worker_args[i].err) |e| return e;
+
     const env = try lmdbx.Environment.init(dest_path, .{ .max_dbs = 2 });
     defer env.deinit() catch {};
 
@@ -218,6 +224,7 @@ fn runPhase(
     }
     try txn.commit();
 
+    for (0..num_workers) |i| result.dropped_blocks += worker_args[i].dropped_blocks;
     result.elapsed_ns = timer.read();
     return result;
 }
@@ -288,6 +295,10 @@ const FilterWorkerArgs = struct {
     filter: Filter,
     results: *std.ArrayListUnmanaged(FilteredBlock),
     allocator: std.mem.Allocator,
+    /// Per-block recoverable failures (alloc, lz4, etc.) — surfaced via BuildResult.
+    dropped_blocks: u64 = 0,
+    /// First fatal pipeline-level error — init/wait/oversize. Aborts the build.
+    err: ?anyerror = null,
 };
 
 fn filterWorker(args: *FilterWorkerArgs) void {
@@ -303,7 +314,10 @@ fn filterWorker(args: *FilterWorkerArgs) void {
 
     if (comptime io_pipeline.supported) {
         const Pipeline = io_pipeline.ReadPipeline(WORKER_QUEUE_DEPTH);
-        const pipeline = Pipeline.init(args.allocator, reader.blocks_file.handle) catch return;
+        const pipeline = Pipeline.init(args.allocator, reader.blocks_file.handle) catch |e| {
+            args.err = e;
+            return;
+        };
         defer pipeline.deinit();
 
         var submitted: usize = 0;
@@ -317,23 +331,35 @@ fn filterWorker(args: *FilterWorkerArgs) void {
                     pipeline.releaseSlot(slot);
                     submitted += 1;
                     completed += 1;
+                    args.dropped_blocks += 1;
                     continue;
                 };
-                pipeline.submit(slot, args.matching_blocks[submitted], loc.offset, loc.length) catch {
+                pipeline.submit(slot, args.matching_blocks[submitted], loc.offset, loc.length) catch |e| {
                     pipeline.releaseSlot(slot);
+                    // EntryExceedsBuffer = corrupt store (fatal); else SQE-full (drain + retry).
+                    if (e == error.EntryExceedsBuffer) {
+                        args.err = e;
+                        return;
+                    }
                     break;
                 };
                 submitted += 1;
             }
-            _ = pipeline.flush() catch {};
+            _ = pipeline.flush() catch |e| {
+                args.err = e;
+                return;
+            };
 
             var done: [WORKER_QUEUE_DEPTH]*io_pipeline.Completion = undefined;
-            const n = pipeline.waitAtLeastOne(&done) catch break;
+            const n = pipeline.waitAtLeastOne(&done) catch |e| {
+                args.err = e;
+                return;
+            };
             for (done[0..n]) |c| {
                 const entry_data = pipeline.getBuffer(c);
                 if (entry_data.len > 0) {
                     processBlockEntry(entry_data, c.block_number, args, &decompress_buf, &log_buf, &keep_buf, &serialize_buf, &compress_buf);
-                }
+                } else args.dropped_blocks += 1;
                 pipeline.releaseSlot(c.buf_slot);
                 completed += 1;
             }
@@ -349,7 +375,10 @@ fn filterWorker(args: *FilterWorkerArgs) void {
     // needed but we sort anyway for path-uniform output.
     var read_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
     for (args.matching_blocks) |bn| {
-        const entry_data = reader.readBlock(bn, &read_buf) catch continue;
+        const entry_data = reader.readBlock(bn, &read_buf) catch {
+            args.dropped_blocks += 1;
+            continue;
+        };
         processBlockEntry(entry_data, bn, args, &decompress_buf, &log_buf, &keep_buf, &serialize_buf, &compress_buf);
     }
     std.mem.sort(FilteredBlock, args.results.items, {}, blockNumberLessThan);
@@ -369,7 +398,12 @@ fn processBlockEntry(
     serialize_buf: []u8,
     compress_buf: []u8,
 ) void {
-    const decompressed = log_serial.decompressEntry(entry_data, decompress_buf) catch return;
+    // Every error path counts the block as dropped → BuildResult.dropped_blocks
+    // → entry point refuses to ship the index. No silent failures here.
+    const decompressed = log_serial.decompressEntry(entry_data, decompress_buf) catch {
+        args.dropped_blocks += 1;
+        return;
+    };
     const log_count = log_serial.deserializeLogs(decompressed, log_buf);
 
     var keep_count: usize = 0;
@@ -382,16 +416,24 @@ fn processBlockEntry(
     if (keep_count == 0) return;
 
     const serialized_len = log_serial.serializeLogs(keep_buf[0..keep_count], serialize_buf);
-    const entry_len = log_serial.compressEntry(serialize_buf[0..serialized_len], compress_buf) catch return;
+    const entry_len = log_serial.compressEntry(serialize_buf[0..serialized_len], compress_buf) catch {
+        args.dropped_blocks += 1;
+        return;
+    };
 
-    const owned = args.allocator.alloc(u8, entry_len) catch return;
+    const owned = args.allocator.alloc(u8, entry_len) catch {
+        args.dropped_blocks += 1;
+        return;
+    };
     @memcpy(owned, compress_buf[0..entry_len]);
 
     args.results.append(args.allocator, .{
         .block_number = block_number,
         .entry = owned,
         .log_count = @intCast(keep_count),
-    }) catch {};
+    }) catch {
+        args.dropped_blocks += 1;
+    };
 }
 
 inline fn keepLog(log: *const RawLog, filter: Filter) bool {
@@ -917,6 +959,35 @@ test "build: end_block clamps the scan range to a fixed window" {
     try testing.expectEqual(@as(usize, 20), decoded.items.len);
     try testing.expectEqual(@as(u64, 100), decoded.items[0].block_number);
     try testing.expectEqual(@as(u64, 119), decoded.items[19].block_number);
+}
+
+test "processBlockEntry: corrupt entry counts as dropped_block (fail-loud safety net)" {
+    const allocator = testing.allocator;
+
+    var results: std.ArrayListUnmanaged(FilteredBlock) = .{};
+    defer results.deinit(allocator);
+
+    var args: FilterWorkerArgs = .{
+        .reader = undefined,
+        .matching_blocks = &.{},
+        .filter = .{ .match_addrs = &.{}, .match_topics = &.{}, .exclude_addrs = &.{} },
+        .results = &results,
+        .allocator = allocator,
+    };
+
+    // lz4_len prefix claims more bytes than the entry contains → decompressEntry
+    // returns error.InvalidEntry. A regression that re-introduced silent drop
+    // would leave dropped_blocks == 0 here.
+    const corrupt_entry = [_]u8{ 0xFF, 0xFF, 0xFF, 0x7F, 0x42 };
+    var decompress_buf: [256]u8 = undefined;
+    var log_buf: [4]RawLog = undefined;
+    var keep_buf: [4]RawLog = undefined;
+    var serialize_buf: [256]u8 = undefined;
+    var compress_buf: [256]u8 = undefined;
+
+    processBlockEntry(&corrupt_entry, 100, &args, &decompress_buf, &log_buf, &keep_buf, &serialize_buf, &compress_buf);
+    try testing.expectEqual(@as(u64, 1), args.dropped_blocks);
+    try testing.expectEqual(@as(usize, 0), results.items.len);
 }
 
 test "blockKey/blockFromKey roundtrip and ordering" {

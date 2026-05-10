@@ -290,4 +290,13 @@ pub fn run(receipts_path: [*:0]const u8, output_path: []const u8) !void {
             @as(f64, @floatFromInt(total_logs)) / elapsed_s,
         });
     }
+
+    if (decode_errors > 0) {
+        std.debug.print(
+            "\nERROR: {d} blocks failed to decode — flat store is incomplete. " ++
+                "Likely MAX_LOGS_PER_BLOCK in core/src/types.zig.\n",
+            .{decode_errors},
+        );
+        return error.ImportHadDecodeErrors;
+    }
 }

@@ -42,10 +42,7 @@ pub fn decodeReceipts(
         const logs_end = try rlp.enterList();
 
         while (rlp.pos < logs_end) {
-            if (log_count >= log_buf.len) {
-                rlp.pos = receipt_end;
-                break;
-            }
+            if (log_count >= log_buf.len) return error.TooManyLogsInBlock;
 
             _ = try rlp.enterList();
 

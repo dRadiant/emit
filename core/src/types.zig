@@ -7,16 +7,18 @@ const std = @import("std");
 /// Maximum event topics per EVM log entry (LOG0..LOG4).
 pub const MAX_TOPICS = 4;
 
-/// Maximum logs per block for pre-allocated buffers. Busiest mainnet blocks
-/// have ~6,000 logs. 8,192 provides headroom without excessive stack usage.
-pub const MAX_LOGS_PER_BLOCK: usize = 8_192;
+/// Maximum logs per block for pre-allocated buffers.
+/// 16,384 covers the current outlier with 2x headroom;
+/// callers (importer, filter pipeline) MUST fail loudly rather than truncate
+/// if a future block ever exceeds it.
+pub const MAX_LOGS_PER_BLOCK: usize = 16_384;
 
 /// Serialize/compress/decompress buffer size. Must fit the largest block's
-/// serialized log data (~1.5 MB typical, 3+ MB worst case).
+/// serialized log data (~1.5 MB typical, 3+ MB worst case). Also used as the
+/// io_uring per-slot read buffer — undersizing it (we previously had a
+/// separate IO_BUF_SIZE = 256 KB) silently truncates large compressed
+/// entries; LZ4 then errors and the whole block is dropped from the index.
 pub const BLOCK_BUF_SIZE: usize = 4 * 1024 * 1024;
-
-/// io_uring read buffer size per slot. Compressed blocks max ~200 KB on mainnet.
-pub const IO_BUF_SIZE: usize = 256 * 1024;
 
 /// Blocks between meta commits during import. Each commit fsyncs (~1ms).
 /// 10K balances crash resilience (~3s of lost work) against fsync overhead (<1%).

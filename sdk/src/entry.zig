@@ -189,6 +189,7 @@ pub fn init(
 
     // Phase 1.
     const primary_result = try filter_builder.build(&reader, m, filter_dir_z, allocator);
+    try requireCompleteFilter("phase 1 (build)", primary_result);
     ctx.stats.filter_blocks_scanned = primary_result.blocks_scanned;
     ctx.stats.filter_blocks_matched = primary_result.blocks_matched;
     ctx.stats.filter_total_logs = primary_result.total_logs;
@@ -219,6 +220,7 @@ pub fn init(
                 filter_dir_z,
                 allocator,
             );
+            try requireCompleteFilter("phase 3 (appendChildren)", child_result);
             ctx.stats.children_blocks_matched = child_result.blocks_matched;
             ctx.stats.children_total_logs = child_result.total_logs;
             ctx.stats.append_children_ns = child_result.elapsed_ns;
@@ -255,6 +257,23 @@ pub fn init(
 
 fn entitiesLen(comptime entities: anytype) u32 {
     return @intCast(comptime resolveEntities(entities).len);
+}
+
+/// Hard-fail when a filter phase dropped blocks. Better than shipping a partial index.
+fn requireCompleteFilter(phase: []const u8, r: filter_builder.BuildResult) !void {
+    if (r.dropped_blocks == 0) return;
+    std.debug.print(
+        \\
+        \\ERROR: filter {s} dropped {d} of {d} matching blocks.
+        \\Index is incomplete; aborting. Likely cause: a block's serialized log
+        \\data exceeded BLOCK_BUF_SIZE or its compressed entry exceeded the
+        \\io_uring slot buffer. Bump the relevant constant in core/src/types.zig
+        \\(MAX_LOGS_PER_BLOCK or BLOCK_BUF_SIZE) and rerun.
+        \\
+    ,
+        .{ phase, r.dropped_blocks, r.blocks_matched + r.dropped_blocks },
+    );
+    return error.FilterBuildIncomplete;
 }
 
 /// Comptime-build the inner struct that holds one entity store per tuple
@@ -391,6 +410,14 @@ const LBTCBalance = struct {
 };
 
 const ADDR_TOKEN: [20]u8 = [_]u8{0xAE} ** 20;
+
+test "requireCompleteFilter: zero drops succeeds, any drops escalate to error" {
+    try requireCompleteFilter("test", .{ .blocks_matched = 100, .dropped_blocks = 0 });
+    try testing.expectError(
+        error.FilterBuildIncomplete,
+        requireCompleteFilter("test", .{ .blocks_matched = 99, .dropped_blocks = 1 }),
+    );
+}
 
 test "store_name override beats the default basename derivation" {
     const Ctx = Context(.{LBTCBalance});
