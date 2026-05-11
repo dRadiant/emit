@@ -174,6 +174,19 @@ fn runPhase(
         return result;
     }
 
+    // blooms.bin can hold duplicate entries for the same block_number when the
+    // importer's RocksDB key parsing collapses multi-byte discriminators (reorg
+    // entries) onto the same u64. The list is already sorted, so adjacent dedup
+    // suffices. Without this, MDBX_APPEND silently no-ops the second write and
+    // BuildResult.{blocks_matched,total_logs} drift ahead of MDBX.
+    var write_idx: usize = 1;
+    for (1..matching.items.len) |read_idx| {
+        if (matching.items[read_idx] == matching.items[read_idx - 1]) continue;
+        matching.items[write_idx] = matching.items[read_idx];
+        write_idx += 1;
+    }
+    matching.items.len = write_idx;
+
     const num_workers = parallel.workerCount(matching.items.len, PARALLEL_THRESHOLD);
     const ranges = parallel.chunkRanges(matching.items.len, num_workers);
 
