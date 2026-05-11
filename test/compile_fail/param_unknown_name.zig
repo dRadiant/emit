@@ -1,6 +1,6 @@
-// expected: has no arg named `frmo`. Available: from, to, value
+// expected: has no parameter named `frmo`. Available: from, to, value
 //
-// arg() with a typo'd name lists the available args.
+// param() with a typo'd name lists the available parameters.
 
 const std = @import("std");
 const sdk = @import("sdk");
@@ -20,5 +20,5 @@ comptime {
         .topic_count = 3,
         .data = &.{},
     };
-    _ = log.arg(Transfer, "frmo");
+    _ = log.param(Transfer, "frmo");
 }

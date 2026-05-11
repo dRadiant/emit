@@ -20,9 +20,9 @@ const Ctx = sdk.Context(@import("entities.zig"));
 
 pub fn handlePairCreated(log: sdk.Log(m.PairCreated), ctx: *Ctx) !void {
     try ctx.stores.pairs.save(.{
-        .id = log.args.pair,
-        .token0 = log.args.token0,
-        .token1 = log.args.token1,
+        .id = log.params.pair,
+        .token0 = log.params.token0,
+        .token1 = log.params.token1,
         .reserve0 = 0,
         .reserve1 = 0,
     });
@@ -31,8 +31,8 @@ pub fn handlePairCreated(log: sdk.Log(m.PairCreated), ctx: *Ctx) !void {
 pub fn handleSync(log: sdk.Log(m.Sync), ctx: *Ctx) !void {
     var pair = try ctx.stores.pairs.loadOrInit(log.address);
     // Sync.reserve0/1 are uint112; widen to u256 for the entity store.
-    pair.reserve0 = log.args.reserve0;
-    pair.reserve1 = log.args.reserve1;
+    pair.reserve0 = log.params.reserve0;
+    pair.reserve1 = log.params.reserve1;
     try ctx.stores.pairs.save(pair);
 }
 
@@ -40,10 +40,10 @@ pub fn handleSwap(log: sdk.Log(m.Swap), ctx: *Ctx) !void {
     try ctx.stores.swapEvents.save(.{
         .id = log.eventId(),
         .pair = log.address,
-        .amount0_in = log.args.amount0In,
-        .amount1_in = log.args.amount1In,
-        .amount0_out = log.args.amount0Out,
-        .amount1_out = log.args.amount1Out,
+        .amount0_in = log.params.amount0In,
+        .amount1_in = log.params.amount1In,
+        .amount0_out = log.params.amount0Out,
+        .amount1_out = log.params.amount1Out,
     });
 }
 

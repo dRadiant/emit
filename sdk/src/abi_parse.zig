@@ -46,21 +46,21 @@ pub fn parseEvent(comptime sig: []const u8) ParsedEvent {
     return comptime parseEventInner(sig);
 }
 
-/// Look up a param by name. Fires `@compileError` listing available args
-/// if the name is not found.
-pub fn paramByName(comptime parsed: ParsedEvent, comptime arg_name: []const u8) ParsedParam {
+/// Look up a parameter by name. Fires `@compileError` listing available
+/// parameters if the name is not found.
+pub fn paramByName(comptime parsed: ParsedEvent, comptime param_name: []const u8) ParsedParam {
     return comptime blk: {
-        if (arg_name.len == 0) @compileError("abi_parse: empty arg name passed to paramByName");
+        if (param_name.len == 0) @compileError("abi_parse: empty parameter name passed to paramByName");
         for (parsed.params) |p| {
             // Skip unnamed params so a caller passing "" can't silently match.
-            if (p.name.len > 0 and std.mem.eql(u8, p.name, arg_name)) break :blk p;
+            if (p.name.len > 0 and std.mem.eql(u8, p.name, param_name)) break :blk p;
         }
         var avail: []const u8 = "";
         for (parsed.params, 0..) |p, i| {
             if (i > 0) avail = avail ++ ", ";
             avail = avail ++ (if (p.name.len == 0) "<unnamed>" else p.name);
         }
-        @compileError("abi_parse: event `" ++ parsed.name ++ "` has no arg named `" ++ arg_name ++ "`. Available: " ++ avail);
+        @compileError("abi_parse: event `" ++ parsed.name ++ "` has no parameter named `" ++ param_name ++ "`. Available: " ++ avail);
     };
 }
 

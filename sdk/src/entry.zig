@@ -456,7 +456,7 @@ test "Context accepts a module type and produces the same Context as the tuple f
 const TransferHandler = struct {
     pub fn handleTransfer(log: @import("handler.zig").Log(Transfer), ctx: anytype) !void {
         // Transfer's signature is unnamed, so we still read positionally
-        // here; named-arg access (`log.args.value`) is exercised by the
+        // here; named-parameter access (`log.params.value`) is exercised by the
         // example indexers and the parser tests.
         const from = log.topics[1][12..32].*;
         const to = log.topics[2][12..32].*;

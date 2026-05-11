@@ -13,11 +13,11 @@ const manifest = @import("manifest.zig");
 /// Two decoder layers:
 ///
 /// 1. **Slot-positional**: `indexedAddress(i)`, `dataU256(word)`, etc.
-///    For one-off ad-hoc reads or signatures without arg names.
-/// 2. **Name-resolved**: `arg(E, "from")` — single helper whose return
+///    For one-off ad-hoc reads or signatures without parameter names.
+/// 2. **Name-resolved**: `param(E, "from")` — single helper whose return
 ///    type is comptime-resolved from `E.signature`. `address` → `[20]u8`,
 ///    `uintN` → `uN`, `intN` → `iN`, `boolean` → `bool`, `bytesN` → `[N]u8`.
-///    Wrong arg name or unsupported type is a `@compileError`.
+///    Wrong parameter name or unsupported type is a `@compileError`.
 pub const DecodedLog = struct {
     block_number: u64,
     tx_index: u16,
@@ -66,13 +66,14 @@ pub const DecodedLog = struct {
         return self.data[start + 12 ..][0..20].*;
     }
 
-    /// Read a named arg from `E.signature`. The return type is derived
-    /// at comptime from the parsed type — `address` → `[20]u8`, `uintN`
-    /// → `uN`, `intN` → `iN`, `bool` → `bool`, `bytesN` → `[N]u8`. Wrong
-    /// arg name lists the available args; dynamic types (`bytes`, `string`)
-    /// are rejected with a pointer at the slot-positional helpers.
-    pub fn arg(self: DecodedLog, comptime E: type, comptime arg_name: []const u8) TypeFor(resolveArg(E, arg_name).type_str) {
-        const p = comptime resolveArg(E, arg_name);
+    /// Read a named parameter from `E.signature`. The return type is
+    /// derived at comptime from the parsed type — `address` → `[20]u8`,
+    /// `uintN` → `uN`, `intN` → `iN`, `bool` → `bool`, `bytesN` → `[N]u8`.
+    /// Wrong parameter name lists the available params; dynamic types
+    /// (`bytes`, `string`) are rejected with a pointer at the slot-positional
+    /// helpers.
+    pub fn param(self: DecodedLog, comptime E: type, comptime param_name: []const u8) TypeFor(resolveParam(E, param_name).type_str) {
+        const p = comptime resolveParam(E, param_name);
         const word: [32]u8 = switch (comptime p.slot_kind) {
             .topic => self.topics[comptime p.slot_index],
             .data => self.data[comptime p.slot_index..][0..32].*,
@@ -80,14 +81,14 @@ pub const DecodedLog = struct {
         return decodeWord(TypeFor(p.type_str), p.type_str, &word);
     }
 
-    /// Decode every named arg of `E.signature` into one struct.
-    /// `ArgsOf(E)` has one field per named arg with the right Zig type
-    /// (see `arg` for the type mapping). Unnamed args are skipped.
-    /// Data slots beyond `self.data.len` are zero-filled (matches the
-    /// ABI's zero-padding convention; keeps the dispatcher safe against
+    /// Decode every named parameter of `E.signature` into one struct.
+    /// `ParamsOf(E)` has one field per named parameter with the right Zig
+    /// type (see `param` for the type mapping). Unnamed parameters are
+    /// skipped. Data slots beyond `self.data.len` are zero-filled (matches
+    /// the ABI's zero-padding convention; keeps the dispatcher safe against
     /// malformed RPC responses or test fixtures with short payloads).
-    pub fn decode(self: DecodedLog, comptime E: type) ArgsOf(E) {
-        var out: ArgsOf(E) = undefined;
+    pub fn decode(self: DecodedLog, comptime E: type) ParamsOf(E) {
+        var out: ParamsOf(E) = undefined;
         inline for (comptime manifest.parsedEvent(E).params) |p| {
             if (comptime p.name.len == 0) continue;
             const word: [32]u8 = switch (comptime p.slot_kind) {
@@ -120,10 +121,10 @@ fn encodeEventId(block_number: u64, tx_index: u16, log_index: u16) [16]u8 {
     return id;
 }
 
-// ── Comptime arg resolution ──────────────────────────────────────────────
+// ── Comptime parameter resolution ────────────────────────────────────────
 
-fn resolveArg(comptime E: type, comptime arg_name: []const u8) abi_parse.ParsedParam {
-    return comptime abi_parse.paramByName(manifest.parsedEvent(E), arg_name);
+fn resolveParam(comptime E: type, comptime param_name: []const u8) abi_parse.ParsedParam {
+    return comptime abi_parse.paramByName(manifest.parsedEvent(E), param_name);
 }
 
 /// Map a Solidity type string to the Zig type the decoder returns:
@@ -141,9 +142,9 @@ fn TypeFor(comptime t: []const u8) type {
 }
 
 /// Comptime struct synthesized from `E.signature`: one field per named
-/// arg with the right Zig type (see `TypeFor`). Unnamed args are
-/// skipped — for fully-positional reads, use `log.arg` / `log.dataU256`.
-pub fn ArgsOf(comptime E: type) type {
+/// parameter with the right Zig type (see `TypeFor`). Unnamed parameters
+/// are skipped — for fully-positional reads, use `log.param` / `log.dataU256`.
+pub fn ParamsOf(comptime E: type) type {
     return comptime blk: {
         var fields: []const std.builtin.Type.StructField = &.{};
         for (manifest.parsedEvent(E).params) |p| {
@@ -193,9 +194,9 @@ fn parseBits(comptime s: []const u8) comptime_int {
 }
 
 /// Typed log handed to handlers by the dispatcher: same meta shape as
-/// `DecodedLog`, plus a comptime-decoded `args: ArgsOf(E)` so handlers
-/// read named fields directly (`log.args.from`) instead of routing every
-/// access through `log.arg(E, "from")`.
+/// `DecodedLog`, plus a comptime-decoded `params: ParamsOf(E)` so handlers
+/// read named fields directly (`log.params.from`) instead of routing every
+/// access through `log.param(E, "from")`.
 pub fn Log(comptime E: type) type {
     return struct {
         block_number: u64,
@@ -206,7 +207,7 @@ pub fn Log(comptime E: type) type {
         topics: [4][32]u8,
         topic_count: u8,
         data: []const u8,
-        args: ArgsOf(E),
+        params: ParamsOf(E),
 
         pub fn fromDecoded(d: DecodedLog) @This() {
             return .{
@@ -218,7 +219,7 @@ pub fn Log(comptime E: type) type {
                 .topics = d.topics,
                 .topic_count = d.topic_count,
                 .data = d.data,
-                .args = d.decode(E),
+                .params = d.decode(E),
             };
         }
 
@@ -387,7 +388,7 @@ test "DecodedLog decoder helpers extract addresses and u256 from data" {
     try std.testing.expectEqual(@as(u256, 12345), log.dataU256(1));
 }
 
-test "arg resolves indexed addresses and uint256 from data" {
+test "param resolves indexed addresses and uint256 from data" {
     const NamedTransfer = struct {
         pub const signature = "Transfer(address indexed from, address indexed to, uint256 value)";
     };
@@ -412,9 +413,9 @@ test "arg resolves indexed addresses and uint256 from data" {
         .data = &data_buf,
     };
 
-    const from = log.arg(NamedTransfer, "from");
-    const to = log.arg(NamedTransfer, "to");
-    const value = log.arg(NamedTransfer, "value");
+    const from = log.param(NamedTransfer, "from");
+    const to = log.param(NamedTransfer, "to");
+    const value = log.param(NamedTransfer, "value");
     try std.testing.expectEqual([20]u8, @TypeOf(from));
     try std.testing.expectEqual(u256, @TypeOf(value));
     try std.testing.expectEqualSlices(u8, &FROM, &from);
@@ -422,8 +423,8 @@ test "arg resolves indexed addresses and uint256 from data" {
     try std.testing.expectEqual(@as(u256, 0xdead_beef), value);
 }
 
-test "arg returns the right narrow integer type for sub-256 uintN" {
-    // Sync(uint112,uint112) — verifies arg returns u112, not u256
+test "param returns the right narrow integer type for sub-256 uintN" {
+    // Sync(uint112,uint112) verifies param returns u112, not u256.
     const Sync = struct {
         pub const signature = "Sync(uint112 reserve0, uint112 reserve1)";
     };
@@ -442,15 +443,15 @@ test "arg returns the right narrow integer type for sub-256 uintN" {
         .data = &data_buf,
     };
 
-    const r0 = log.arg(Sync, "reserve0");
-    const r1 = log.arg(Sync, "reserve1");
+    const r0 = log.param(Sync, "reserve0");
+    const r1 = log.param(Sync, "reserve1");
     try std.testing.expectEqual(u112, @TypeOf(r0));
     try std.testing.expectEqual(u112, @TypeOf(r1));
     try std.testing.expectEqual(@as(u112, 0x1234), r0);
     try std.testing.expectEqual(@as(u112, 0xabcd), r1);
 }
 
-test "decode returns a struct with one field per named arg, correct types" {
+test "decode returns a struct with one field per named parameter, correct types" {
     const Sync = struct {
         pub const signature = "Sync(uint112 reserve0, uint112 reserve1)";
     };
@@ -476,7 +477,7 @@ test "decode returns a struct with one field per named arg, correct types" {
     try std.testing.expectEqual(@as(u112, 200), a.reserve1);
 }
 
-test "arg returns bool and bytesN with the right Zig types" {
+test "param returns bool and bytesN with the right Zig types" {
     const E = struct {
         pub const signature = "E(bool indexed flag, bytes4 selector, bytes32 hash)";
     };
@@ -498,9 +499,9 @@ test "arg returns bool and bytesN with the right Zig types" {
         .data = &data_buf,
     };
 
-    const flag = log.arg(E, "flag");
-    const sel = log.arg(E, "selector");
-    const hash = log.arg(E, "hash");
+    const flag = log.param(E, "flag");
+    const sel = log.param(E, "selector");
+    const hash = log.param(E, "hash");
     try std.testing.expectEqual(bool, @TypeOf(flag));
     try std.testing.expectEqual([4]u8, @TypeOf(sel));
     try std.testing.expectEqual([32]u8, @TypeOf(hash));
