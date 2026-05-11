@@ -24,6 +24,15 @@ pub const BLOCK_BUF_SIZE: usize = 4 * 1024 * 1024;
 /// 10K balances crash resilience (~3s of lost work) against fsync overhead (<1%).
 pub const COMMIT_INTERVAL: usize = 10_000;
 
+/// Chain-level finality cushion. The flat store contains only blocks that
+/// have at least this many confirmations; anything within FINALITY_DEPTH of
+/// head lives in the pending ring (engine/src/pending_ring.zig) and may
+/// still reorg. The importer stops at `head - FINALITY_DEPTH`, head_follower
+/// graduates blocks once they cross it, and reorg detection only ever walks
+/// back this far. Per-chain value: Ethereum L1 = 64 (≈ 12.8 min PoS). Becomes
+/// part of `ChainConfig` when multi-chain lands.
+pub const FINALITY_DEPTH: u64 = 64;
+
 // ── Raw log ──────────────────────────────────────────────────────────────
 
 /// A single EVM log entry. Core interchange type between import, serialization,

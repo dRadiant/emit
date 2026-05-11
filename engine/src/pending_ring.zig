@@ -22,7 +22,7 @@ const core = @import("core");
 
 const bloom = core.bloom;
 
-pub const FINALITY_DEPTH: u64 = 64;
+pub const FINALITY_DEPTH = core.types.FINALITY_DEPTH;
 
 const HASH_SIZE = 32;
 const FIXED_ENTRY_SIZE = 8 + HASH_SIZE + bloom.BLOOM_SIZE + bloom.ADDR_BLOOM_SIZE + 4;

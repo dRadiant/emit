@@ -6,6 +6,14 @@
 /// → serialize → LZ4 compress. The reader thread also drains completed slots
 /// into the flat store writer in order. Lock-free via atomic slot states.
 ///
+/// Only finalized blocks land in the flat store: we stop at `head - 64`.
+/// Nethermind retains reorg-history receipt rows in the Blocks CF for
+/// not-yet-finalized blocks (multiple entries per block_number with a
+/// discriminator suffix), and our first-8-bytes-as-block_number key parsing
+/// would collapse those onto a single block_number and write whichever
+/// version came last. The pending ring in head_follower fills the trailing
+/// edge canonically.
+///
 /// Only compiled when the rocksdb lazy dependency is available (`zig build import`).
 /// Decode logic lives in receipt_decoder.zig (testable without rocksdb).
 const std = @import("std");
@@ -20,6 +28,8 @@ const types = core.types;
 const log_serial = core.log_serial;
 const bloom = core.bloom;
 const parallel = core.parallel;
+
+const FINALITY_DEPTH = types.FINALITY_DEPTH;
 
 const Iterator = ?*c.rocksdb_iterator_t;
 
@@ -144,6 +154,15 @@ fn iterValid(iter: Iterator) bool {
     return c.rocksdb_iter_valid(iter) != 0;
 }
 
+/// Peek the current iter key as a u64 BE block number. Returns null if
+/// the iter is invalid or the key is shorter than 8 bytes.
+fn iterKeyBlock(iter: Iterator) ?u64 {
+    var klen: usize = 0;
+    const key_ptr: [*]const u8 = @ptrCast(c.rocksdb_iter_key(iter, &klen) orelse return null);
+    if (klen < 8) return null;
+    return std.mem.readInt(u64, key_ptr[0..8], .big);
+}
+
 // ── Entry points ─────────────────────────────────────────────────────────
 
 pub fn main() !void {
@@ -163,6 +182,7 @@ pub fn run(receipts_path: [*:0]const u8, output_path: []const u8) !void {
     // "Blocks" CF contains receipts keyed by block number (u64 BE).
     var err: ?[*:0]u8 = null;
     const opts = c.rocksdb_options_create();
+    defer c.rocksdb_options_destroy(opts);
 
     const cf_names = [_][*c]const u8{ @ptrCast("default"), @ptrCast("Transactions"), @ptrCast("Blocks") };
     const cf_opts = [3]?*const c.rocksdb_options_t{ opts, opts, opts };
@@ -173,21 +193,61 @@ pub fn run(receipts_path: [*:0]const u8, output_path: []const u8) !void {
     );
     try rocksErr(&err);
     if (db == null) return error.RocksDBError;
+    defer c.rocksdb_close(db);
+    defer for (&cf_handles) |h| if (h) |handle| c.rocksdb_column_family_handle_destroy(handle);
+
     const blocks_cf = cf_handles[2] orelse return error.RocksDBError;
 
     std.fs.cwd().makeDir(output_path) catch {};
     var writer = try flat_writer.FlatStoreWriter.open(output_path);
+    defer writer.close();
 
     // Sequential bulk read: 4 MB readahead, skip block cache and checksums
     const read_opts = c.rocksdb_readoptions_create();
+    defer c.rocksdb_readoptions_destroy(read_opts);
     c.rocksdb_readoptions_set_readahead_size(read_opts, 4 * 1024 * 1024);
     c.rocksdb_readoptions_set_fill_cache(read_opts, 0);
     c.rocksdb_readoptions_set_verify_checksums(read_opts, 0);
 
     const iter = c.rocksdb_create_iterator_cf(db, read_opts, blocks_cf);
     if (iter == null) return error.RocksDBError;
+    defer c.rocksdb_iter_destroy(iter);
+
+    // Query chain head; cap import at head - FINALITY_DEPTH so the flat store
+    // only contains finalized blocks. The pending ring (head_follower) fills
+    // the trailing edge canonically.
+    c.rocksdb_iter_seek_to_last(iter);
+    if (!iterValid(iter)) {
+        std.debug.print("Receipts DB is empty; nothing to import.\n", .{});
+        return;
+    }
+    const head = iterKeyBlock(iter) orelse return error.InvalidKey;
+    const finality_cutoff: u64 = if (head > FINALITY_DEPTH) head - FINALITY_DEPTH else 0;
+    std.debug.print("Chain head: {d}; finality cutoff: {d} (head - {d}).\n", .{ head, finality_cutoff, FINALITY_DEPTH });
+
+    const start_block: u64 = if (writer.meta.last_finalized_block > 0)
+        writer.meta.last_finalized_block + 1
+    else
+        0;
+    if (start_block > finality_cutoff) {
+        std.debug.print(
+            "Flat store already covers the finalized prefix (last_finalized={d}); nothing to import.\n",
+            .{writer.meta.last_finalized_block},
+        );
+        return;
+    }
+
+    if (start_block > 0) {
+        var resume_key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &resume_key, start_block, .big);
+        c.rocksdb_iter_seek(iter, @ptrCast(&resume_key), resume_key.len);
+        std.debug.print("Resuming from block {} (flat store size: {} bytes)\n", .{ start_block, writer.meta.blocks_dat_size });
+    } else {
+        c.rocksdb_iter_seek_to_first(iter);
+    }
 
     const slots = try allocator.create([SLOT_COUNT]Slot);
+    defer allocator.destroy(slots);
     for (slots) |*s| s.* = Slot{};
 
     const t_start = std.time.nanoTimestamp();
@@ -200,18 +260,6 @@ pub fn run(receipts_path: [*:0]const u8, output_path: []const u8) !void {
         parallel.MAX_WORKERS, std.mem.span(receipts_path), output_path,
     });
 
-    // Resume from flat store checkpoint if present
-    if (writer.meta.last_finalized_block > 0) {
-        var resume_key: [8]u8 = undefined;
-        std.mem.writeInt(u64, &resume_key, writer.meta.last_finalized_block + 1, .big);
-        c.rocksdb_iter_seek(iter, @ptrCast(&resume_key), resume_key.len);
-        std.debug.print("Resuming from block {} (flat store size: {} bytes)\n", .{
-            writer.meta.last_finalized_block + 1, writer.meta.blocks_dat_size,
-        });
-    } else {
-        c.rocksdb_iter_seek_to_first(iter);
-    }
-
     var worker_args: [parallel.MAX_WORKERS]WorkerArgs = undefined;
     var workers: [parallel.MAX_WORKERS]std.Thread = undefined;
     for (0..parallel.MAX_WORKERS) |i| {
@@ -219,21 +267,36 @@ pub fn run(receipts_path: [*:0]const u8, output_path: []const u8) !void {
         workers[i] = try std.Thread.spawn(.{ .stack_size = parallel.WORKER_STACK_SIZE }, workerFn, .{&worker_args[i]});
     }
 
-    // Single-threaded reader + writer loop. Reads ahead into empty slots,
-    // then drains the next completed slot in order (preserves block ordering).
+    // Reader + writer loop. `read_done` flips once we've consumed past
+    // `finality_cutoff` or exhausted the iter; the drain phase then runs
+    // until in-flight slots are flushed.
     var read_cursor: usize = 0;
     var write_cursor: usize = 0;
+    var read_done = false;
 
-    while (write_cursor < read_cursor or iterValid(iter)) {
-        // Fill empty slots from RocksDB iterator
-        while (read_cursor - write_cursor < SLOT_COUNT and iterValid(iter)) {
-            const next_slot = &slots[read_cursor % SLOT_COUNT];
-            if (next_slot.state.load(.acquire) != Slot.EMPTY) break;
-            if (fillSlot(next_slot, iter)) read_cursor += 1;
-            c.rocksdb_iter_next(iter);
+    while (write_cursor < read_cursor or (!read_done and iterValid(iter))) {
+        if (!read_done) {
+            while (read_cursor - write_cursor < SLOT_COUNT and iterValid(iter)) {
+                if (iterKeyBlock(iter)) |bn| {
+                    if (bn > finality_cutoff) {
+                        read_done = true;
+                        break;
+                    }
+                }
+                const next_slot = &slots[read_cursor % SLOT_COUNT];
+                if (next_slot.state.load(.acquire) != Slot.EMPTY) break;
+                if (fillSlot(next_slot, iter)) read_cursor += 1;
+                c.rocksdb_iter_next(iter);
+            }
+            if (!iterValid(iter)) read_done = true;
         }
 
-        if (write_cursor >= read_cursor) break;
+        if (write_cursor >= read_cursor) {
+            if (read_done) break;
+            std.atomic.spinLoopHint();
+            continue;
+        }
+
         const slot = &slots[write_cursor % SLOT_COUNT];
         while (slot.state.load(.acquire) != Slot.DONE) std.atomic.spinLoopHint();
 
@@ -263,16 +326,7 @@ pub fn run(receipts_path: [*:0]const u8, output_path: []const u8) !void {
     slots[0].block_number = std.math.maxInt(u64);
     for (&workers) |*w| w.join();
 
-    // Cleanup RocksDB resources
-    c.rocksdb_iter_destroy(iter);
-    c.rocksdb_readoptions_destroy(read_opts);
-    for (&cf_handles) |h| if (h) |handle| c.rocksdb_column_family_handle_destroy(handle);
-    c.rocksdb_close(db);
-    c.rocksdb_options_destroy(opts);
-
     try writer.finalize();
-    writer.close();
-    allocator.destroy(slots);
 
     const elapsed_s = @as(f64, @floatFromInt(std.time.nanoTimestamp() - t_start)) / 1e9;
     std.debug.print(
