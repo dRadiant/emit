@@ -16,9 +16,10 @@ const std = @import("std");
 
 pub const MAX_WORKERS = 7;
 
-/// Worker thread stack size. Sized above the largest worker frame
-/// (~41 MB in `filter_builder.filterWorker` after MAX_LOGS_PER_BLOCK = 65,536).
-pub const WORKER_STACK_SIZE: usize = 64 * 1024 * 1024;
+/// Worker thread stack size. Sized above the largest worker frame:
+/// `engine/rocksdb_import.workerFn` at ~24 MB (`MAX_LOGS_PER_BLOCK` × RawLog
+/// + 2 × BLOCK_BUF_SIZE). `filter_builder.filterWorker` is ~12 MB.
+pub const WORKER_STACK_SIZE: usize = 32 * 1024 * 1024;
 
 /// Run `worker_fn` across `num_workers` threads. Even when `num_workers == 1`
 /// we spawn a thread (rather than running inline on the caller) so the

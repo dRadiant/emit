@@ -318,8 +318,6 @@ fn filterWorker(args: *FilterWorkerArgs) void {
     // Stack scratch is safe under the buffer rule in `core.parallel`:
     // `parallel.run` always spawns workers at `WORKER_STACK_SIZE`.
     var decompress_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
-    var log_buf: [types.MAX_LOGS_PER_BLOCK]RawLog = undefined;
-    var keep_buf: [types.MAX_LOGS_PER_BLOCK]RawLog = undefined;
     var serialize_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
     var compress_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
 
@@ -371,7 +369,7 @@ fn filterWorker(args: *FilterWorkerArgs) void {
             for (done[0..n]) |c| {
                 const entry_data = pipeline.getBuffer(c);
                 if (entry_data.len > 0) {
-                    processBlockEntry(entry_data, c.block_number, args, &decompress_buf, &log_buf, &keep_buf, &serialize_buf, &compress_buf);
+                    processBlockEntry(entry_data, c.block_number, args, &decompress_buf, &serialize_buf, &compress_buf);
                 } else args.dropped_blocks += 1;
                 pipeline.releaseSlot(c.buf_slot);
                 completed += 1;
@@ -392,7 +390,7 @@ fn filterWorker(args: *FilterWorkerArgs) void {
             args.dropped_blocks += 1;
             continue;
         };
-        processBlockEntry(entry_data, bn, args, &decompress_buf, &log_buf, &keep_buf, &serialize_buf, &compress_buf);
+        processBlockEntry(entry_data, bn, args, &decompress_buf, &serialize_buf, &compress_buf);
     }
     std.mem.sort(FilteredBlock, args.results.items, {}, blockNumberLessThan);
 }
@@ -406,8 +404,6 @@ fn processBlockEntry(
     block_number: u64,
     args: *FilterWorkerArgs,
     decompress_buf: []u8,
-    log_buf: []RawLog,
-    keep_buf: []RawLog,
     serialize_buf: []u8,
     compress_buf: []u8,
 ) void {
@@ -417,19 +413,44 @@ fn processBlockEntry(
         args.dropped_blocks += 1;
         return;
     };
-    const log_count = log_serial.deserializeLogs(decompressed, log_buf);
 
-    var keep_count: usize = 0;
-    for (log_buf[0..log_count]) |*log| {
-        if (!keepLog(log, args.filter)) continue;
-        log.block_number = block_number;
-        keep_buf[keep_count] = log.*;
-        keep_count += 1;
+    // Zero-copy walk: iterate logs in place, check the filter against raw
+    // bytes at known offsets, memcpy whole-log byte ranges of keepers into
+    // serialize_buf. Skips both `deserializeLogs` and the
+    // per-log `RawLog` materialization for rejected logs
+    var pos: usize = 0;
+    const log_count: usize = std.mem.readInt(u32, decompressed[pos..][0..4], .little);
+    pos += 4;
+
+    var out_pos: usize = 4;
+    var kept: u32 = 0;
+
+    for (0..log_count) |_| {
+        const log_start = pos;
+        const address: *const [20]u8 = @ptrCast(decompressed[pos + 4 ..][0..20]);
+        const topic_count = decompressed[pos + 24];
+        const topics_end = pos + 25 + @as(usize, topic_count) * 32;
+        const data_len: usize = std.mem.readInt(u32, decompressed[topics_end..][0..4], .little);
+        const log_end = topics_end + 4 + data_len + 32;
+        pos = log_end;
+
+        if (topic_count == 0) continue;
+        if (!containsAddress(args.filter.match_addrs, address)) continue;
+        const topic0: *const [32]u8 = @ptrCast(decompressed[log_start + 25 ..][0..32]);
+        if (!containsTopic(args.filter.match_topics, topic0)) continue;
+        if (containsAddress(args.filter.exclude_addrs, address)) continue;
+
+        const len = log_end - log_start;
+        @memcpy(serialize_buf[out_pos..][0..len], decompressed[log_start..log_end]);
+        out_pos += len;
+        kept += 1;
     }
-    if (keep_count == 0) return;
 
-    const serialized_len = log_serial.serializeLogs(keep_buf[0..keep_count], serialize_buf);
-    const entry_len = log_serial.compressEntry(serialize_buf[0..serialized_len], compress_buf) catch {
+    if (kept == 0) return;
+
+    std.mem.writeInt(u32, serialize_buf[0..4], kept, .little);
+
+    const entry_len = log_serial.compressEntry(serialize_buf[0..out_pos], compress_buf) catch {
         args.dropped_blocks += 1;
         return;
     };
@@ -443,18 +464,10 @@ fn processBlockEntry(
     args.results.append(args.allocator, .{
         .block_number = block_number,
         .entry = owned,
-        .log_count = @intCast(keep_count),
+        .log_count = kept,
     }) catch {
         args.dropped_blocks += 1;
     };
-}
-
-inline fn keepLog(log: *const RawLog, filter: Filter) bool {
-    if (log.topic_count == 0) return false;
-    if (!containsAddress(filter.match_addrs, &log.address)) return false;
-    if (!containsTopic(filter.match_topics, &log.topics[0])) return false;
-    if (containsAddress(filter.exclude_addrs, &log.address)) return false;
-    return true;
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -996,12 +1009,10 @@ test "processBlockEntry: corrupt entry counts as dropped_block (fail-loud safety
     // would leave dropped_blocks == 0 here.
     const corrupt_entry = [_]u8{ 0xFF, 0xFF, 0xFF, 0x7F, 0x42 };
     var decompress_buf: [256]u8 = undefined;
-    var log_buf: [4]RawLog = undefined;
-    var keep_buf: [4]RawLog = undefined;
     var serialize_buf: [256]u8 = undefined;
     var compress_buf: [256]u8 = undefined;
 
-    processBlockEntry(&corrupt_entry, 100, &args, &decompress_buf, &log_buf, &keep_buf, &serialize_buf, &compress_buf);
+    processBlockEntry(&corrupt_entry, 100, &args, &decompress_buf, &serialize_buf, &compress_buf);
     try testing.expectEqual(@as(u64, 1), args.dropped_blocks);
     try testing.expectEqual(@as(usize, 0), results.items.len);
 }
