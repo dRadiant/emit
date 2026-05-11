@@ -129,7 +129,7 @@ fn resolveArg(comptime E: type, comptime arg_name: []const u8) abi_parse.ParsedP
 /// Map a Solidity type string to the Zig type the decoder returns:
 /// `address`→`[20]u8`, `uintN`→`uN`, `intN`→`iN`, `bytesN`→`[N]u8`,
 /// `bool`→`bool`. Dynamic types (`bytes`, `string`) are rejected.
-pub fn TypeFor(comptime t: []const u8) type {
+fn TypeFor(comptime t: []const u8) type {
     if (comptime std.mem.eql(u8, t, "address")) return [20]u8;
     if (comptime std.mem.eql(u8, t, "bool")) return bool;
     if (comptime std.mem.startsWith(u8, t, "uint")) return std.meta.Int(.unsigned, parseBits(t["uint".len..]));

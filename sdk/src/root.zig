@@ -20,11 +20,9 @@ const mutable_store = @import("mutable_store.zig");
 const scanner = @import("scanner.zig");
 
 // Public submodules: handler-helper utilities the user calls by name.
-pub const humanize = @import("humanize.zig");
 pub const manifest = @import("manifest.zig");
 
 // User-facing top-level surface.
-pub const ArgsOf = handler.ArgsOf;
 pub const Context = entry.Context;
 pub const ContractDef = manifest.ContractDef;
 pub const DecodedLog = handler.DecodedLog;
@@ -167,7 +165,7 @@ test {
     _ = immutable_store;
     _ = mutable_store;
     _ = manifest;
-    _ = humanize;
+    _ = @import("humanize.zig");
     _ = handler;
     _ = filter_builder;
     _ = scanner;

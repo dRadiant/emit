@@ -7,7 +7,7 @@ const std = @import("std");
 /// k=7 hash functions extracted from non-overlapping 2-byte windows in the
 /// 32-byte key. No extra hashing needed — topic0 values are already keccak256
 /// (uniformly distributed). Addresses are right-padded to 32 bytes.
-pub const NUM_HASHES = 7;
+const NUM_HASHES = 7;
 
 pub fn BloomFilter(comptime SIZE: comptime_int) type {
     return struct {

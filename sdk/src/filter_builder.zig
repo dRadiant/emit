@@ -55,7 +55,7 @@ pub const BuildResult = struct {
     elapsed_ns: u64 = 0,
 };
 
-pub fn blockKey(block_number: u64) [KEY_SIZE]u8 {
+fn blockKey(block_number: u64) [KEY_SIZE]u8 {
     var buf: [KEY_SIZE]u8 = undefined;
     std.mem.writeInt(u64, &buf, block_number, .big);
     return buf;

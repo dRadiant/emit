@@ -93,7 +93,7 @@ pub fn validateManifest(comptime m: Manifest) void {
 
 /// Comptime check that `f.spawn_arg` references a named `address` arg on
 /// `f.create_event`'s signature.
-pub fn validateSpawnArg(comptime f: FactoryDef) void {
+fn validateSpawnArg(comptime f: FactoryDef) void {
     comptime {
         const parsed = parsedEvent(f.create_event);
         const p = abi_parse.paramByName(parsed, f.spawn_arg);
