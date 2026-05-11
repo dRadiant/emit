@@ -7,11 +7,11 @@ const std = @import("std");
 /// Maximum event topics per EVM log entry (LOG0..LOG4).
 pub const MAX_TOPICS = 4;
 
-/// Maximum logs per block for pre-allocated buffers.
-/// 16,384 covers the current outlier with 2x headroom;
-/// callers (importer, filter pipeline) MUST fail loudly rather than truncate
-/// if a future block ever exceeds it.
-pub const MAX_LOGS_PER_BLOCK: usize = 16_384;
+/// Pre-allocated log-buffer ceiling. 65,536 is the natural cap — `RawLog.log_index`
+/// is `u16`, so log_index 65,536 can't be addressed. Mainnet has 35 blocks with
+/// >16,384 logs (caught by the importer's fail-loud). Callers must fail loud,
+/// not truncate, on overflow.
+pub const MAX_LOGS_PER_BLOCK: usize = 65_536;
 
 /// Serialize/compress/decompress buffer size. Must fit the largest block's
 /// serialized log data (~1.5 MB typical, 3+ MB worst case). Also used as the

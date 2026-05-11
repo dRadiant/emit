@@ -507,7 +507,8 @@ fn writeFlatStore(dir: std.fs.Dir, blocks: []const TestBlock, allocator: std.mem
 
     var offset: u64 = 0;
     for (blocks) |blk| {
-        var raw_logs: [types.MAX_LOGS_PER_BLOCK]RawLog = undefined;
+        const raw_logs = try allocator.alloc(RawLog, blk.logs.len);
+        defer allocator.free(raw_logs);
         for (blk.logs, 0..) |tl, i| {
             raw_logs[i] = .{
                 .block_number = blk.block_number,
@@ -520,7 +521,7 @@ fn writeFlatStore(dir: std.fs.Dir, blocks: []const TestBlock, allocator: std.mem
                 .tx_hash = [_]u8{0xFE} ** 32,
             };
         }
-        const written = log_serial.serializeLogs(raw_logs[0..blk.logs.len], serialize_buf);
+        const written = log_serial.serializeLogs(raw_logs, serialize_buf);
         const entry_len = try log_serial.compressEntry(serialize_buf[0..written], compress_buf);
         try blocks_file.writeAll(compress_buf[0..entry_len]);
 
@@ -529,8 +530,8 @@ fn writeFlatStore(dir: std.fs.Dir, blocks: []const TestBlock, allocator: std.mem
         std.mem.writeInt(u32, idx_entry[8..12], @intCast(entry_len), .little);
         try idx_file.writeAll(&idx_entry);
 
-        const tb = log_serial.buildTopicBloom(raw_logs[0..blk.logs.len]);
-        const ab = log_serial.buildAddrBloom(raw_logs[0..blk.logs.len]);
+        const tb = log_serial.buildTopicBloom(raw_logs);
+        const ab = log_serial.buildAddrBloom(raw_logs);
         var bloom_entry: [flat_reader.BLOOM_ENTRY_SIZE]u8 = std.mem.zeroes([flat_reader.BLOOM_ENTRY_SIZE]u8);
         std.mem.writeInt(u64, bloom_entry[0..8], blk.block_number, .big);
         @memcpy(bloom_entry[flat_reader.TOPIC_BLOOM_OFFSET..][0..bloom.BLOOM_SIZE], &tb.bits);
@@ -565,13 +566,15 @@ fn dumpDecodedBlocks(env: lmdbx.Environment, dbi_name: [*:0]const u8, allocator:
     }
 
     var key_opt = cursor.goToFirst() catch return out;
-    var decompress_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
-    var log_scratch: [types.MAX_LOGS_PER_BLOCK]RawLog = undefined;
+    const decompress_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
+    defer allocator.free(decompress_buf);
+    const log_scratch = try allocator.alloc(RawLog, types.MAX_LOGS_PER_BLOCK);
+    defer allocator.free(log_scratch);
     while (key_opt) |k| {
         const bn = blockFromKey(k);
         const v = try cursor.getCurrentValue();
-        const decoded = try log_serial.decompressEntry(v, &decompress_buf);
-        const n = log_serial.deserializeLogs(decoded, &log_scratch);
+        const decoded = try log_serial.decompressEntry(v, decompress_buf);
+        const n = log_serial.deserializeLogs(decoded, log_scratch);
         const owned = try allocator.alloc(LogSummary, n);
         for (log_scratch[0..n], 0..) |*l, i| {
             owned[i] = .{ .address = l.address, .topic0 = l.topics[0] };

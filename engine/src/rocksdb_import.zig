@@ -74,7 +74,8 @@ fn workerFn(args: *WorkerArgs) void {
 
             const log_count = receipt_decoder.decodeReceipts(
                 slot.block_number, slot.raw_value[0..slot.raw_len], &log_buf, &data_buf,
-            ) catch {
+            ) catch |e| {
+                std.debug.print("decode error block {d}: {}\n", .{ slot.block_number, e });
                 slot.has_error = true;
                 slot.log_count = 0;
                 slot.entry_len = 0;

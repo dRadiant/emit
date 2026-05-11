@@ -17,9 +17,8 @@ const std = @import("std");
 pub const MAX_WORKERS = 7;
 
 /// Worker thread stack size. Sized above the largest worker frame
-/// (~12 MB in `filter_builder.filterWorker`) so additions to worker scratch
-/// land softly.
-pub const WORKER_STACK_SIZE: usize = 32 * 1024 * 1024;
+/// (~41 MB in `filter_builder.filterWorker` after MAX_LOGS_PER_BLOCK = 65,536).
+pub const WORKER_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 /// Run `worker_fn` across `num_workers` threads. Even when `num_workers == 1`
 /// we spawn a thread (rather than running inline on the caller) so the
