@@ -108,13 +108,17 @@ pub const DecodedLog = struct {
     /// underpins envio's `${block.number}-${logIndex}` string id without
     /// the runtime concat.
     pub fn eventId(self: DecodedLog) [16]u8 {
-        var id: [16]u8 = undefined;
-        std.mem.writeInt(u64, id[0..8], self.block_number, .big);
-        std.mem.writeInt(u32, id[8..12], self.tx_index, .big);
-        std.mem.writeInt(u32, id[12..16], self.log_index, .big);
-        return id;
+        return encodeEventId(self.block_number, self.tx_index, self.log_index);
     }
 };
+
+fn encodeEventId(block_number: u64, tx_index: u16, log_index: u16) [16]u8 {
+    var id: [16]u8 = undefined;
+    std.mem.writeInt(u64, id[0..8], block_number, .big);
+    std.mem.writeInt(u32, id[8..12], tx_index, .big);
+    std.mem.writeInt(u32, id[12..16], log_index, .big);
+    return id;
+}
 
 // ── Comptime arg resolution ──────────────────────────────────────────────
 
@@ -219,11 +223,7 @@ pub fn Log(comptime E: type) type {
         }
 
         pub fn eventId(self: @This()) [16]u8 {
-            var id: [16]u8 = undefined;
-            std.mem.writeInt(u64, id[0..8], self.block_number, .big);
-            std.mem.writeInt(u32, id[8..12], self.tx_index, .big);
-            std.mem.writeInt(u32, id[12..16], self.log_index, .big);
-            return id;
+            return encodeEventId(self.block_number, self.tx_index, self.log_index);
         }
     };
 }

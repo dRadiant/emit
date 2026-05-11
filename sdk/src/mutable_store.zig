@@ -1,26 +1,11 @@
-/// MutableStore(T): comptime-generated MDBX wrapper for mutable entities
-/// (accounts, allowances, pool reserves).
-///
-/// The "mutable" name pairs with `ImmutableStore` and matches the user-
-/// facing `StorageMode.mutable` declared on the entity type. The
-/// "mutable" semantics — repeated `load` → mutate → `save` over the same
-/// primary key without paying an MDBX read every time — are made
-/// practical by an in-memory HashMap cache in front of the MDBX DBI:
-///
+/// MutableStore(T): comptime-generated MDBX wrapper for mutable entities,
+/// fronted by an in-memory HashMap cache:
 ///   - `load` hits the cache (~50ns) before falling through to MDBX (~1µs).
 ///   - `save` updates the cache only and sets a dirty flag.
 ///   - `flush` drains dirty entries to MDBX in bulk.
 ///   - The cache persists across commits; only dirty flags are reset.
 ///
-/// Without the cache, a Transfer handler that touches the same Account in
-/// many blocks would pay one MDBX read per touch. With it, that becomes
-/// one MDBX read for the lifetime of the backfill. Measured 3.3× handler
-/// speedup in the prototype. The cache is the *implementation* that makes
-/// the mutable storage mode performant; the type's name reflects the
-/// concept users reason about.
-///
-/// Not thread-safe. Stage 2 dispatch is single-threaded. Entity-store
-/// mutations from parallel handlers would need a separate sharding scheme.
+/// Not thread-safe. Stage 2 dispatch is single-threaded.
 const std = @import("std");
 
 const lmdbx = @import("lmdbx");

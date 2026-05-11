@@ -197,13 +197,7 @@ fn canonicalizeType(comptime t: []const u8) ?[]const u8 {
 /// the caller passes `min = 1` so any 1..32 is accepted.
 fn matchN(comptime t: []const u8, comptime prefix: []const u8, comptime max: usize, comptime min: usize) bool {
     if (!std.mem.startsWith(u8, t, prefix)) return false;
-    const rest = t[prefix.len..];
-    if (rest.len == 0) return false;
-    var n: usize = 0;
-    for (rest) |c| {
-        if (c < '0' or c > '9') return false;
-        n = n * 10 + (c - '0');
-    }
+    const n = std.fmt.parseInt(usize, t[prefix.len..], 10) catch return false;
     if (n < min or n > max) return false;
     if (min == 8 and n % 8 != 0) return false;
     return true;

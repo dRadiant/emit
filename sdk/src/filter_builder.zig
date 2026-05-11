@@ -34,10 +34,10 @@ const types = core.types;
 
 pub const KEY_SIZE = 8;
 pub const WORKER_QUEUE_DEPTH = 16;
-/// Commit cadence during the MDBX write phase. Smaller than the entity-store
-/// 100K because each filtered-index row is a whole block (one cursor step in
-/// Stage 2), so the absolute work between commits stays in the same range.
-pub const COMMIT_BLOCKS = 10_000;
+/// Commit cadence during the MDBX write phase. Each commit fsyncs (~13 ms);
+/// Larger txn = larger crash-recovery window, but filtered_index.mdbx is
+/// rebuildable from the engine flat store so the trade is fine.
+pub const COMMIT_BLOCKS = 100_000;
 /// Min matching blocks before we spawn worker threads. Below this, the
 /// thread spin-up cost is larger than the parallel speedup.
 pub const PARALLEL_THRESHOLD = 1_000;
@@ -284,14 +284,17 @@ fn collectChildTopics(comptime m: sdk_manifest.Manifest) []const [32]u8 {
     }
 }
 
-inline fn containsTopic(haystack: []const [32]u8, needle: *const [32]u8) bool {
-    for (haystack) |t| if (std.mem.eql(u8, &t, needle)) return true;
+inline fn contains(comptime N: usize, haystack: []const [N]u8, needle: *const [N]u8) bool {
+    for (haystack) |h| if (std.mem.eql(u8, &h, needle)) return true;
     return false;
 }
 
+inline fn containsTopic(haystack: []const [32]u8, needle: *const [32]u8) bool {
+    return contains(32, haystack, needle);
+}
+
 inline fn containsAddress(haystack: []const [20]u8, needle: *const [20]u8) bool {
-    for (haystack) |a| if (std.mem.eql(u8, &a, needle)) return true;
-    return false;
+    return contains(20, haystack, needle);
 }
 
 // ── Worker ───────────────────────────────────────────────────────────────
