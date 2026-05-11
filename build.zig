@@ -88,8 +88,8 @@ pub fn build(b: *std.Build) void {
         .{ .path = "test/compile_fail/handler_missing_method.zig", .expected = "is missing method `handleTransfer` for event `Transfer(address,address,uint256)`. Add `pub fn handleTransfer(log: sdk.Log(@This()), ctx: *Ctx) !void { ... }`." },
         .{ .path = "test/compile_fail/block_context_name_collision.zig", .expected = "both derive store field name 'items'. Rename one of the entity types." },
         .{ .path = "test/compile_fail/param_unknown_name.zig", .expected = "has no parameter named `frmo`. Available: from, to, value" },
-        .{ .path = "test/compile_fail/factory_spawn_arg_unknown.zig", .expected = "has no parameter named `piar`. Available: token0, token1, pair, allPairsLength" },
-        .{ .path = "test/compile_fail/factory_spawn_arg_wrong_type.zig", .expected = "spawn_arg `allPairsLength` is type `uint256`, expected `address`" },
+        .{ .path = "test/compile_fail/factory_spawn_param_unknown.zig", .expected = "has no parameter named `piar`. Available: token0, token1, pair, allPairsLength" },
+        .{ .path = "test/compile_fail/factory_spawn_param_wrong_type.zig", .expected = "spawn_param `allPairsLength` is type `uint256`, expected `address`" },
     };
     for (compile_fail) |s| {
         const obj = b.addObject(.{

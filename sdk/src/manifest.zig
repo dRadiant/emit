@@ -9,8 +9,8 @@
 /// aliases resolved) which is what gets keccak-hashed for topic0. Both
 /// forms above hash identically, matching `solc`'s event selector.
 ///
-/// The full form unlocks named arg lookup (`log.argAddress(E, "from")`)
-/// and named factory spawn args (`spawn_arg = "pair"`).
+/// The full form unlocks named parameter lookup (`log.param(E, "from")`)
+/// and named factory spawn parameters (`spawn_param = "pair"`).
 const std = @import("std");
 
 const eth = @import("eth");
@@ -41,10 +41,11 @@ pub const FactoryDef = struct {
     name: []const u8,
     address: [20]u8,
     create_event: type,
-    /// Name of the arg in `create_event` that carries the spawned address.
-    /// Must reference a named `address` arg in the signature — comptime
-    /// validation fires `@compileError` listing available args otherwise.
-    spawn_arg: []const u8,
+    /// Name of the parameter in `create_event` that carries the spawned
+    /// address. Must reference a named `address` parameter in the signature;
+    /// comptime validation fires `@compileError` listing available
+    /// parameters otherwise.
+    spawn_param: []const u8,
     child_events: []const type,
 };
 
@@ -86,29 +87,29 @@ pub fn validateManifest(comptime m: Manifest) void {
     }
     inline for (m.factories) |f| {
         validateEvent(f.create_event);
-        validateSpawnArg(f);
+        validateSpawnParam(f);
         inline for (f.child_events) |E| validateEvent(E);
     }
 }
 
-/// Comptime check that `f.spawn_arg` references a named `address` arg on
-/// `f.create_event`'s signature.
-fn validateSpawnArg(comptime f: FactoryDef) void {
+/// Comptime check that `f.spawn_param` references a named `address`
+/// parameter on `f.create_event`'s signature.
+fn validateSpawnParam(comptime f: FactoryDef) void {
     comptime {
         const parsed = parsedEvent(f.create_event);
-        const p = abi_parse.paramByName(parsed, f.spawn_arg);
+        const p = abi_parse.paramByName(parsed, f.spawn_param);
         if (!std.mem.eql(u8, p.type_str, "address")) @compileError(
-            "manifest: factory `" ++ f.name ++ "` spawn_arg `" ++ f.spawn_arg ++ "` is type `" ++ p.type_str ++ "`, expected `address`",
+            "manifest: factory `" ++ f.name ++ "` spawn_param `" ++ f.spawn_param ++ "` is type `" ++ p.type_str ++ "`, expected `address`",
         );
     }
 }
 
 /// Extract the spawned address from a factory log. The slot (topic vs
-/// data offset) is comptime-resolved from `f.create_event` and `f.spawn_arg`;
+/// data offset) is comptime-resolved from `f.create_event` and `f.spawn_param`;
 /// the runtime cost is one slice read plus a 20-byte copy.
 pub fn extractFactoryAddress(comptime f: FactoryDef, topics: []const [32]u8, data: []const u8) [20]u8 {
     const parsed = comptime parsedEvent(f.create_event);
-    const p = comptime abi_parse.paramByName(parsed, f.spawn_arg);
+    const p = comptime abi_parse.paramByName(parsed, f.spawn_param);
     const word: [32]u8 = switch (comptime p.slot_kind) {
         .topic => topics[comptime p.slot_index],
         .data => data[comptime p.slot_index..][0..32].*,
@@ -214,7 +215,7 @@ test "validateManifest walks contracts and factories" {
             .name = "UniV2",
             .address = [_]u8{0x5C} ** 20,
             .create_event = PairCreated,
-            .spawn_arg = "pair",
+            .spawn_param = "pair",
             .child_events = &.{Sync},
         }},
     };
@@ -244,7 +245,7 @@ test "extractFactoryAddress reads indexed topic" {
         .name = "F",
         .address = [_]u8{0} ** 20,
         .create_event = Spawned,
-        .spawn_arg = "creator",
+        .spawn_param = "creator",
         .child_events = &.{},
     };
     var topics: [4][32]u8 = std.mem.zeroes([4][32]u8);
@@ -258,7 +259,7 @@ test "extractFactoryAddress reads non-indexed data slot" {
         .name = "UniV2",
         .address = [_]u8{0} ** 20,
         .create_event = PairCreated,
-        .spawn_arg = "pair",
+        .spawn_param = "pair",
         .child_events = &.{},
     };
     var data: [64]u8 = std.mem.zeroes([64]u8);

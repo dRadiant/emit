@@ -1,6 +1,6 @@
-// expected: has no arg named `piar`. Available: token0, token1, pair, allPairsLength
+// expected: spawn_param `allPairsLength` is type `uint256`, expected `address`
 //
-// validateManifest catches spawn_arg referencing a non-existent arg.
+// validateManifest catches spawn_param pointing at a non-address parameter.
 
 const sdk = @import("sdk");
 
@@ -21,7 +21,7 @@ comptime {
             .name = "F",
             .address = [_]u8{0} ** 20,
             .create_event = PairCreated,
-            .spawn_arg = "piar",
+            .spawn_param = "allPairsLength",
             .child_events = &.{Sync},
         }},
     });

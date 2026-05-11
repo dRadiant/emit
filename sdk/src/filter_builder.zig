@@ -802,7 +802,7 @@ test "build + appendChildren: primary holds creations, children holds child even
             .name = "F",
             .address = FactoryAddr,
             .create_event = Create,
-            .spawn_arg = "pair",
+            .spawn_param = "pair",
             .child_events = &.{Sync},
         }},
     };
@@ -908,7 +908,7 @@ test "appendChildren: returns zero-result for empty discovered set" {
             .name = "F",
             .address = FactoryAddr,
             .create_event = Create,
-            .spawn_arg = "pair",
+            .spawn_param = "pair",
             .child_events = &.{Sync},
         }},
     };

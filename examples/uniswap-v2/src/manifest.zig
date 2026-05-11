@@ -35,7 +35,7 @@ pub const config: sdk.Manifest = .{
         .name = "UniswapV2Factory",
         .address = sdk.address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"),
         .create_event = PairCreated,
-        .spawn_arg = "pair",
+        .spawn_param = "pair",
         .child_events = &.{ Mint, Burn, Swap, Sync },
     }},
 };

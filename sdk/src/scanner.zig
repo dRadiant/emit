@@ -423,7 +423,7 @@ test "scanCreations: extracts spawned addresses from factory creation events" {
     const allocator = testing.allocator;
 
     // Plant a flat store containing a PairCreated log at block 100 whose
-    // `pair` address (the spawn_arg target) sits at data[0..32].
+    // `pair` address (the spawn_param target) sits at data[0..32].
     var src_tmp = testing.tmpDir(.{});
     defer src_tmp.cleanup();
 
@@ -499,7 +499,7 @@ test "scanCreations: extracts spawned addresses from factory creation events" {
             .name = "F",
             .address = FACTORY_ADDR,
             .create_event = PairCreated,
-            .spawn_arg = "token0",
+            .spawn_param = "token0",
             .child_events = &.{Sync},
         }},
     };
@@ -618,7 +618,7 @@ test "replay: k-way merge across BLOCKS_PRIMARY and BLOCKS_CHILDREN preserves bl
             .name = "F",
             .address = FACTORY_ADDR,
             .create_event = PairCreated,
-            .spawn_arg = "pair",
+            .spawn_param = "pair",
             .child_events = &.{Sync},
         }},
     };
@@ -757,7 +757,7 @@ test "factory orchestration: build → scanCreations → appendChildren → repl
             .name = "F",
             .address = FACTORY_ADDR,
             .create_event = PairCreated,
-            .spawn_arg = "pair",
+            .spawn_param = "pair",
             .child_events = &.{Sync},
         }},
     };
