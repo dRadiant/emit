@@ -46,7 +46,7 @@ pub fn gatherDynamic(
     const decompress_buf = try arena.alloc(u8, types.BLOCK_BUF_SIZE);
     const log_buf = try arena.alloc(RawLog, types.MAX_LOGS_PER_BLOCK);
 
-    inline for ([_][]const u8{ filter_builder.DBI_PRIMARY, filter_builder.DBI_CHILDREN }) |dbi_name| {
+    inline for (.{ filter_builder.DBI_PRIMARY, filter_builder.DBI_CHILDREN }) |dbi_name| {
         if (lmdbx.Database.open(txn, dbi_name, .{})) |db| {
             var cursor = try db.cursor();
             defer cursor.deinit();
