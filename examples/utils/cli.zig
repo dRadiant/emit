@@ -14,12 +14,15 @@ pub const StandardArgs = struct {
     engine_data_dir: []const u8,
     data_dir: []const u8,
     commit_interval: u32 = 100_000,
+    /// Optional JSON-RPC URL for Phase 4 prefetch. When absent, prefetch
+    /// gathers but skips Multicall3 — handlers see `error.NotPrefetched`
+    /// for any uncached pair.
+    node_rpc: ?[]const u8 = null,
 };
 
-/// Parse `--engine-data-dir`, `--data-dir`, `--commit-interval` from argv.
-/// On missing required args, prints a usage line keyed on `prog_name` and
-/// returns `error.MissingArgs`. Caller frees `engine_data_dir` and
-/// `data_dir`.
+/// Parse the standard arg set: `--engine-data-dir`, `--data-dir`,
+/// `--commit-interval`, `--node-rpc`. Missing required args print usage and
+/// return `error.MissingArgs`. Caller frees the duped string fields.
 pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8) !StandardArgs {
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
@@ -27,6 +30,7 @@ pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8) !S
     var engine_data_dir: ?[]const u8 = null;
     var data_dir: ?[]const u8 = null;
     var commit_interval: u32 = 100_000;
+    var node_rpc: ?[]const u8 = null;
 
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -40,16 +44,20 @@ pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8) !S
         } else if (std.mem.eql(u8, a, "--commit-interval") and i + 1 < argv.len) {
             commit_interval = try std.fmt.parseInt(u32, argv[i + 1], 10);
             i += 1;
+        } else if (std.mem.eql(u8, a, "--node-rpc") and i + 1 < argv.len) {
+            node_rpc = try allocator.dupe(u8, argv[i + 1]);
+            i += 1;
         }
     }
 
     if (engine_data_dir == null or data_dir == null) {
         std.debug.print(
-            "usage: {s} --engine-data-dir <path> --data-dir <path> [--commit-interval N]\n",
+            "usage: {s} --engine-data-dir <path> --data-dir <path> [--commit-interval N] [--node-rpc URL]\n",
             .{prog_name},
         );
         if (engine_data_dir) |s| allocator.free(s);
         if (data_dir) |s| allocator.free(s);
+        if (node_rpc) |s| allocator.free(s);
         return error.MissingArgs;
     }
 
@@ -57,6 +65,7 @@ pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8) !S
         .engine_data_dir = engine_data_dir.?,
         .data_dir = data_dir.?,
         .commit_interval = commit_interval,
+        .node_rpc = node_rpc,
     };
 }
 
@@ -66,7 +75,7 @@ pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8) !S
 /// non-factory indexer didn't unexpectedly discover children.
 pub fn printStats(prog_name: []const u8, stats: sdk.RunStats) void {
     const ms = std.time.ns_per_ms;
-    const phases = stats.filter_build_ns + stats.scan_creations_ns + stats.append_children_ns + stats.replay_ns;
+    const phases = stats.filter_build_ns + stats.scan_creations_ns + stats.append_children_ns + stats.prefetch_ns + stats.replay_ns;
     const overhead_ns = if (stats.elapsed_ns > phases) stats.elapsed_ns - phases else 0;
     std.debug.print(
         \\{s} indexer complete
@@ -79,10 +88,15 @@ pub fn printStats(prog_name: []const u8, stats: sdk.RunStats) void {
         \\  logs dispatched:   {d}
         \\  blocks dispatched: {d}
         \\  commits:           {d}
+        \\  phases skipped:    {}
+        \\  prefetch gathered: {d}
+        \\  prefetch executed: {d}
+        \\  prefetch batches:  {d}
         \\  ── timing ──
         \\  filter build:      {d} ms
         \\  scan creations:    {d} ms
         \\  append children:   {d} ms
+        \\  prefetch:          {d} ms
         \\  replay:            {d} ms
         \\  overhead:          {d} ms
         \\  elapsed:           {d} ms
@@ -98,9 +112,14 @@ pub fn printStats(prog_name: []const u8, stats: sdk.RunStats) void {
         stats.logs_dispatched,
         stats.blocks_dispatched,
         stats.commits_performed,
+        stats.phases_skipped,
+        stats.prefetch_calls_gathered,
+        stats.prefetch_calls_executed,
+        stats.prefetch_batches,
         stats.filter_build_ns / ms,
         stats.scan_creations_ns / ms,
         stats.append_children_ns / ms,
+        stats.prefetch_ns / ms,
         stats.replay_ns / ms,
         overhead_ns / ms,
         stats.elapsed_ns / ms,
@@ -121,11 +140,13 @@ pub fn run(
     const args = try parseStandardArgs(allocator, manifest.name);
     defer allocator.free(args.engine_data_dir);
     defer allocator.free(args.data_dir);
+    defer if (args.node_rpc) |s| allocator.free(s);
 
     const stats = try sdk.run(manifest, handlers, entities, .{
         .engine_data_dir = args.engine_data_dir,
         .data_dir = args.data_dir,
         .commit_interval = args.commit_interval,
+        .node_rpc = args.node_rpc,
     }, allocator);
 
     printStats(manifest.name, stats);

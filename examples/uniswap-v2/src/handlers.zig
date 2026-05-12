@@ -18,6 +18,10 @@ const m = @import("manifest.zig");
 
 const Ctx = sdk.Context(@import("entities.zig"));
 
+/// Pairs created before the indexer's start_block don't appear in the
+/// filter env, so their decimals weren't prefetched. ERC20 default is 18.
+const DEFAULT_DECIMALS: u8 = 18;
+
 pub fn handlePairCreated(log: sdk.Log(m.PairCreated), ctx: *Ctx) !void {
     try ctx.stores.pairs.save(.{
         .id = log.params.pair,
@@ -37,6 +41,18 @@ pub fn handleSync(log: sdk.Log(m.Sync), ctx: *Ctx) !void {
 }
 
 pub fn handleSwap(log: sdk.Log(m.Swap), ctx: *Ctx) !void {
+    const pair = try ctx.stores.pairs.loadOrInit(log.address);
+    const dec0 = ctx.ethCall(u8, pair.token0, "decimals()") catch DEFAULT_DECIMALS;
+    const dec1 = ctx.ethCall(u8, pair.token1, "decimals()") catch DEFAULT_DECIMALS;
+
+    std.log.debug("swap pair={x} in0={f} in1={f} out0={f} out1={f}", .{
+        log.address,
+        sdk.amount(log.params.amount0In, dec0),
+        sdk.amount(log.params.amount1In, dec1),
+        sdk.amount(log.params.amount0Out, dec0),
+        sdk.amount(log.params.amount1Out, dec1),
+    });
+
     try ctx.stores.swapEvents.save(.{
         .id = log.eventId(),
         .pair = log.address,

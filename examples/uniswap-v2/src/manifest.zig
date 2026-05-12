@@ -24,6 +24,26 @@ pub const Sync = struct {
     pub const signature = "Sync(uint112 reserve0, uint112 reserve1)";
 };
 
+/// Comptime helper that expands `addrs` into ERC20-shaped `StaticCall`
+/// triples. Lives in user code rather than the SDK so adapting to other
+/// shapes (ERC721 `tokenURI`, ERC4626 `asset`) is a copy-paste edit.
+fn erc20Metadata(comptime addrs: []const [20]u8) []const sdk.StaticCall {
+    comptime {
+        var out: []const sdk.StaticCall = &.{};
+        for (addrs) |a| {
+            out = out ++ &[_]sdk.StaticCall{
+                .{ .address = a, .method = "decimals()" },
+                .{ .address = a, .method = "symbol()" },
+                .{ .address = a, .method = "name()" },
+            };
+        }
+        return out;
+    }
+}
+
+const WETH = sdk.address("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+const USDC = sdk.address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+
 pub const config: sdk.Manifest = .{
     .name = "uniswap-v2",
     .chain_id = 1,
@@ -38,4 +58,15 @@ pub const config: sdk.Manifest = .{
         .spawn_param = "pair",
         .child_events = &.{ Mint, Burn, Swap, Sync },
     }},
+    // Per-pair token decimals fetched once at creation. `symbol()`/`name()`
+    // would also fit here but their dynamic-string returns are deferred
+    // (see docs/emit-v1-spec.md §M3 deferred work).
+    .prefetch = &.{.{
+        .on_event = PairCreated,
+        .calls = &.{
+            .{ .address = .{ .param = "token0" }, .method = "decimals()" },
+            .{ .address = .{ .param = "token1" }, .method = "decimals()" },
+        },
+    }},
+    .static_prefetch = erc20Metadata(&.{ WETH, USDC }),
 };
