@@ -76,6 +76,23 @@ fn followWs(
         const msg = try sub.next();
         defer alloc.free(msg);
         const block_number = parseBlockNumber(msg) orelse continue;
+
+        // Defensive gap-fill: WS can drop messages (NAT, provider hiccup) and
+        // recovery loops can leave a partial ring after RPC failure or process
+        // restart. `followPoll` does this naturally via tip+1..latest; mirror
+        // that here so a non-dense ring cannot silently propagate into the
+        // flat store. Each gap block goes through the full `ingestBlock` so
+        // its own reorg check still runs.
+        if (ring.latestBlock()) |tip| {
+            var bn = tip + 1;
+            while (bn < block_number) : (bn += 1) {
+                ingestBlock(bn, provider, ring, alloc) catch |err| {
+                    std.debug.print("Block {d}: {s}\n", .{ bn, @errorName(err) });
+                    break;
+                };
+            }
+        }
+
         ingestBlock(block_number, provider, ring, alloc) catch |err| {
             std.debug.print("Block {d}: {s}\n", .{ block_number, @errorName(err) });
             continue;
