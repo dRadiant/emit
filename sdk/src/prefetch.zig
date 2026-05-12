@@ -104,7 +104,8 @@ pub fn dedupe(arena: std.mem.Allocator, calls: []const ethcall.Call) ![]ethcall.
     return out.toOwnedSlice(arena);
 }
 
-/// Drop entries already in the cache; order-preserving.
+/// Drop entries already in the cache; order-preserving. Holds one ro-txn
+/// for the entire scan so we don't pay N txn opens for N calls.
 pub fn filterUncached(
     arena: std.mem.Allocator,
     cache: *ethcall.Cache,
@@ -112,11 +113,14 @@ pub fn filterUncached(
 ) ![]ethcall.Call {
     if (calls.len == 0) return &.{};
 
+    const txn = try cache.beginRead();
+    defer txn.abort() catch {};
+
     var out: std.ArrayList(ethcall.Call) = .empty;
     try out.ensureTotalCapacity(arena, calls.len);
 
     for (calls) |c| {
-        if (!try cache.contains(c.target, c.calldata)) {
+        if ((try cache.lookupInTxn(txn, c.target, c.calldata)) == null) {
             try out.append(arena, c);
         }
     }

@@ -60,7 +60,6 @@ pub const config: sdk.Manifest = .{
     }},
     // Per-pair token decimals fetched once at creation. `symbol()`/`name()`
     // would also fit here but their dynamic-string returns are deferred
-    // (see docs/emit-v1-spec.md §M3 deferred work).
     .prefetch = &.{.{
         .on_event = PairCreated,
         .calls = &.{

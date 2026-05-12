@@ -29,9 +29,11 @@ pub const CachedEntry = struct {
     bytes: []const u8,
 };
 
-/// Shared between `prefetch.zig` (queue calldata) and `entry.zig` (cache
-/// lookup) so the same method string produces the same selector at both
-/// sites — without this, an off-by-one would silently miss every cache hit.
+/// Comptime 4-byte selector for a Solidity method. Shared between
+/// `prefetch.zig` (queue calldata) and `entry.zig` (cache lookup) so the
+/// method string produces the same selector at both sites. `eth.keccak.hash`
+/// sets only a 10k eval-branch quota internally, which is insufficient for
+/// the keccak permutation at comptime — hence the 200k bump here.
 pub fn selectorOf(comptime method: []const u8) [4]u8 {
     return comptime blk: {
         @setEvalBranchQuota(200_000);
@@ -118,6 +120,11 @@ pub const Cache = struct {
         try txn.commit();
     }
 
+    /// Most cached payloads are a single 32-byte ABI word; the +1 covers the
+    /// status prefix. Sized to cover the long tail of decimals/factory/bool
+    /// returns without an allocator round-trip.
+    const STACK_VALUE_BUF = 64;
+
     fn writeInTxn(
         self: *Cache,
         allocator: std.mem.Allocator,
@@ -127,8 +134,10 @@ pub const Cache = struct {
         status: u8,
         bytes: []const u8,
     ) !void {
-        const value = try allocator.alloc(u8, 1 + bytes.len);
-        defer allocator.free(value);
+        var stack_buf: [STACK_VALUE_BUF]u8 = undefined;
+        const need = 1 + bytes.len;
+        const value = if (need <= stack_buf.len) stack_buf[0..need] else try allocator.alloc(u8, need);
+        defer if (need > stack_buf.len) allocator.free(value);
         value[0] = status;
         @memcpy(value[1..], bytes);
 
@@ -145,12 +154,27 @@ pub const Cache = struct {
     ) !?CachedEntry {
         const txn = try lmdbx.Transaction.init(self.env, .{ .mode = .ReadOnly });
         defer txn.abort() catch {};
+        return self.lookupInTxn(txn, target, calldata);
+    }
 
+    /// Read a cached pair under a borrowed ro-txn; lets bulk callers (e.g.
+    /// `filterUncached`) share one txn instead of paying N opens.
+    pub fn lookupInTxn(
+        self: *Cache,
+        txn: lmdbx.Transaction,
+        target: [20]u8,
+        calldata: []const u8,
+    ) !?CachedEntry {
         const k = cacheKey(target, calldata);
         const db = lmdbx.Database{ .txn = txn, .dbi = self.dbi };
         const raw = (try db.get(&k)) orelse return null;
         if (raw.len < 1) return error.MalformedResult;
         return .{ .status = raw[0], .bytes = raw[1..] };
+    }
+
+    /// Open a read-only transaction on the cache env. Caller aborts.
+    pub fn beginRead(self: *Cache) !lmdbx.Transaction {
+        return try lmdbx.Transaction.init(self.env, .{ .mode = .ReadOnly });
     }
 
     pub fn contains(self: *Cache, target: [20]u8, calldata: []const u8) !bool {

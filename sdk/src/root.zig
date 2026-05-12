@@ -30,6 +30,7 @@ pub const AddressSource = manifest.AddressSource;
 pub const Amount = humanize.Amount;
 pub const amount = humanize.amount;
 pub const Context = entry.Context;
+pub const DEFAULT_BATCH_SIZE = ethcall.DEFAULT_BATCH_SIZE;
 pub const ContractDef = manifest.ContractDef;
 pub const DecodedLog = handler.DecodedLog;
 pub const Log = handler.Log;

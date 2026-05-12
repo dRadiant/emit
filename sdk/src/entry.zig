@@ -63,13 +63,8 @@ pub const RunStats = struct {
     logs_dispatched: u64 = 0,
     blocks_dispatched: u64 = 0,
     commits_performed: u32 = 0,
-    /// Pairs gathered for Phase 4 (post-dedup).
     prefetch_calls_gathered: u64 = 0,
-    /// Pairs actually fetched via Multicall3 (gathered minus already-cached).
     prefetch_calls_executed: u64 = 0,
-    /// Multicall3 RPC requests issued; derivable from `prefetch_calls_executed`
-    /// and the configured batch size but kept here so cost is one field-read.
-    prefetch_batches: u32 = 0,
     /// True when an existing filter env let init skip Phases 1-3.
     phases_skipped: bool = false,
     filter_build_ns: u64 = 0,
@@ -300,7 +295,7 @@ pub fn init(
 
     if (comptime (m.prefetch.len > 0 or m.static_prefetch.len > 0)) {
         var phase4_timer = try std.time.Timer.start();
-        try runPhase4(m, options, ctx, filter_env, cache, allocator);
+        try runPhase4(m, options, ctx, filter_env);
         ctx.stats.prefetch_ns = phase4_timer.read();
     }
 
@@ -337,9 +332,10 @@ fn runPhase4(
     options: Options,
     ctx: anytype,
     filter_env: lmdbx.Environment,
-    cache: *ethcall.Cache,
-    allocator: std.mem.Allocator,
 ) !void {
+    const allocator = ctx._allocator;
+    const cache = ctx._cache.?;
+
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -367,9 +363,7 @@ fn runPhase4(
     defer mc.deinit();
 
     try cache.preload(allocator, &mc, missing, options.multicall_batch_size);
-
     ctx.stats.prefetch_calls_executed = missing.len;
-    ctx.stats.prefetch_batches = @intCast((missing.len + options.multicall_batch_size - 1) / options.multicall_batch_size);
 }
 
 /// True when `BLOCKS_PRIMARY` has at least one entry — a prior filter build
@@ -1004,7 +998,6 @@ test "phase 4 gathers static_prefetch and skips preload without node_rpc" {
 
     try testing.expectEqual(@as(u64, 3), ctx.stats.prefetch_calls_gathered);
     try testing.expectEqual(@as(u64, 0), ctx.stats.prefetch_calls_executed);
-    try testing.expectEqual(@as(u32, 0), ctx.stats.prefetch_batches);
     try testing.expect(!ctx.stats.phases_skipped);
 }
 

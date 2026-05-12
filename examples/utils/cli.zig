@@ -77,6 +77,9 @@ pub fn printStats(prog_name: []const u8, stats: sdk.RunStats) void {
     const ms = std.time.ns_per_ms;
     const phases = stats.filter_build_ns + stats.scan_creations_ns + stats.append_children_ns + stats.prefetch_ns + stats.replay_ns;
     const overhead_ns = if (stats.elapsed_ns > phases) stats.elapsed_ns - phases else 0;
+    // Derive batch count from executed pairs and the default Multicall3 chunk;
+    // an exact match would require routing the per-run override through stats.
+    const batches = (stats.prefetch_calls_executed + sdk.DEFAULT_BATCH_SIZE - 1) / sdk.DEFAULT_BATCH_SIZE;
     std.debug.print(
         \\{s} indexer complete
         \\  blocks scanned:    {d}
@@ -115,7 +118,7 @@ pub fn printStats(prog_name: []const u8, stats: sdk.RunStats) void {
         stats.phases_skipped,
         stats.prefetch_calls_gathered,
         stats.prefetch_calls_executed,
-        stats.prefetch_batches,
+        batches,
         stats.filter_build_ns / ms,
         stats.scan_creations_ns / ms,
         stats.append_children_ns / ms,
