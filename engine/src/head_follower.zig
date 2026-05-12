@@ -109,6 +109,9 @@ fn followPoll(
 // ── Shared ───────────────────────────────────────────────────────────────
 
 /// Fetch block hash + logs from node, serialize, compress, insert into pending ring.
+/// On reorg detection, truncate divergent entries and re-ingest the canonical
+/// chain from the fork point up to `block_number`. WS mode previously dropped
+/// these blocks because the next subscription push delivers block_number+1.
 fn ingestBlock(
     block_number: u64,
     provider: *eth.provider.Provider,
@@ -125,11 +128,42 @@ fn ingestBlock(
     if (ring.getHash(block_number - 1)) |stored_hash| {
         if (!std.mem.eql(u8, &stored_hash, &header.parent_hash)) {
             std.debug.print("Reorg detected at block {d}\n", .{block_number});
-            try resolveReorg(ring, block_number, provider);
+            const fork = try resolveReorg(ring, block_number, provider);
+            var bn = fork;
+            while (bn <= block_number) : (bn += 1) {
+                try ingestBlockNoReorgCheck(bn, provider, ring, parent_alloc);
+            }
             return;
         }
     }
 
+    try ingestBlockCore(block_number, header, provider, ring, alloc);
+}
+
+/// Recovery-path ingest: skip the reorg check (we're restoring canonical state,
+/// the parent-hash comparison against an already-truncated ring is meaningless).
+fn ingestBlockNoReorgCheck(
+    block_number: u64,
+    provider: *eth.provider.Provider,
+    ring: *PendingRing,
+    parent_alloc: std.mem.Allocator,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(parent_alloc);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const header = try provider.getBlock(block_number) orelse return error.BlockNotFound;
+    try ingestBlockCore(block_number, header, provider, ring, alloc);
+}
+
+/// Shared core: fetch logs for `block_number`, build blooms, compress, insert.
+fn ingestBlockCore(
+    block_number: u64,
+    header: anytype,
+    provider: *eth.provider.Provider,
+    ring: *PendingRing,
+    alloc: std.mem.Allocator,
+) !void {
     var num_buf: [20]u8 = undefined;
     const hex = try std.fmt.bufPrint(&num_buf, "0x{x}", .{block_number});
     const eth_logs = try provider.getLogs(.{ .fromBlock = hex, .toBlock = hex });
@@ -153,10 +187,12 @@ fn ingestBlock(
     std.debug.print("Block {d}: {d} logs\n", .{ block_number, count });
 }
 
-fn resolveReorg(ring: *PendingRing, from: u64, provider: *eth.provider.Provider) !void {
+/// Truncate divergent pending entries down to the fork point and return it,
+/// so the caller can re-ingest the canonical chain from `fork..from`.
+fn resolveReorg(ring: *PendingRing, from: u64, provider: *eth.provider.Provider) !u64 {
     // Fetch canonical hashes walking backwards (most reorgs are 1-2 blocks)
     var canonical: [pending_ring.FINALITY_DEPTH][32]u8 = undefined;
-    const oldest = ring.oldestBlock() orelse return;
+    const oldest = ring.oldestBlock() orelse return from;
     const depth = @min(from - oldest, pending_ring.FINALITY_DEPTH);
     for (0..depth) |i| {
         const hdr = (provider.getBlock(from - 1 - i) catch break) orelse break;
@@ -167,6 +203,7 @@ fn resolveReorg(ring: *PendingRing, from: u64, provider: *eth.provider.Provider)
     const removed = try ring.truncateFrom(fork);
     try ring.flush();
     std.debug.print("Reorg: fork at {d}, removed {d} blocks\n", .{ fork, removed });
+    return fork;
 }
 
 /// Move blocks with 64+ confirmations from pending ring to flat store.

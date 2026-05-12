@@ -439,3 +439,40 @@ test "findForkPoint on empty ring returns from" {
     const canonical = [_][32]u8{[_]u8{0} ** 32};
     try testing.expectEqual(@as(u64, 100), ring.findForkPoint(100, &canonical));
 }
+
+// Verifies the dense-ring invariant that head_follower's reorg recovery depends on:
+// after truncate + canonical re-insert, getHash() returns the canonical hash for
+// every block. The dense-array indexing in getHash() previously mis-reported
+// presence when ring entries had gaps, which surfaced as silently-dropped blocks
+// in WS-mode reorgs.
+test "truncate + re-insert restores dense ring with canonical hashes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ring = try PendingRing.open(tmp.dir, testing.allocator);
+    defer ring.deinit();
+
+    const hash_a = [_]u8{0xAA} ** 32;
+    for (100..106) |i| {
+        try ring.insert(i, hash_a, &dummy_topic, &dummy_addr, &dummy_entry);
+    }
+    try testing.expectEqual(@as(usize, 6), ring.count());
+
+    // Reorg at block 103: fork point is 103 (blocks 103-105 diverge).
+    _ = try ring.truncateFrom(103);
+    try testing.expectEqual(@as(usize, 3), ring.count());
+    try testing.expectEqual(@as(u64, 102), ring.latestBlock().?);
+
+    // Recovery re-inserts canonical 103, 104, 105 with hash B.
+    const hash_b = [_]u8{0xBB} ** 32;
+    for (103..106) |i| {
+        try ring.insert(i, hash_b, &dummy_topic, &dummy_addr, &dummy_entry);
+    }
+    try testing.expectEqual(@as(usize, 6), ring.count());
+    try testing.expectEqual(@as(u64, 105), ring.latestBlock().?);
+
+    // The dense-array index must resolve every block to the right hash.
+    try testing.expectEqualSlices(u8, &hash_a, &ring.getHash(102).?);
+    try testing.expectEqualSlices(u8, &hash_b, &ring.getHash(103).?);
+    try testing.expectEqualSlices(u8, &hash_b, &ring.getHash(104).?);
+    try testing.expectEqualSlices(u8, &hash_b, &ring.getHash(105).?);
+}
