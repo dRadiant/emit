@@ -53,6 +53,19 @@ pub const Error = error{
     MulticallFailed,
 };
 
+/// Comptime 4-byte selector for a Solidity method signature. The same
+/// derivation used by both `prefetch.zig` (to build calldata for the queue)
+/// and `handler.zig`'s `ethCall(comptime T, ...)` (to build the cache
+/// lookup). Sharing the helper guarantees the manifest-side selector and
+/// the handler-side selector match for a given method string.
+pub fn selectorOf(comptime method: []const u8) [4]u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(200_000);
+        const h = eth.keccak.hash(method);
+        break :blk h[0..4].*;
+    };
+}
+
 /// Form the 52-byte cache key for a `(target, calldata)` pair. Stable across
 /// SDK versions so the cache survives upgrades.
 pub fn cacheKey(target: [20]u8, calldata: []const u8) [52]u8 {

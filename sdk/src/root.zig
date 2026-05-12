@@ -15,6 +15,7 @@ const entity_serial = @import("entity_serial.zig");
 const entry = @import("entry.zig");
 const ethcall = @import("ethcall.zig");
 const filter_builder = @import("filter_builder.zig");
+const prefetch = @import("prefetch.zig");
 const handler = @import("handler.zig");
 const immutable_store = @import("immutable_store.zig");
 const mutable_store = @import("mutable_store.zig");
@@ -168,6 +169,7 @@ test {
     _ = abi_parse;
     _ = entity_serial;
     _ = ethcall;
+    _ = prefetch;
     _ = immutable_store;
     _ = mutable_store;
     _ = manifest;
