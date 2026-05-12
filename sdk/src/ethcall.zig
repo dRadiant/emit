@@ -1,63 +1,37 @@
-/// MDBX-backed cache for immutable eth_call results.
+/// MDBX-backed cache for immutable eth_call results, kept in its own env at
+/// `<data_dir>/ethcall/` so wiping the entity store doesn't invalidate it.
 ///
-/// The cache lives in its own MDBX env at `<entity_data_dir>/ethcall.mdbx`,
-/// separate from the entity store so users can `rm -rf entity/` and re-run
-/// without paying Phase 4 again. Variable-length values (token symbols,
-/// names, etc.) don't fit the fixed-size entity-store machinery, so this is
-/// a thin purpose-built layer rather than another `MutableStore` instance.
+/// Key layout (52 bytes): address [20]u8 || keccak256(calldata) [32]u8
+/// Value layout (1 + N): status u8(0 ok, 1 revert) || raw return bytes
 ///
-/// Key layout (52 bytes):
-///   address  [20]u8           target contract
-///   hash     [32]u8           keccak256(calldata)
-///
-/// Value layout (1 + N bytes):
-///   status   u8               0 = success, 1 = revert (per Multicall3)
-///   bytes    [N]u8            raw payload (ABI-encoded return data)
-///
-/// Persistence is permanent: results are time-invariant as we only fetch immutable data.
-/// eth_call is made at head and is not meant for `x data at y block`.
+/// Entries never expire: results are immutable at the call site (decimals,
+/// symbol, factory address, etc.) and we always call at `latest`.
 const std = @import("std");
 
 const eth = @import("eth");
 const lmdbx = @import("lmdbx");
 
-/// Default Multicall3 chunk size. Tuned to fit comfortably under typical
-/// RPC payload limits (Alchemy/Infura ~1 MB, Multicall3 gas budget). Override
-/// via `preload`'s `batch_size` arg if the RPC provider has tighter limits.
+/// Default Multicall3 chunk size; fits comfortably under typical RPC payload
+/// limits and the Multicall3 gas budget.
 pub const DEFAULT_BATCH_SIZE: usize = 500;
 
-/// One declared eth_call. `calldata` is the full call payload: 4-byte
-/// selector for no-argument methods today; `selector ++ ABI-encode(args)`
-/// when method-with-args support lands in M3.x.
+/// One declared eth_call. `calldata` is the full call payload (4-byte
+/// selector for no-argument methods).
 pub const Call = struct {
     target: [20]u8,
     calldata: []const u8,
 };
 
-/// Result of a single cache lookup. `bytes` is borrowed from the active
-/// MDBX read transaction and is valid until the next cache op on the same
-/// txn (M3 uses short-lived per-call read txns, so copy if you need the
-/// value past the lookup).
+/// Result of a cache lookup. `bytes` points into the mmap'd MDBX value and
+/// remains valid for the lifetime of the env (entries are never deleted).
 pub const CachedEntry = struct {
     status: u8,
     bytes: []const u8,
 };
 
-/// Errors returned by the typed-decode path layered on top of `get` in
-/// `handler.zig`'s `ethCall(comptime T, ...)`. Kept here so the public
-/// surface lives next to the cache it describes.
-pub const Error = error{
-    NotPrefetched,
-    CallReverted,
-    MalformedResult,
-    MulticallFailed,
-};
-
-/// Comptime 4-byte selector for a Solidity method signature. The same
-/// derivation used by both `prefetch.zig` (to build calldata for the queue)
-/// and `handler.zig`'s `ethCall(comptime T, ...)` (to build the cache
-/// lookup). Sharing the helper guarantees the manifest-side selector and
-/// the handler-side selector match for a given method string.
+/// Shared between `prefetch.zig` (queue calldata) and `entry.zig` (cache
+/// lookup) so the same method string produces the same selector at both
+/// sites — without this, an off-by-one would silently miss every cache hit.
 pub fn selectorOf(comptime method: []const u8) [4]u8 {
     return comptime blk: {
         @setEvalBranchQuota(200_000);
@@ -66,17 +40,9 @@ pub fn selectorOf(comptime method: []const u8) [4]u8 {
     };
 }
 
-/// Decode an ABI-encoded 32-byte word into the requested Zig type. Used by
-/// `BlockContext.ethCall(comptime T, ...)` to interpret cached return data.
-///
-/// Supported `T`: any signed/unsigned Zig integer (truncated from the
-/// 32-byte word's big-endian u256), `bool` (LSB of the word), `[20]u8`
-/// (trailing 20 bytes, the EVM address layout), and `[N]u8` for fixed N
-/// up to 32 (left-aligned bytes32-class).
-///
-/// Dynamic-return types (`[]const u8` for ABI strings or dynamic bytes)
-/// are deferred to M3.x. Strict lifetime story for borrowed slices needs
-/// the long-lived ro-txn redesign before we can return them safely.
+/// Decode an ABI-encoded 32-byte word into `T`. Supports any int (truncated
+/// from the big-endian u256), `bool` (LSB), `[20]u8` (trailing bytes — EVM
+/// address layout), and `[N]u8` for N ≤ 32 (left-aligned bytes32-class).
 pub fn decodeAs(comptime T: type, bytes: []const u8) !T {
     if (bytes.len < 32) return error.MalformedResult;
     const word = bytes[0..32];
@@ -120,9 +86,7 @@ pub const Cache = struct {
     env: lmdbx.Environment,
     dbi: lmdbx.Database.DBI,
 
-    /// Open (or create) the ethcall cache rooted at `dir_path`. The directory
-    /// must already exist; the SDK's `entry.run` is responsible for mkdir-ing
-    /// `<entity_data_dir>/ethcall/` before calling this.
+    /// Open or create the cache at `dir_path` (caller mkdir's).
     pub fn open(dir_path: [*:0]const u8) !Cache {
         const env = try lmdbx.Environment.init(dir_path, .{ .max_dbs = 1 });
         errdefer env.deinit() catch {};
@@ -139,10 +103,7 @@ pub const Cache = struct {
         self.env.deinit() catch {};
     }
 
-    /// Insert or overwrite the cached entry for `(target, calldata)`. Idempotent.
-    /// Status = 0 (success) writes a typical entry. Status = 1 (revert) records
-    /// that the call ran but failed; the handler will see `error.CallReverted`
-    /// instead of a silent re-fetch on the next run.
+    /// Idempotent upsert. Status 1 records a revert so re-runs don't refetch.
     pub fn put(
         self: *Cache,
         allocator: std.mem.Allocator,
@@ -153,7 +114,19 @@ pub const Cache = struct {
     ) !void {
         const txn = try lmdbx.Transaction.init(self.env, .{});
         errdefer txn.abort() catch {};
+        try self.writeInTxn(allocator, txn, target, calldata, status, bytes);
+        try txn.commit();
+    }
 
+    fn writeInTxn(
+        self: *Cache,
+        allocator: std.mem.Allocator,
+        txn: lmdbx.Transaction,
+        target: [20]u8,
+        calldata: []const u8,
+        status: u8,
+        bytes: []const u8,
+    ) !void {
         const value = try allocator.alloc(u8, 1 + bytes.len);
         defer allocator.free(value);
         value[0] = status;
@@ -162,13 +135,9 @@ pub const Cache = struct {
         const k = cacheKey(target, calldata);
         const db = lmdbx.Database{ .txn = txn, .dbi = self.dbi };
         try db.set(&k, value, .Upsert);
-        try txn.commit();
     }
 
-    /// Read the cached entry for `(target, calldata)`. Returns `null` when
-    /// absent. The returned `bytes` slice is valid for the lifetime of the
-    /// read transaction; this method opens and commits a short-lived ro-txn
-    /// per call. Callers that need the value beyond the call return must copy.
+    /// `null` when absent. `bytes` is mmap-resident and outlives the call.
     pub fn get(
         self: *Cache,
         target: [20]u8,
@@ -184,23 +153,15 @@ pub const Cache = struct {
         return .{ .status = raw[0], .bytes = raw[1..] };
     }
 
-    /// True if the cache contains an entry for this pair. Used by the
-    /// prefetch filterUncached step to skip already-warm calls without
-    /// paying the value-read cost.
     pub fn contains(self: *Cache, target: [20]u8, calldata: []const u8) !bool {
         return (try self.get(target, calldata)) != null;
     }
 
-    /// Batch-execute `calls` through Multicall3 and write every result to
-    /// the cache. Calls are chunked into batches of `batch_size`; each batch
-    /// is one HTTP RTT to the configured provider. Per Multicall3, every
-    /// call's `allow_failure` is set so one revert doesn't sink the batch.
-    ///
-    /// On any batch failure (network, malformed response, etc.) this returns
-    /// `error.MulticallFailed` after aborting the in-flight batch. The cache
-    /// retains whatever previous batches succeeded in writing; subsequent
-    /// runs will retry the missing pairs through the dedup + filterUncached
-    /// path.
+    /// Chunk `calls` through Multicall3 (one HTTP RTT per `batch_size`),
+    /// write every result under a single MDBX write txn per batch — N+1
+    /// fsync-per-result is the classic regression to watch for here. On
+    /// network or decode failure: `error.MulticallFailed`, in-flight batch
+    /// rolls back, prior batches retain their writes.
     pub fn preload(
         self: *Cache,
         allocator: std.mem.Allocator,
@@ -217,12 +178,15 @@ pub const Cache = struct {
             for (batch) |c| try mc.addCall(c.target, c.calldata, true);
             const results = mc.execute() catch return error.MulticallFailed;
             defer eth.multicall.freeResults(allocator, results);
-
             if (results.len != batch.len) return error.MulticallFailed;
+
+            const txn = try lmdbx.Transaction.init(self.env, .{});
+            errdefer txn.abort() catch {};
             for (batch, results) |c, r| {
                 const status: u8 = if (r.success) 0 else 1;
-                try self.put(allocator, c.target, c.calldata, status, r.return_data);
+                try self.writeInTxn(allocator, txn, c.target, c.calldata, status, r.return_data);
             }
+            try txn.commit();
         }
     }
 };

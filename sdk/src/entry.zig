@@ -1,20 +1,25 @@
-/// `sdk.run` and `sdk.init`: orchestrate the four-phase pipeline.
+/// `sdk.run` and `sdk.init`: orchestrate the five-phase pipeline.
 ///
-/// Phase 1: filter_builder.build         (static + factory addresses)
-/// Phase 2: scanner.scanCreations        (only when factories declared)
+/// Phase 1: filter_builder.build          (static + factory addresses)
+/// Phase 2: scanner.scanCreations         (only when factories declared)
 /// Phase 3: filter_builder.appendChildren (only when Phase 2 found any)
-/// Phase 4: scanner.replay               (with commit batching via Context)
+/// Phase 4: prefetch.gather + ethcall.preload (only when prefetch declared)
+/// Phase 5: scanner.replay                (with commit batching via Context)
 ///
-/// `run` performs the full backfill and tears down the context. `init`
-/// performs the same backfill but returns a live `Context` whose entity
-/// stores stay open so the caller (e.g. an HTTP server) can read entities.
+/// Phases 1-3 are skipped when an existing filter env is present (the
+/// handler-only re-run path). Phase 4 is skipped when the manifest declares
+/// no prefetch. `run` performs the full backfill and tears down the context.
+/// `init` performs the same backfill but returns a live `Context` whose
+/// entity stores stay open so the caller (e.g. an HTTP server) can read.
 const std = @import("std");
 
 const core = @import("core");
 const lmdbx = @import("lmdbx");
 
+const eth = @import("eth");
 const ethcall = @import("ethcall.zig");
 const filter_builder = @import("filter_builder.zig");
+const prefetch = @import("prefetch.zig");
 const root = @import("root.zig");
 const scanner = @import("scanner.zig");
 const sdk_manifest = @import("manifest.zig");
@@ -24,12 +29,25 @@ pub const Options = struct {
     /// (blocks.dat / blocks.idx / blooms.bin / meta.bin). Read-only.
     engine_data_dir: []const u8,
     /// SDK-managed data root. The SDK creates `<data_dir>/entity/` for the
-    /// entity MDBX env and `<data_dir>/filter/` for the filtered-index env
-    /// on first run; both are mkdir'd if missing. Users only need to
-    /// allocate this single directory.
+    /// entity MDBX env, `<data_dir>/filter/` for the filtered-index env,
+    /// and `<data_dir>/ethcall/` for the eth_call cache on first run; all
+    /// three are mkdir'd if missing. Users only need to allocate this
+    /// single directory.
     data_dir: []const u8,
     /// Flush + commit cadence during handler replay, in dispatched logs.
     commit_interval: u32 = 100_000,
+    /// JSON-RPC HTTP URL for Phase 4. `null` skips the network fetch
+    /// (warm-cache re-runs and tests); uncached calls stay uncached.
+    node_rpc: ?[]const u8 = null,
+    /// Multicall3 address; canonical on every major chain. Override only
+    /// for chains without the canonical deployment.
+    multicall_address: [20]u8 = CANONICAL_MULTICALL3,
+    multicall_batch_size: usize = ethcall.DEFAULT_BATCH_SIZE,
+};
+
+pub const CANONICAL_MULTICALL3: [20]u8 = .{
+    0xca, 0x11, 0xbd, 0xe0, 0x59, 0x77, 0xb3, 0x63, 0x11, 0x67,
+    0x02, 0x88, 0x62, 0xbe, 0x2a, 0x17, 0x39, 0x76, 0xca, 0x11,
 };
 
 /// Result of a backfill run; returned from `run` and embedded in `Context`.
@@ -45,9 +63,19 @@ pub const RunStats = struct {
     logs_dispatched: u64 = 0,
     blocks_dispatched: u64 = 0,
     commits_performed: u32 = 0,
+    /// Pairs gathered for Phase 4 (post-dedup).
+    prefetch_calls_gathered: u64 = 0,
+    /// Pairs actually fetched via Multicall3 (gathered minus already-cached).
+    prefetch_calls_executed: u64 = 0,
+    /// Multicall3 RPC requests issued; derivable from `prefetch_calls_executed`
+    /// and the configured batch size but kept here so cost is one field-read.
+    prefetch_batches: u32 = 0,
+    /// True when an existing filter env let init skip Phases 1-3.
+    phases_skipped: bool = false,
     filter_build_ns: u64 = 0,
     scan_creations_ns: u64 = 0,
     append_children_ns: u64 = 0,
+    prefetch_ns: u64 = 0,
     replay_ns: u64 = 0,
     elapsed_ns: u64 = 0,
 };
@@ -84,20 +112,23 @@ pub fn Context(comptime entities: anytype) type {
         _allocator: std.mem.Allocator,
         _env: lmdbx.Environment,
         _active_txn: lmdbx.Transaction,
-        /// Borrowed ethcall cache pointer; null when the run is initialized
-        /// without prefetch (test harnesses, manifests with no `prefetch` or
-        /// `static_prefetch`). A null cache makes every `ethCall` return
-        /// `error.NotPrefetched`, which is also the strict-mode answer for
-        /// any undeclared pair.
+        /// Heap-allocated ethcall cache, owned by Context. Null when init
+        /// runs without prefetch declared — every `ethCall` then returns
+        /// `error.NotPrefetched`, matching the strict-mode semantics.
         _cache: ?*ethcall.Cache = null,
 
         /// Tear down: abort the open txn, deinit every entity store, close
-        /// the entity env, free the heap-allocated Context itself.
+        /// the entity env, close + free the heap-allocated ethcall cache
+        /// (when present), free the heap-allocated Context itself.
         pub fn deinit(self: *Self) void {
             self._active_txn.abort() catch {};
             inline for (std.meta.fields(Stores)) |f| {
                 var s = &@field(self.stores, f.name);
                 s.deinit();
+            }
+            if (self._cache) |c| {
+                c.close();
+                self._allocator.destroy(c);
             }
             self._env.deinit() catch {};
             self._allocator.destroy(self);
@@ -116,17 +147,9 @@ pub fn Context(comptime entities: anytype) type {
             self.stats.commits_performed += 1;
         }
 
-        /// Strict cache read for an immutable eth_call. Returns the cached
-        /// return data decoded into `T`, or one of:
-        ///   - `error.NotPrefetched`: pair not declared in `manifest.prefetch`
-        ///     or `manifest.static_prefetch`, or Phase 4 didn't run.
-        ///   - `error.CallReverted`: Phase 4 ran the call and it reverted.
-        ///   - `error.MalformedResult`: cached payload can't decode into `T`
-        ///     (short payload, etc.).
-        ///
-        /// Cache lookup key derives from `to ++ keccak(selectorOf(method))`,
-        /// matching the prefetch side. No HTTP I/O from this method. See
-        /// `ethcall.decodeAs` for the supported `T` set.
+        /// Strict cache read — never issues HTTP. Returns `error.NotPrefetched`
+        /// for undeclared pairs, `error.CallReverted` for status=1 entries.
+        /// See `ethcall.decodeAs` for the supported `T` set.
         pub fn ethCall(
             self: *Self,
             comptime T: type,
@@ -178,17 +201,22 @@ pub fn init(
 ) !*Context(entities) {
     var timer = try std.time.Timer.start();
 
-    // Derive and mkdir the entity / filter subdirs under `data_dir`.
+    // Derive and mkdir the entity / filter / ethcall subdirs under `data_dir`.
     const entity_dir = try std.fs.path.join(allocator, &.{ options.data_dir, "entity" });
     defer allocator.free(entity_dir);
     const filter_dir = try std.fs.path.join(allocator, &.{ options.data_dir, "filter" });
     defer allocator.free(filter_dir);
+    const ethcall_dir = try std.fs.path.join(allocator, &.{ options.data_dir, "ethcall" });
+    defer allocator.free(ethcall_dir);
     try std.fs.cwd().makePath(entity_dir);
     try std.fs.cwd().makePath(filter_dir);
+    try std.fs.cwd().makePath(ethcall_dir);
     const entity_dir_z = try allocator.dupeZ(u8, entity_dir);
     defer allocator.free(entity_dir_z);
     const filter_dir_z = try allocator.dupeZ(u8, filter_dir);
     defer allocator.free(filter_dir_z);
+    const ethcall_dir_z = try allocator.dupeZ(u8, ethcall_dir);
+    defer allocator.free(ethcall_dir_z);
 
     var reader = try core.FlatStoreReader.open(options.engine_data_dir);
     defer reader.close();
@@ -212,57 +240,78 @@ pub fn init(
     };
     errdefer ctx._active_txn.abort() catch {};
 
-    // Phase 1.
-    const primary_result = try filter_builder.build(&reader, m, filter_dir_z, allocator);
-    try requireCompleteFilter("phase 1 (build)", primary_result);
-    ctx.stats.filter_blocks_scanned = primary_result.blocks_scanned;
-    ctx.stats.filter_blocks_matched = primary_result.blocks_matched;
-    ctx.stats.filter_total_logs = primary_result.total_logs;
-    ctx.stats.filter_build_ns = primary_result.elapsed_ns;
+    // Handler-only re-run gate: skip Phases 1-3 when a populated filter env
+    // already exists. See `shouldSkipFilterBuild` for the threshold rationale.
+    if (shouldSkipFilterBuild(filter_dir)) {
+        ctx.stats.phases_skipped = true;
+    } else {
+        // Phase 1.
+        const primary_result = try filter_builder.build(&reader, m, filter_dir_z, allocator);
+        try requireCompleteFilter("phase 1 (build)", primary_result);
+        ctx.stats.filter_blocks_scanned = primary_result.blocks_scanned;
+        ctx.stats.filter_blocks_matched = primary_result.blocks_matched;
+        ctx.stats.filter_total_logs = primary_result.total_logs;
+        ctx.stats.filter_build_ns = primary_result.elapsed_ns;
 
-    // Phases 2 + 3 (factory-only).
-    if (comptime m.factories.len > 0) {
-        const filter_env = try lmdbx.Environment.init(filter_dir_z, .{ .max_dbs = 2 });
-        var phase23_timer = try std.time.Timer.start();
-        var discovered = try scanner.scanCreations(filter_env, m, allocator);
-        defer discovered.deinit();
-        ctx.stats.scan_creations_ns = phase23_timer.read();
-        filter_env.deinit() catch {};
+        // Phases 2 + 3 (factory-only).
+        if (comptime m.factories.len > 0) {
+            const filter_env = try lmdbx.Environment.init(filter_dir_z, .{ .max_dbs = 2 });
+            var phase23_timer = try std.time.Timer.start();
+            var discovered = try scanner.scanCreations(filter_env, m, allocator);
+            defer discovered.deinit();
+            ctx.stats.scan_creations_ns = phase23_timer.read();
+            filter_env.deinit() catch {};
 
-        ctx.stats.discovered_children = discovered.count();
+            ctx.stats.discovered_children = discovered.count();
 
-        if (discovered.count() > 0) {
-            const child_addrs = try allocator.alloc([20]u8, discovered.count());
-            defer allocator.free(child_addrs);
-            var i: usize = 0;
-            var it = discovered.keyIterator();
-            while (it.next()) |addr| : (i += 1) child_addrs[i] = addr.*;
+            if (discovered.count() > 0) {
+                const child_addrs = try allocator.alloc([20]u8, discovered.count());
+                defer allocator.free(child_addrs);
+                var i: usize = 0;
+                var it = discovered.keyIterator();
+                while (it.next()) |addr| : (i += 1) child_addrs[i] = addr.*;
 
-            const child_result = try filter_builder.appendChildren(
-                &reader,
-                m,
-                child_addrs,
-                filter_dir_z,
-                allocator,
-            );
-            try requireCompleteFilter("phase 3 (appendChildren)", child_result);
-            ctx.stats.children_blocks_matched = child_result.blocks_matched;
-            ctx.stats.children_total_logs = child_result.total_logs;
-            ctx.stats.append_children_ns = child_result.elapsed_ns;
+                const child_result = try filter_builder.appendChildren(
+                    &reader,
+                    m,
+                    child_addrs,
+                    filter_dir_z,
+                    allocator,
+                );
+                try requireCompleteFilter("phase 3 (appendChildren)", child_result);
+                ctx.stats.children_blocks_matched = child_result.blocks_matched;
+                ctx.stats.children_total_logs = child_result.total_logs;
+                ctx.stats.append_children_ns = child_result.elapsed_ns;
+            }
         }
     }
 
-    // Phase 4 store open.
+    // Open the filter env once for Phases 4 and 5. Borrowed by both
+    // `prefetch.gatherDynamic` and `scanner.replay`.
+    const filter_env = try lmdbx.Environment.init(filter_dir_z, .{ .max_dbs = 2 });
+    defer filter_env.deinit() catch {};
+
+    // Phase 4: prefetch.
+    const cache = try allocator.create(ethcall.Cache);
+    errdefer allocator.destroy(cache);
+    cache.* = try ethcall.Cache.open(ethcall_dir_z);
+    errdefer cache.close();
+    ctx._cache = cache;
+
+    if (comptime (m.prefetch.len > 0 or m.static_prefetch.len > 0)) {
+        var phase4_timer = try std.time.Timer.start();
+        try runPhase4(m, options, ctx, filter_env, cache, allocator);
+        ctx.stats.prefetch_ns = phase4_timer.read();
+    }
+
+    // Phase 5 store open.
     inline for (comptime resolveEntities(entities)) |T| {
         const StoreT = root.storeFor(T);
         const dbi_name = comptime entityFieldName(T);
         @field(ctx.stores, dbi_name) = try StoreT.open(allocator, &ctx._active_txn, dbi_name);
     }
 
-    // Phase 4 run.
-    const filter_env = try lmdbx.Environment.init(filter_dir_z, .{ .max_dbs = 2 });
-    defer filter_env.deinit() catch {};
-
+    // Phase 5: handler replay.
     const replay_result = try scanner.replay(
         filter_env,
         m,
@@ -278,6 +327,60 @@ pub fn init(
     try ctx.commitCycle();
     ctx.stats.elapsed_ns = timer.read();
     return ctx;
+}
+
+/// Gather → dedupe → filterUncached → preload. Runs once between Phases 3 and 5.
+/// All gather allocations live in a local arena that frees on return; the
+/// only state that escapes is the cache writes from `preload`.
+fn runPhase4(
+    comptime m: sdk_manifest.Manifest,
+    options: Options,
+    ctx: anytype,
+    filter_env: lmdbx.Environment,
+    cache: *ethcall.Cache,
+    allocator: std.mem.Allocator,
+) !void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const static_calls = try prefetch.gatherStatic(arena, m);
+    const dynamic_calls = try prefetch.gatherDynamic(arena, filter_env, m);
+
+    const merged = try arena.alloc(ethcall.Call, static_calls.len + dynamic_calls.len);
+    @memcpy(merged[0..static_calls.len], static_calls);
+    @memcpy(merged[static_calls.len..], dynamic_calls);
+
+    const unique = try prefetch.dedupe(arena, merged);
+    ctx.stats.prefetch_calls_gathered = unique.len;
+
+    const missing = try prefetch.filterUncached(arena, cache, unique);
+    if (missing.len == 0) return;
+
+    // No RPC configured: gather is informational, fetch is a no-op. Handlers
+    // that hit an uncached pair will see `error.NotPrefetched` at replay.
+    const rpc_url = options.node_rpc orelse return;
+
+    var http = eth.http_transport.HttpTransport.init(allocator, rpc_url);
+    var provider = eth.provider.Provider.init(allocator, &http);
+    var mc = eth.multicall.Multicall.init(allocator, &provider, options.multicall_address);
+    defer mc.deinit();
+
+    try cache.preload(allocator, &mc, missing, options.multicall_batch_size);
+
+    ctx.stats.prefetch_calls_executed = missing.len;
+    ctx.stats.prefetch_batches = @intCast((missing.len + options.multicall_batch_size - 1) / options.multicall_batch_size);
+}
+
+/// Decide whether to skip Phases 1-3. Returns true when an MDBX file at
+/// `<filter_dir>/data.mdb` is at least `MIN_FILTER_SIZE` bytes, i.e. an
+/// existing filter env that the user kept. Smaller / missing forces a rebuild.
+fn shouldSkipFilterBuild(filter_dir: []const u8) bool {
+    const MIN_FILTER_SIZE: u64 = 16 * 1024;
+    var d = std.fs.openDirAbsolute(filter_dir, .{}) catch return false;
+    defer d.close();
+    const stat = d.statFile("data.mdb") catch return false;
+    return stat.size >= MIN_FILTER_SIZE;
 }
 
 fn entitiesLen(comptime entities: anytype) u32 {

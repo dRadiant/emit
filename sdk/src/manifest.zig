@@ -38,7 +38,7 @@ pub const Manifest = struct {
     /// Useful for canonical contracts whose metadata the indexer references
     /// from handler code regardless of which logs flow through (WETH
     /// decimals, a router's factory pointer, etc.). Each entry is one
-    /// `(address, method)` pair
+    /// `(address, method)` pair.
     static_prefetch: []const StaticCall = &.{},
 };
 
@@ -181,17 +181,10 @@ fn validateSpawnParam(comptime f: FactoryDef) void {
     }
 }
 
-/// Extract the spawned address from a factory log. The slot (topic vs
-/// data offset) is comptime-resolved from `f.create_event` and `f.spawn_param`;
-/// the runtime cost is one slice read plus a 20-byte copy.
+/// Extract the spawned address from a factory log. Thin wrapper over
+/// `extractAddress(.param)` — kept for call-site clarity at factory pre-pass.
 pub fn extractFactoryAddress(comptime f: FactoryDef, topics: []const [32]u8, data: []const u8) [20]u8 {
-    const parsed = comptime parsedEvent(f.create_event);
-    const p = comptime abi_parse.paramByName(parsed, f.spawn_param);
-    const word: [32]u8 = switch (comptime p.slot_kind) {
-        .topic => topics[comptime p.slot_index],
-        .data => data[comptime p.slot_index..][0..32].*,
-    };
-    return word[12..32].*;
+    return extractAddress(f.create_event, .{ .param = f.spawn_param }, [_]u8{0} ** 20, topics, data);
 }
 
 /// Resolve a `PrefetchCall`'s target address against a matching log.

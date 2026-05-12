@@ -1,18 +1,5 @@
-/// Phase 4 prefetch gather, dedupe, and uncached-filter.
-///
-/// Two declaration channels produce `ethcall.Call` entries:
-///
-///   - `gatherStatic(arena, manifest)` walks `manifest.static_prefetch`
-///     at comptime; one `Call` per entry, calldata is the method selector.
-///   - `gatherDynamic(arena, env, manifest)` walks the filtered index
-///     (`BLOCKS_PRIMARY` + `BLOCKS_CHILDREN`) and emits a `Call` for every
-///     log whose `topic0` matches some `PrefetchDef.on_event`. Address
-///     resolves via `manifest.extractAddress(.log | .param)`.
-///
-/// `dedupe` collapses both channels' outputs by `(target, keccak(calldata))`.
-/// `filterUncached` drops pairs already present in the ethcall cache so
-/// re-runs hit zero RPC. All allocations come from the caller-provided
-/// arena; one `arena.deinit()` frees every `Call.calldata` and the slice.
+/// Phase 4 gather → dedupe → filterUncached. All allocations come from a
+/// caller-owned arena so the entire phase frees in one `arena.deinit()`.
 const std = @import("std");
 
 const core = @import("core");
@@ -26,10 +13,8 @@ const RawLog = core.RawLog;
 const log_serial = core.log_serial;
 const types = core.types;
 
-/// Comptime-extracted list of `static_prefetch` entries. One `Call` per
-/// entry. The selector is comptime-known per method string; we still dupe
-/// the 4 bytes into arena memory so every `Call.calldata` has the same
-/// lifetime story as the dynamic-channel calls.
+/// One `Call` per `static_prefetch` entry. Selectors dupe into arena memory
+/// so every `Call.calldata` shares the same lifetime as the dynamic-channel.
 pub fn gatherStatic(
     arena: std.mem.Allocator,
     comptime m: sdk_manifest.Manifest,
@@ -44,11 +29,8 @@ pub fn gatherStatic(
     return out;
 }
 
-/// Walk the filtered index and emit one `Call` per `(matching log, declared
-/// PrefetchCall)` pair. Visits both `BLOCKS_PRIMARY` (always) and
-/// `BLOCKS_CHILDREN` (when present). Returns an empty slice when the
-/// manifest declares no prefetch, when the env has no `BLOCKS_PRIMARY`, or
-/// when the filtered index is empty.
+/// Walk the filtered index (`BLOCKS_PRIMARY` + `BLOCKS_CHILDREN` when
+/// present) and emit one `Call` per `(matching log, declared PrefetchCall)`.
 pub fn gatherDynamic(
     arena: std.mem.Allocator,
     env: lmdbx.Environment,
@@ -95,16 +77,13 @@ pub fn gatherDynamic(
                     }
                 }
             }
-        } else |_| {
-            // BLOCKS_CHILDREN may be absent on factory-free manifests; not an error.
-        }
+        } else |_| {}
     }
 
     return out.toOwnedSlice(arena);
 }
 
-/// Collapse `calls` by `(target, keccak(calldata))` while preserving the
-/// first occurrence of each key. Caller's `arena` owns the returned slice.
+/// Collapse by `(target, keccak(calldata))`, preserving first occurrence.
 pub fn dedupe(arena: std.mem.Allocator, calls: []const ethcall.Call) ![]ethcall.Call {
     if (calls.len == 0) return &.{};
 
@@ -125,8 +104,7 @@ pub fn dedupe(arena: std.mem.Allocator, calls: []const ethcall.Call) ![]ethcall.
     return out.toOwnedSlice(arena);
 }
 
-/// Drop entries already present in the cache so re-runs hit zero RPC for
-/// the warm subset. Order-preserving for the surviving entries.
+/// Drop entries already in the cache; order-preserving.
 pub fn filterUncached(
     arena: std.mem.Allocator,
     cache: *ethcall.Cache,
