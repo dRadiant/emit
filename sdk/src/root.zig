@@ -13,6 +13,7 @@ const eth = @import("eth");
 const abi_parse = @import("abi_parse.zig");
 const entity_serial = @import("entity_serial.zig");
 const entry = @import("entry.zig");
+const ethcall = @import("ethcall.zig");
 const filter_builder = @import("filter_builder.zig");
 const handler = @import("handler.zig");
 const immutable_store = @import("immutable_store.zig");
@@ -166,6 +167,7 @@ pub fn validateHandler(comptime m: Manifest, comptime Handler: type) void {
 test {
     _ = abi_parse;
     _ = entity_serial;
+    _ = ethcall;
     _ = immutable_store;
     _ = mutable_store;
     _ = manifest;
