@@ -1,5 +1,4 @@
 /// Derived presentation helpers.
-/// TODO: add token-metadata formatting (decimals, symbol) atop the ethcall cache.
 const std = @import("std");
 
 const MERGE_BLOCK: u64 = 15_537_394;
@@ -40,4 +39,112 @@ test "pre-merge approximation is monotonic" {
 test "block zero saturates without overflow" {
     const ts = blockTimestamp(0);
     try std.testing.expect(ts == 0 or ts < MERGE_TIMESTAMP);
+}
+
+/// Zero-alloc fixed-point renderer for token amounts. Pair with a `decimals`
+/// pulled from `ctx.ethCall(u8, token, "decimals()")`. Trailing fractional
+/// zeros and the decimal point itself are omitted when redundant, so
+/// `amount(2_000…000, 18)` prints `"2"` rather than `"2.000000000000000000"`.
+pub const Amount = struct {
+    value: u256,
+    decimals: u8,
+
+    pub fn format(self: Amount, writer: anytype) !void {
+        if (self.decimals == 0) {
+            try writer.print("{d}", .{self.value});
+            return;
+        }
+        const scale = pow10(self.decimals);
+        const integer_part = self.value / scale;
+        const fractional_part = self.value % scale;
+
+        try writer.print("{d}", .{integer_part});
+        if (fractional_part == 0) return;
+
+        // Render fractional left-padded to `decimals` width, then trim
+        // trailing zeros. 78 digits covers u256.MAX (10^78 > 2^256).
+        var buf: [78]u8 = undefined;
+        const slice = buf[0..self.decimals];
+        var remainder = fractional_part;
+        var i: usize = self.decimals;
+        while (i > 0) {
+            i -= 1;
+            slice[i] = '0' + @as(u8, @intCast(remainder % 10));
+            remainder /= 10;
+        }
+        var end = self.decimals;
+        while (end > 0 and slice[end - 1] == '0') end -= 1;
+        try writer.writeAll(".");
+        try writer.writeAll(slice[0..end]);
+    }
+};
+
+pub fn amount(value: u256, decimals: u8) Amount {
+    return .{ .value = value, .decimals = decimals };
+}
+
+fn pow10(exp: u8) u256 {
+    var p: u256 = 1;
+    var i: u8 = 0;
+    while (i < exp) : (i += 1) p *= 10;
+    return p;
+}
+
+fn formatAmount(a: Amount, buf: []u8) ![]const u8 {
+    var stream = std.io.fixedBufferStream(buf);
+    var writer = stream.writer();
+    try a.format(&writer);
+    return stream.getWritten();
+}
+
+test "Amount formats 1.5 ETH at 18 decimals" {
+    var buf: [80]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "1.5",
+        try formatAmount(amount(1_500_000_000_000_000_000, 18), &buf),
+    );
+}
+
+test "Amount formats 12.345678 USDC at 6 decimals" {
+    var buf: [80]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "12.345678",
+        try formatAmount(amount(12_345_678, 6), &buf),
+    );
+}
+
+test "Amount strips redundant trailing zeros and decimal point" {
+    var buf: [80]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "2",
+        try formatAmount(amount(2_000_000_000_000_000_000, 18), &buf),
+    );
+}
+
+test "Amount renders zero without a decimal point" {
+    var buf: [80]u8 = undefined;
+    try std.testing.expectEqualStrings("0", try formatAmount(amount(0, 18), &buf));
+}
+
+test "Amount renders the smallest representable fraction" {
+    var buf: [80]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "0.000000000000000001",
+        try formatAmount(amount(1, 18), &buf),
+    );
+}
+
+test "Amount with decimals=0 falls through to integer rendering" {
+    var buf: [80]u8 = undefined;
+    try std.testing.expectEqualStrings("42", try formatAmount(amount(42, 0), &buf));
+}
+
+test "Amount handles u256 values near the type limit" {
+    var buf: [80]u8 = undefined;
+    // 10**30 (above u64::MAX) at 18 decimals → "1000000000000".
+    const v: u256 = 1_000_000_000_000_000_000_000_000_000_000;
+    try std.testing.expectEqualStrings(
+        "1000000000000",
+        try formatAmount(amount(v, 18), &buf),
+    );
 }

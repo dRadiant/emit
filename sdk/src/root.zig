@@ -15,6 +15,7 @@ const entity_serial = @import("entity_serial.zig");
 const entry = @import("entry.zig");
 const ethcall = @import("ethcall.zig");
 const filter_builder = @import("filter_builder.zig");
+const humanize = @import("humanize.zig");
 const prefetch = @import("prefetch.zig");
 const handler = @import("handler.zig");
 const immutable_store = @import("immutable_store.zig");
@@ -26,6 +27,8 @@ pub const manifest = @import("manifest.zig");
 
 // User-facing top-level surface.
 pub const AddressSource = manifest.AddressSource;
+pub const Amount = humanize.Amount;
+pub const amount = humanize.amount;
 pub const Context = entry.Context;
 pub const ContractDef = manifest.ContractDef;
 pub const DecodedLog = handler.DecodedLog;
