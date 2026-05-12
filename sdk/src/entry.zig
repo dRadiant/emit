@@ -240,9 +240,9 @@ pub fn init(
     };
     errdefer ctx._active_txn.abort() catch {};
 
-    // Handler-only re-run gate: skip Phases 1-3 when a populated filter env
-    // already exists. See `shouldSkipFilterBuild` for the threshold rationale.
-    if (shouldSkipFilterBuild(filter_dir)) {
+    // Handler-only re-run gate: skip Phases 1-3 when the filter env has any
+    // prior `BLOCKS_PRIMARY` entries.
+    if (shouldSkipFilterBuild(filter_dir_z)) {
         ctx.stats.phases_skipped = true;
     } else {
         // Phase 1.
@@ -372,15 +372,21 @@ fn runPhase4(
     ctx.stats.prefetch_batches = @intCast((missing.len + options.multicall_batch_size - 1) / options.multicall_batch_size);
 }
 
-/// Decide whether to skip Phases 1-3. Returns true when an MDBX file at
-/// `<filter_dir>/data.mdb` is at least `MIN_FILTER_SIZE` bytes, i.e. an
-/// existing filter env that the user kept. Smaller / missing forces a rebuild.
-fn shouldSkipFilterBuild(filter_dir: []const u8) bool {
-    const MIN_FILTER_SIZE: u64 = 16 * 1024;
-    var d = std.fs.openDirAbsolute(filter_dir, .{}) catch return false;
-    defer d.close();
-    const stat = d.statFile("data.mdb") catch return false;
-    return stat.size >= MIN_FILTER_SIZE;
+/// True when `BLOCKS_PRIMARY` has at least one entry — a prior filter build
+/// exists. Cursor probe instead of `Database.stat()` because the lmdbx-zig
+/// wrapper's `stat()` is stale against the current libmdbx C ABI (4-arg
+/// `mdbx_dbi_stat` vs the wrapper's 3-arg binding). Any failure degrades
+/// to "don't skip" rather than blocking the run.
+fn shouldSkipFilterBuild(filter_dir_z: [*:0]const u8) bool {
+    const env = lmdbx.Environment.init(filter_dir_z, .{ .max_dbs = 2 }) catch return false;
+    defer env.deinit() catch {};
+    const txn = lmdbx.Transaction.init(env, .{ .mode = .ReadOnly }) catch return false;
+    defer txn.abort() catch {};
+    const db = lmdbx.Database.open(txn, filter_builder.DBI_PRIMARY, .{}) catch return false;
+    var cursor = db.cursor() catch return false;
+    defer cursor.deinit();
+    const first = cursor.goToFirst() catch return false;
+    return first != null;
 }
 
 fn entitiesLen(comptime entities: anytype) u32 {
@@ -949,4 +955,134 @@ test "ethCall decodes u256 from the full word" {
         @as(u256, 1_000_000_000_000_000_000_000),
         try ctx.ethCall(u256, TOKEN, "totalSupply()"),
     );
+}
+
+// ── Phase 4 wiring ───────────────────────────────────────────────────────
+
+fn writeSingleTransferStore(dir: std.fs.Dir, allocator: std.mem.Allocator) !void {
+    const ALICE: [20]u8 = [_]u8{0xA1} ** 20;
+    var data_buf: [32]u8 = undefined;
+    const log = makeTransferLog(100, 0, [_]u8{0} ** 20, ALICE, 1, &data_buf);
+    const blocks = [_][]const core.RawLog{&.{log}};
+    try writeFlatStoreFromLogs(dir, &blocks, allocator);
+}
+
+test "phase 4 gathers static_prefetch and skips preload without node_rpc" {
+    const allocator = testing.allocator;
+
+    var src_tmp = testing.tmpDir(.{});
+    defer src_tmp.cleanup();
+    try writeSingleTransferStore(src_tmp.dir, allocator);
+    var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
+
+    var data_tmp = testing.tmpDir(.{});
+    defer data_tmp.cleanup();
+    var data_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_path = try data_tmp.dir.realpath(".", &data_path_buf);
+
+    const Manifest: sdk_manifest.Manifest = .{
+        .name = "erc20",
+        .chain_id = 1,
+        .start_block = 0,
+        .contracts = &.{.{ .name = "T", .address = ADDR_TOKEN, .events = &.{Transfer} }},
+        .static_prefetch = &.{
+            .{ .address = [_]u8{0xC0} ** 20, .method = "decimals()" },
+            .{ .address = [_]u8{0xC0} ** 20, .method = "symbol()" },
+            .{ .address = [_]u8{0xC1} ** 20, .method = "decimals()" },
+        },
+    };
+
+    const ctx = try init(
+        Manifest,
+        TransferHandler,
+        .{Account},
+        .{ .engine_data_dir = src_path, .data_dir = data_path },
+        allocator,
+    );
+    defer ctx.deinit();
+
+    try testing.expectEqual(@as(u64, 3), ctx.stats.prefetch_calls_gathered);
+    try testing.expectEqual(@as(u64, 0), ctx.stats.prefetch_calls_executed);
+    try testing.expectEqual(@as(u32, 0), ctx.stats.prefetch_batches);
+    try testing.expect(!ctx.stats.phases_skipped);
+}
+
+test "phase 4 runs zero work for a manifest with no prefetch" {
+    const allocator = testing.allocator;
+
+    var src_tmp = testing.tmpDir(.{});
+    defer src_tmp.cleanup();
+    try writeSingleTransferStore(src_tmp.dir, allocator);
+    var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
+
+    var data_tmp = testing.tmpDir(.{});
+    defer data_tmp.cleanup();
+    var data_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_path = try data_tmp.dir.realpath(".", &data_path_buf);
+
+    const Manifest: sdk_manifest.Manifest = .{
+        .name = "erc20",
+        .chain_id = 1,
+        .start_block = 0,
+        .contracts = &.{.{ .name = "T", .address = ADDR_TOKEN, .events = &.{Transfer} }},
+    };
+
+    const ctx = try init(
+        Manifest,
+        TransferHandler,
+        .{Account},
+        .{ .engine_data_dir = src_path, .data_dir = data_path },
+        allocator,
+    );
+    defer ctx.deinit();
+
+    try testing.expectEqual(@as(u64, 0), ctx.stats.prefetch_calls_gathered);
+    try testing.expectEqual(@as(u64, 0), ctx.stats.prefetch_ns);
+}
+
+test "handler-only re-run gate skips phases 1-3 on the second init" {
+    const allocator = testing.allocator;
+
+    var src_tmp = testing.tmpDir(.{});
+    defer src_tmp.cleanup();
+    try writeSingleTransferStore(src_tmp.dir, allocator);
+    var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
+
+    var data_tmp = testing.tmpDir(.{});
+    defer data_tmp.cleanup();
+    var data_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_path = try data_tmp.dir.realpath(".", &data_path_buf);
+
+    const Manifest: sdk_manifest.Manifest = .{
+        .name = "erc20",
+        .chain_id = 1,
+        .start_block = 0,
+        .contracts = &.{.{ .name = "T", .address = ADDR_TOKEN, .events = &.{Transfer} }},
+    };
+
+    const ctx1 = try init(
+        Manifest,
+        TransferHandler,
+        .{Account},
+        .{ .engine_data_dir = src_path, .data_dir = data_path },
+        allocator,
+    );
+    try testing.expect(!ctx1.stats.phases_skipped);
+    try testing.expect(ctx1.stats.filter_build_ns > 0);
+    ctx1.deinit();
+
+    const ctx2 = try init(
+        Manifest,
+        TransferHandler,
+        .{Account},
+        .{ .engine_data_dir = src_path, .data_dir = data_path },
+        allocator,
+    );
+    defer ctx2.deinit();
+    try testing.expect(ctx2.stats.phases_skipped);
+    try testing.expectEqual(@as(u64, 0), ctx2.stats.filter_build_ns);
+    try testing.expectEqual(@as(u64, 1), ctx2.stats.logs_dispatched);
 }
