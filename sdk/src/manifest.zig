@@ -23,12 +23,23 @@ pub const Manifest = struct {
     start_block: u64,
     /// Optional inclusive upper bound on the scan range. `null` (the
     /// default) scans to the flat store's `latest_block`. Set this to
-    /// pin a benchmark or test to a fixed window — e.g., to compare
+    /// pin a benchmark or test to a fixed window. For example, to compare
     /// entity counts byte-for-byte against an external reference that
     /// covers a specific block range.
     end_block: ?u64 = null,
     contracts: []const ContractDef = &.{},
     factories: []const FactoryDef = &.{},
+    /// Event-driven eth_call prefetch declarations. For each matching log,
+    /// the SDK queues the declared `(address, method)` pairs and batches
+    /// them through Multicall3 during Phase 4. Handlers read the cached
+    /// results via `ctx.ethCall(T, addr, "method()")`.
+    prefetch: []const PrefetchDef = &.{},
+    /// Address-driven eth_call declarations independent of any event.
+    /// Useful for canonical contracts whose metadata the indexer references
+    /// from handler code regardless of which logs flow through (WETH
+    /// decimals, a router's factory pointer, etc.). Each entry is one
+    /// `(address, method)` pair
+    static_prefetch: []const StaticCall = &.{},
 };
 
 pub const ContractDef = struct {
@@ -47,6 +58,40 @@ pub const FactoryDef = struct {
     /// parameters otherwise.
     spawn_param: []const u8,
     child_events: []const type,
+};
+
+/// Per-log target-address source for a `PrefetchCall`. `.log` selects the
+/// emitter address; `.param: "name"` resolves a named event parameter
+/// through `abi_parse.paramByName` (the same machinery `FactoryDef.spawn_param`
+/// uses). Comptime validation rejects names that are absent from the event
+/// signature or whose type is not `address`.
+pub const AddressSource = union(enum) {
+    log,
+    param: []const u8,
+};
+
+/// One declared eth_call. The target address resolves per-log via `address`;
+/// `method` is the no-argument Solidity signature whose first four keccak
+/// bytes form the call selector. Methods with parameters are not supported yet.
+pub const PrefetchCall = struct {
+    address: AddressSource,
+    method: []const u8,
+};
+
+pub const PrefetchDef = struct {
+    on_event: type,
+    calls: []const PrefetchCall,
+};
+
+/// One eth_call declared against a fixed address, independent of any event.
+/// The `method` string is the no-argument Solidity signature; the SDK
+/// keccaks the first four bytes as the selector. The same string appears
+/// at the handler call site (`ctx.ethCall(T, address, "method()")`) so the
+/// cache key derivation is unambiguous and consistent. Methods with
+/// parameters are planned for a future release.
+pub const StaticCall = struct {
+    address: [20]u8,
+    method: []const u8,
 };
 
 /// Parse the event's signature at comptime. Cached per type by the
@@ -90,6 +135,38 @@ pub fn validateManifest(comptime m: Manifest) void {
         validateSpawnParam(f);
         inline for (f.child_events) |E| validateEvent(E);
     }
+    inline for (m.prefetch) |d| validatePrefetch(d);
+    inline for (m.static_prefetch) |c| validateStaticCall(c);
+}
+
+fn validateStaticCall(comptime c: StaticCall) void {
+    comptime if (c.method.len == 0) @compileError(
+        "manifest: static_prefetch entry has an empty method string",
+    );
+}
+
+/// Comptime check that every `PrefetchCall` in `d` declares a non-empty
+/// method and that any `.param: name` source resolves to an `address`
+/// parameter on `d.on_event`'s signature.
+fn validatePrefetch(comptime d: PrefetchDef) void {
+    comptime {
+        validateEvent(d.on_event);
+        for (d.calls) |c| {
+            if (c.method.len == 0) @compileError(
+                "manifest: prefetch on `" ++ @typeName(d.on_event) ++ "` has an empty method string",
+            );
+            switch (c.address) {
+                .log => {},
+                .param => |name| {
+                    const parsed = parsedEvent(d.on_event);
+                    const p = abi_parse.paramByName(parsed, name);
+                    if (!std.mem.eql(u8, p.type_str, "address")) @compileError(
+                        "manifest: prefetch on `" ++ @typeName(d.on_event) ++ "` references parameter `" ++ name ++ "` of type `" ++ p.type_str ++ "`, expected `address`",
+                    );
+                },
+            }
+        }
+    }
 }
 
 /// Comptime check that `f.spawn_param` references a named `address`
@@ -115,6 +192,32 @@ pub fn extractFactoryAddress(comptime f: FactoryDef, topics: []const [32]u8, dat
         .data => data[comptime p.slot_index..][0..32].*,
     };
     return word[12..32].*;
+}
+
+/// Resolve a `PrefetchCall`'s target address against a matching log.
+/// `.log` returns `log_address` directly; `.param: name` resolves the
+/// named parameter at comptime through `abi_parse.paramByName` and reads
+/// from `topics[slot_index]` or `data[slot_index..][0..32]` per the
+/// parser's `slot_kind`, returning the trailing 20 bytes.
+pub fn extractAddress(
+    comptime E: type,
+    comptime src: AddressSource,
+    log_address: [20]u8,
+    topics: []const [32]u8,
+    data: []const u8,
+) [20]u8 {
+    return switch (comptime src) {
+        .log => log_address,
+        .param => |name| blk: {
+            const parsed = comptime parsedEvent(E);
+            const p = comptime abi_parse.paramByName(parsed, name);
+            const word: [32]u8 = switch (comptime p.slot_kind) {
+                .topic => topics[comptime p.slot_index],
+                .data => data[comptime p.slot_index..][0..32].*,
+            };
+            break :blk word[12..32].*;
+        },
+    };
 }
 
 /// Topic0-deduplicated flat list of every event referenced by `m`. Used to
@@ -278,4 +381,62 @@ test "topic0 is identical for bare and full-form signatures" {
     const a = comptime eventTopic0(Bare);
     const b = comptime eventTopic0(Full);
     try std.testing.expectEqualSlices(u8, &a, &b);
+}
+
+const NamedTransfer = struct {
+    pub const signature = "Transfer(address indexed from, address indexed to, uint256 value)";
+};
+
+test "validateManifest accepts prefetch and static_prefetch" {
+    const m = Manifest{
+        .name = "test",
+        .chain_id = 1,
+        .start_block = 0,
+        .contracts = &.{.{
+            .name = "rETH",
+            .address = [_]u8{0xAE} ** 20,
+            .events = &.{NamedTransfer},
+        }},
+        .prefetch = &.{.{
+            .on_event = NamedTransfer,
+            .calls = &.{
+                .{ .address = .log, .method = "decimals()" },
+                .{ .address = .{ .param = "from" }, .method = "balanceOf()" },
+            },
+        }},
+        .static_prefetch = &.{
+            .{ .address = [_]u8{0xC0} ** 20, .method = "decimals()" },
+            .{ .address = [_]u8{0xC0} ** 20, .method = "symbol()" },
+            .{ .address = [_]u8{0xC0} ** 20, .method = "name()" },
+        },
+    };
+    validateManifest(m);
+}
+
+test "extractAddress returns the emitter for .log" {
+    const EMIT = [_]u8{0xDE} ** 20;
+    const got = extractAddress(NamedTransfer, .log, EMIT, &.{}, &.{});
+    try std.testing.expectEqualSlices(u8, &EMIT, &got);
+}
+
+test "extractAddress resolves a named indexed-topic parameter" {
+    const FROM = [_]u8{0x11} ** 20;
+    var topics: [4][32]u8 = std.mem.zeroes([4][32]u8);
+    @memcpy(topics[1][12..32], &FROM);
+    const got = extractAddress(NamedTransfer, .{ .param = "from" }, [_]u8{0} ** 20, &topics, &.{});
+    try std.testing.expectEqualSlices(u8, &FROM, &got);
+}
+
+test "extractAddress resolves a named non-indexed data parameter" {
+    const PAIR = [_]u8{0xCD} ** 20;
+    var data: [64]u8 = std.mem.zeroes([64]u8);
+    @memcpy(data[12..32], &PAIR);
+    const got = extractAddress(PairCreated, .{ .param = "pair" }, [_]u8{0} ** 20, &.{}, &data);
+    try std.testing.expectEqualSlices(u8, &PAIR, &got);
+}
+
+test "StaticCall expresses one (address, method) pair" {
+    const c: StaticCall = .{ .address = [_]u8{0xC0} ** 20, .method = "decimals()" };
+    try std.testing.expectEqual(@as(usize, 20), c.address.len);
+    try std.testing.expectEqualStrings("decimals()", c.method);
 }

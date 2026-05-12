@@ -23,6 +23,7 @@ const scanner = @import("scanner.zig");
 pub const manifest = @import("manifest.zig");
 
 // User-facing top-level surface.
+pub const AddressSource = manifest.AddressSource;
 pub const Context = entry.Context;
 pub const ContractDef = manifest.ContractDef;
 pub const DecodedLog = handler.DecodedLog;
@@ -31,8 +32,11 @@ pub const FactoryDef = manifest.FactoryDef;
 pub const init = entry.init;
 pub const Manifest = manifest.Manifest;
 pub const Options = entry.Options;
+pub const PrefetchCall = manifest.PrefetchCall;
+pub const PrefetchDef = manifest.PrefetchDef;
 pub const run = entry.run;
 pub const RunStats = entry.RunStats;
+pub const StaticCall = manifest.StaticCall;
 
 /// Storage mode declared per-entity via `pub const storage: sdk.StorageMode`.
 /// `mutable` → MutableStore (HashMap-fronted, dirty-flag flush, supports
