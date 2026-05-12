@@ -13,6 +13,7 @@ const std = @import("std");
 const core = @import("core");
 const lmdbx = @import("lmdbx");
 
+const ethcall = @import("ethcall.zig");
 const filter_builder = @import("filter_builder.zig");
 const root = @import("root.zig");
 const scanner = @import("scanner.zig");
@@ -83,6 +84,12 @@ pub fn Context(comptime entities: anytype) type {
         _allocator: std.mem.Allocator,
         _env: lmdbx.Environment,
         _active_txn: lmdbx.Transaction,
+        /// Borrowed ethcall cache pointer; null when the run is initialized
+        /// without prefetch (test harnesses, manifests with no `prefetch` or
+        /// `static_prefetch`). A null cache makes every `ethCall` return
+        /// `error.NotPrefetched`, which is also the strict-mode answer for
+        /// any undeclared pair.
+        _cache: ?*ethcall.Cache = null,
 
         /// Tear down: abort the open txn, deinit every entity store, close
         /// the entity env, free the heap-allocated Context itself.
@@ -109,10 +116,28 @@ pub fn Context(comptime entities: anytype) type {
             self.stats.commits_performed += 1;
         }
 
-        /// Returns `error.NotYetImplemented` until the ethcall MDBX cache
-        /// and Multicall3 batching land.
-        pub fn ethCall(_: *Self, _: [20]u8, _: []const u8) ![]const u8 {
-            return error.NotYetImplemented;
+        /// Strict cache read for an immutable eth_call. Returns the cached
+        /// return data decoded into `T`, or one of:
+        ///   - `error.NotPrefetched`: pair not declared in `manifest.prefetch`
+        ///     or `manifest.static_prefetch`, or Phase 4 didn't run.
+        ///   - `error.CallReverted`: Phase 4 ran the call and it reverted.
+        ///   - `error.MalformedResult`: cached payload can't decode into `T`
+        ///     (short payload, etc.).
+        ///
+        /// Cache lookup key derives from `to ++ keccak(selectorOf(method))`,
+        /// matching the prefetch side. No HTTP I/O from this method. See
+        /// `ethcall.decodeAs` for the supported `T` set.
+        pub fn ethCall(
+            self: *Self,
+            comptime T: type,
+            to: [20]u8,
+            comptime method: []const u8,
+        ) !T {
+            const cache = self._cache orelse return error.NotPrefetched;
+            const selector = comptime ethcall.selectorOf(method);
+            const entry = (try cache.get(to, &selector)) orelse return error.NotPrefetched;
+            if (entry.status != 0) return error.CallReverted;
+            return ethcall.decodeAs(T, entry.bytes);
         }
 
         /// Factory pre-pass discovers child addresses directly from logs,
@@ -707,4 +732,118 @@ test "init + replay commit batching: ctx.commitCycle fires per commit_interval" 
     // a final commit from init. Total 3.
     try testing.expectEqual(@as(u32, 3), ctx.stats.commits_performed);
     try testing.expectEqual(@as(u64, 12), ctx.stats.logs_dispatched);
+}
+
+// ── ethCall (BlockContext typed cache read) ──────────────────────────────
+
+/// Build a minimal Context whose only used field is `_cache`. `_env` and
+/// `_active_txn` are left `undefined` because `ethCall` never touches them;
+/// the caller must NOT invoke `deinit` (which would dereference them).
+fn ethCallTestContext(cache: *ethcall.Cache) Context(.{}) {
+    return .{
+        .stores = .{},
+        ._allocator = testing.allocator,
+        ._env = undefined,
+        ._active_txn = undefined,
+        ._cache = cache,
+    };
+}
+
+fn openTestCache(tmp: *std.testing.TmpDir) !ethcall.Cache {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpathZ(".", &path_buf);
+    var path_z: [std.fs.max_path_bytes:0]u8 = undefined;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    return try ethcall.Cache.open(@ptrCast(&path_z));
+}
+
+test "ethCall returns the cached u8 for a prefetched decimals() pair" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try openTestCache(&tmp);
+    defer cache.close();
+
+    const USDC = [_]u8{0xA0} ** 20;
+    const SEL = ethcall.selectorOf("decimals()");
+    var payload: [32]u8 = std.mem.zeroes([32]u8);
+    payload[31] = 6;
+    try cache.put(testing.allocator, USDC, &SEL, 0, &payload);
+
+    var ctx = ethCallTestContext(&cache);
+    try testing.expectEqual(@as(u8, 6), try ctx.ethCall(u8, USDC, "decimals()"));
+}
+
+test "ethCall returns NotPrefetched when the cache lacks the pair" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try openTestCache(&tmp);
+    defer cache.close();
+
+    const UNKNOWN = [_]u8{0xDE} ** 20;
+    var ctx = ethCallTestContext(&cache);
+    try testing.expectError(error.NotPrefetched, ctx.ethCall(u8, UNKNOWN, "decimals()"));
+}
+
+test "ethCall returns NotPrefetched when the cache is null" {
+    var ctx: Context(.{}) = .{
+        .stores = .{},
+        ._allocator = testing.allocator,
+        ._env = undefined,
+        ._active_txn = undefined,
+        ._cache = null,
+    };
+    const ANY = [_]u8{0xAA} ** 20;
+    try testing.expectError(error.NotPrefetched, ctx.ethCall(u8, ANY, "decimals()"));
+}
+
+test "ethCall returns CallReverted for a status=1 cached entry" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try openTestCache(&tmp);
+    defer cache.close();
+
+    const MKR = [_]u8{0x9F} ** 20;
+    const SEL = ethcall.selectorOf("decimals()");
+    try cache.put(testing.allocator, MKR, &SEL, 1, &.{});
+
+    var ctx = ethCallTestContext(&cache);
+    try testing.expectError(error.CallReverted, ctx.ethCall(u8, MKR, "decimals()"));
+}
+
+test "ethCall decodes [20]u8 from the trailing word bytes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try openTestCache(&tmp);
+    defer cache.close();
+
+    const ROUTER = [_]u8{0x7A} ** 20;
+    const FACTORY = [_]u8{0x5C} ** 20;
+    const SEL = ethcall.selectorOf("factory()");
+    var payload: [32]u8 = std.mem.zeroes([32]u8);
+    @memcpy(payload[12..32], &FACTORY);
+    try cache.put(testing.allocator, ROUTER, &SEL, 0, &payload);
+
+    var ctx = ethCallTestContext(&cache);
+    const got = try ctx.ethCall([20]u8, ROUTER, "factory()");
+    try testing.expectEqualSlices(u8, &FACTORY, &got);
+}
+
+test "ethCall decodes u256 from the full word" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try openTestCache(&tmp);
+    defer cache.close();
+
+    const TOKEN = [_]u8{0xBB} ** 20;
+    const SEL = ethcall.selectorOf("totalSupply()");
+    var payload: [32]u8 = undefined;
+    std.mem.writeInt(u256, &payload, 1_000_000_000_000_000_000_000, .big);
+    try cache.put(testing.allocator, TOKEN, &SEL, 0, &payload);
+
+    var ctx = ethCallTestContext(&cache);
+    try testing.expectEqual(
+        @as(u256, 1_000_000_000_000_000_000_000),
+        try ctx.ethCall(u256, TOKEN, "totalSupply()"),
+    );
 }

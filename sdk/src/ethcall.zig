@@ -66,6 +66,46 @@ pub fn selectorOf(comptime method: []const u8) [4]u8 {
     };
 }
 
+/// Decode an ABI-encoded 32-byte word into the requested Zig type. Used by
+/// `BlockContext.ethCall(comptime T, ...)` to interpret cached return data.
+///
+/// Supported `T`: any signed/unsigned Zig integer (truncated from the
+/// 32-byte word's big-endian u256), `bool` (LSB of the word), `[20]u8`
+/// (trailing 20 bytes, the EVM address layout), and `[N]u8` for fixed N
+/// up to 32 (left-aligned bytes32-class).
+///
+/// Dynamic-return types (`[]const u8` for ABI strings or dynamic bytes)
+/// are deferred to M3.x. Strict lifetime story for borrowed slices needs
+/// the long-lived ro-txn redesign before we can return them safely.
+pub fn decodeAs(comptime T: type, bytes: []const u8) !T {
+    if (bytes.len < 32) return error.MalformedResult;
+    const word = bytes[0..32];
+    const info = @typeInfo(T);
+    return switch (info) {
+        .int => |int_info| if (int_info.signedness == .unsigned)
+            @truncate(std.mem.readInt(u256, word, .big))
+        else
+            @truncate(@as(i256, @bitCast(std.mem.readInt(u256, word, .big)))),
+        .bool => word[31] != 0,
+        .array => |arr| blk: {
+            if (arr.child != u8) @compileError(
+                "ethcall.decodeAs: arrays must be `[N]u8`; got `" ++ @typeName(T) ++ "`",
+            );
+            // [20]u8 is the EVM address layout: trailing 20 bytes of the word.
+            // Any other fixed length is bytes32-class: left-aligned.
+            if (arr.len == 20) break :blk word[12..32].*;
+            if (arr.len > 32) @compileError(
+                "ethcall.decodeAs: arrays larger than 32 bytes cannot fit in one ABI word",
+            );
+            break :blk word[0..arr.len].*;
+        },
+        else => @compileError(
+            "ethcall.decodeAs: type `" ++ @typeName(T) ++ "` is not supported. " ++
+                "Use an int (u8..u256, i8..i256), bool, [20]u8, or [N]u8 for fixed N <= 32.",
+        ),
+    };
+}
+
 /// Form the 52-byte cache key for a `(target, calldata)` pair. Stable across
 /// SDK versions so the cache survives upgrades.
 pub fn cacheKey(target: [20]u8, calldata: []const u8) [52]u8 {
@@ -300,6 +340,60 @@ test "contains tracks presence without value-read cost (interface contract)" {
     payload[31] = 8;
     try cache.put(std.testing.allocator, TARGET, &CALLDATA, 0, &payload);
     try std.testing.expect(try cache.contains(TARGET, &CALLDATA));
+}
+
+test "decodeAs reads u8 from the trailing byte of a 32-byte word" {
+    var word: [32]u8 = std.mem.zeroes([32]u8);
+    word[31] = 18;
+    try std.testing.expectEqual(@as(u8, 18), try decodeAs(u8, &word));
+}
+
+test "decodeAs reads u256 from the full 32-byte word" {
+    var word: [32]u8 = undefined;
+    std.mem.writeInt(u256, &word, 0xdead_beef_cafe_babe, .big);
+    try std.testing.expectEqual(@as(u256, 0xdead_beef_cafe_babe), try decodeAs(u256, &word));
+}
+
+test "decodeAs reads u112 by truncating the u256 view" {
+    // Sync(uint112,uint112): low 112 bits of the word are the value.
+    var word: [32]u8 = std.mem.zeroes([32]u8);
+    word[19] = 0xAB; // bit 152 (above u112 range, must be ignored if upper bits were set)
+    std.mem.writeInt(u256, &word, 0x1234_5678, .big);
+    const got = try decodeAs(u112, &word);
+    try std.testing.expectEqual(@as(u112, 0x1234_5678), got);
+}
+
+test "decodeAs reads a signed i32 with sign extension" {
+    var word: [32]u8 = std.mem.zeroes([32]u8);
+    // -1 in i256 has all bits set.
+    @memset(&word, 0xFF);
+    try std.testing.expectEqual(@as(i32, -1), try decodeAs(i32, &word));
+}
+
+test "decodeAs reads bool from the LSB" {
+    var word_true: [32]u8 = std.mem.zeroes([32]u8);
+    word_true[31] = 1;
+    var word_false: [32]u8 = std.mem.zeroes([32]u8);
+    try std.testing.expect(try decodeAs(bool, &word_true));
+    try std.testing.expect(!(try decodeAs(bool, &word_false)));
+}
+
+test "decodeAs reads an EVM address from the trailing 20 bytes" {
+    var word: [32]u8 = std.mem.zeroes([32]u8);
+    const ADDR = [_]u8{0xAB} ** 20;
+    @memcpy(word[12..32], &ADDR);
+    try std.testing.expectEqualSlices(u8, &ADDR, &(try decodeAs([20]u8, &word)));
+}
+
+test "decodeAs reads bytes32-class from the left-aligned head" {
+    var word: [32]u8 = std.mem.zeroes([32]u8);
+    word[0..4].* = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xAA, 0xBB, 0xCC, 0xDD }, &(try decodeAs([4]u8, &word)));
+}
+
+test "decodeAs returns MalformedResult for a short payload" {
+    var short: [4]u8 = .{ 1, 2, 3, 4 };
+    try std.testing.expectError(error.MalformedResult, decodeAs(u8, &short));
 }
 
 test "cache survives close and re-open" {
