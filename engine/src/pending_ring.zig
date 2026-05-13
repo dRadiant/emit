@@ -21,19 +21,22 @@ const std = @import("std");
 const core = @import("core");
 
 const bloom = core.bloom;
+const pending_format = core.pending_format;
 
-pub const FINALITY_DEPTH = core.types.FINALITY_DEPTH;
+pub const FINALITY_DEPTH = pending_format.FINALITY_DEPTH;
 
-const HASH_SIZE = 32;
-const FIXED_ENTRY_SIZE = 8 + HASH_SIZE + bloom.BLOOM_SIZE + bloom.ADDR_BLOOM_SIZE + 4;
-// block_number(8) + hash(32) + topic(256) + addr(1024) + lz4_len(4) = 1324
+const HASH_SIZE = pending_format.HASH_SIZE;
+const FIXED_ENTRY_SIZE = pending_format.FIXED_ENTRY_SIZE;
 
+/// Engine-side entry: same shape as `core.pending_format.Entry` but owns its
+/// `lz4_entry` bytes (the engine is the writer; the format's read view is
+/// non-owning). Layout constants live in `core.pending_format`.
 pub const Entry = struct {
     block_number: u64,
     hash: [HASH_SIZE]u8,
     topic_bloom: [bloom.BLOOM_SIZE]u8,
     addr_bloom: [bloom.ADDR_BLOOM_SIZE]u8,
-    lz4_entry: []u8, // owned by allocator
+    lz4_entry: []u8,
 
     fn totalSize(self: Entry) usize {
         return FIXED_ENTRY_SIZE + self.lz4_entry.len;
@@ -192,46 +195,31 @@ pub const PendingRing = struct {
         try self.dir.rename("pending.bin.tmp", "pending.bin");
     }
 
-    /// Load entries from pending.bin on startup.
+    /// Load entries from pending.bin on startup. Routes parsing through
+    /// `core.pending_format` so the engine writer and SDK reader cannot
+    /// drift on byte layout.
     fn load(self: *PendingRing) !void {
         const file = try self.dir.openFile("pending.bin", .{});
         defer file.close();
         const stat = try file.stat();
-        if (stat.size < 4) return;
+        if (stat.size == 0) return;
 
         const buf = try self.alloc.alloc(u8, stat.size);
         defer self.alloc.free(buf);
         const n = try file.readAll(buf);
-        if (n < 4) return;
 
-        const entry_count: usize = std.mem.readInt(u32, buf[0..4], .little);
-        var pos: usize = 4;
+        const parsed = try pending_format.parse(self.alloc, buf[0..n]);
+        defer self.alloc.free(parsed);
 
-        for (0..entry_count) |_| {
-            if (pos + FIXED_ENTRY_SIZE > n) break;
-
-            const block_number = std.mem.readInt(u64, buf[pos..][0..8], .big);
-            pos += 8;
-            const hash = buf[pos..][0..HASH_SIZE].*;
-            pos += HASH_SIZE;
-            const topic_bloom = buf[pos..][0..bloom.BLOOM_SIZE].*;
-            pos += bloom.BLOOM_SIZE;
-            const addr_bloom = buf[pos..][0..bloom.ADDR_BLOOM_SIZE].*;
-            pos += bloom.ADDR_BLOOM_SIZE;
-            const lz4_len: usize = std.mem.readInt(u32, buf[pos..][0..4], .little);
-            pos += 4;
-
-            if (pos + lz4_len > n) break;
-            const lz4_entry = try self.alloc.alloc(u8, lz4_len);
-            @memcpy(lz4_entry, buf[pos..][0..lz4_len]);
-            pos += lz4_len;
-
-            try self.entries.append(self.alloc, .{
-                .block_number = block_number,
-                .hash = hash,
-                .topic_bloom = topic_bloom,
-                .addr_bloom = addr_bloom,
-                .lz4_entry = lz4_entry,
+        try self.entries.ensureUnusedCapacity(self.alloc, parsed.len);
+        for (parsed) |p| {
+            const owned = try self.alloc.dupe(u8, p.lz4_entry);
+            self.entries.appendAssumeCapacity(.{
+                .block_number = p.block_number,
+                .hash = p.hash,
+                .topic_bloom = p.topic_bloom,
+                .addr_bloom = p.addr_bloom,
+                .lz4_entry = owned,
             });
         }
     }

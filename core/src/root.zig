@@ -12,6 +12,7 @@ pub const block_filter = @import("block_filter.zig");
 pub const log_serial = @import("log_serial.zig");
 pub const io_pipeline = @import("io_pipeline.zig");
 pub const parallel = @import("parallel.zig");
+pub const pending_format = @import("pending_format.zig");
 
 // Re-export commonly used types at top level for convenience.
 pub const RawLog = types.RawLog;
@@ -28,4 +29,5 @@ test {
     _ = log_serial;
     _ = io_pipeline;
     _ = parallel;
+    _ = pending_format;
 }
