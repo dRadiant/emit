@@ -229,6 +229,19 @@ pub fn Log(comptime E: type) type {
     };
 }
 
+/// Decode a `RawLog` and route it through the manifest's comptime dispatcher
+/// in one step. Backfill (`scanner.replay`) and live mode share this — keeping
+/// the per-log path in one place means a future change (e.g. metrics, tracing)
+/// lands once.
+pub fn dispatchLog(
+    comptime m: manifest.Manifest,
+    comptime Handler: type,
+    ctx: anytype,
+    raw_log: core.RawLog,
+) !void {
+    return dispatcherFor(m).dispatch(Handler, DecodedLog.fromRawLog(raw_log), ctx);
+}
+
 /// Build the comptime dispatch table for a manifest. Returns a function
 /// type that switches on `log.topics[0]` against each declared event's
 /// topic0 and invokes `Handler.handle ++ event.name`. Logs whose topic0

@@ -178,8 +178,7 @@ pub fn replay(
         result.blocks_dispatched += 1;
 
         for (merge_buf[0..merge_count]) |log| {
-            const decoded = handler_mod.DecodedLog.fromRawLog(log);
-            try Dispatcher.dispatch(Handler, decoded, ctx);
+            try handler_mod.dispatchLog(m, Handler, ctx, log);
             result.logs_dispatched += 1;
             events_since_commit += 1;
             if (events_since_commit >= options.commit_interval) {
