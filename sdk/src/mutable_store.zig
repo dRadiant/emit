@@ -5,6 +5,14 @@
 ///   - `flush` drains dirty entries to MDBX in bulk.
 ///   - The cache persists across commits; only dirty flags are reset.
 ///
+/// In live mode (`live = true`, set by `sdk/live.zig` before the first
+/// pending-block dispatch), saves route through a separate in-memory
+/// overlay tagged with the block that produced them. Reads check the
+/// overlay first, then fall through to the cache and MDBX. Finalization
+/// (`commitBlock`) drains a block's slice into the active txn; reorg
+/// recovery (`discardAll`) drops the entire overlay and the live loop
+/// re-dispatches the canonical pending entries from oldest to newest.
+///
 /// Not thread-safe. Stage 2 dispatch is single-threaded.
 const std = @import("std");
 
@@ -29,6 +37,7 @@ pub fn MutableStore(comptime T: type) type {
         pub const value_size = VALUE_SIZE;
 
         const CacheEntry = struct { entity: T, dirty: bool };
+        const PendingEntry = struct { block: u64, value: T };
 
         dbi: lmdbx.Database.DBI,
         cache: std.AutoHashMap(KeyField, CacheEntry),
@@ -39,20 +48,36 @@ pub fn MutableStore(comptime T: type) type {
         /// rebind the txn themselves.
         active_txn: *const lmdbx.Transaction,
 
+        // ── Live-mode state ────────────────────────────────────────────
+        // `pending` is zero-initialized — backfill never touches it, so no
+        // backing storage is allocated until the live loop's first `save`.
+        // The live loop sets `live = true` once at entry and updates
+        // `live_block` before each pending block's dispatch so saves carry
+        // the right tag.
+        allocator: std.mem.Allocator,
+        live: bool = false,
+        live_block: u64 = 0,
+        pending: std.AutoHashMapUnmanaged(KeyField, PendingEntry) = .{},
+
         pub fn open(allocator: std.mem.Allocator, txn_ref: *const lmdbx.Transaction, name: [*:0]const u8) !Self {
             const db = try lmdbx.Database.open(txn_ref.*, name, .{ .create = true });
             return .{
                 .dbi = db.dbi,
                 .cache = std.AutoHashMap(KeyField, CacheEntry).init(allocator),
                 .active_txn = txn_ref,
+                .allocator = allocator,
             };
         }
 
         pub fn deinit(self: *Self) void {
+            self.pending.deinit(self.allocator);
             self.cache.deinit();
         }
 
         pub fn load(self: *Self, key: KeyField) !?T {
+            if (self.live) {
+                if (self.pending.get(key)) |e| return e.value;
+            }
             if (self.cache.get(key)) |entry| return entry.entity;
 
             var key_buf: [KEY_SIZE]u8 = undefined;
@@ -77,7 +102,11 @@ pub fn MutableStore(comptime T: type) type {
             if (try self.load(key)) |existing| return existing;
             var entity = std.mem.zeroes(T);
             @field(entity, key_field_name) = key;
-            try self.cache.put(key, .{ .entity = entity, .dirty = true });
+            if (self.live) {
+                try self.pending.put(self.allocator, key, .{ .block = self.live_block, .value = entity });
+            } else {
+                try self.cache.put(key, .{ .entity = entity, .dirty = true });
+            }
             return entity;
         }
 
@@ -86,6 +115,10 @@ pub fn MutableStore(comptime T: type) type {
         /// feel uniform from a handler's perspective.
         pub fn save(self: *Self, entity: T) !void {
             const key = @field(entity, key_field_name);
+            if (self.live) {
+                try self.pending.put(self.allocator, key, .{ .block = self.live_block, .value = entity });
+                return;
+            }
             try self.cache.put(key, .{ .entity = entity, .dirty = true });
         }
 
@@ -103,8 +136,45 @@ pub fn MutableStore(comptime T: type) type {
             }
         }
 
+        /// Live-mode finalization: walk the overlay and upsert every entry
+        /// tagged with `block` into MDBX via the active txn, then drop those
+        /// entries from the overlay. Entries tagged with other blocks remain
+        /// pending. No-op when the overlay is empty.
+        pub fn commitBlock(self: *Self, block: u64) !void {
+            if (self.pending.count() == 0) return;
+            const db = lmdbx.Database{ .txn = self.active_txn.*, .dbi = self.dbi };
+            var to_remove: std.ArrayListUnmanaged(KeyField) = .{};
+            defer to_remove.deinit(self.allocator);
+            var it = self.pending.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.block != block) continue;
+                var key_buf: [KEY_SIZE]u8 = undefined;
+                var val_buf: [VALUE_SIZE]u8 = undefined;
+                entity_serial.encodeKey(KeyField, entry.key_ptr.*, &key_buf);
+                entity_serial.serialize(T, entry.value_ptr.value, &val_buf);
+                try db.set(&key_buf, &val_buf, .Upsert);
+                try to_remove.append(self.allocator, entry.key_ptr.*);
+            }
+            for (to_remove.items) |k| _ = self.pending.remove(k);
+        }
+
+        /// Drop the entire overlay. Reorg recovery uses this — the live loop
+        /// then re-dispatches every block in the fresh pending file from
+        /// oldest to newest, repopulating the overlay from the canonical
+        /// chain. Per-block partial discard is intentionally not exposed:
+        /// the single-value overlay loses pre-fork values when the same key
+        /// is written across multiple pending blocks, so partial discard is
+        /// unsafe.
+        pub fn discardAll(self: *Self) void {
+            self.pending.clearRetainingCapacity();
+        }
+
         pub fn count(self: *const Self) u32 {
             return self.cache.count();
+        }
+
+        pub fn pendingCount(self: *const Self) u32 {
+            return self.pending.count();
         }
     };
 }
@@ -219,6 +289,144 @@ test "cache survives flush, commit, and a new transaction" {
     current_txn = try env.transaction(.{});
     const got = (try store.load(alice)).?;
     try std.testing.expectEqual(@as(u256, 100), got.balance);
+    try current_txn.abort();
+}
+
+test "live save buffers to overlay, not cache or MDBX" {
+    const S = MutableStore(Account);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const env = try openTestEnv(&tmp);
+    defer env.deinit() catch {};
+
+    var current_txn = try env.transaction(.{});
+    var store = try S.open(std.testing.allocator, &current_txn, "accounts");
+    defer store.deinit();
+    store.live = true;
+    store.live_block = 100;
+
+    const alice = [_]u8{0xAA} ** 20;
+    try store.save(.{ .id = alice, .balance = 100 });
+
+    // Overlay holds the live write; cache and MDBX are untouched.
+    try std.testing.expectEqual(@as(u32, 1), store.pendingCount());
+    try std.testing.expectEqual(@as(u32, 0), store.count());
+    const db = lmdbx.Database{ .txn = current_txn, .dbi = store.dbi };
+    var key_buf: [S.key_size]u8 = undefined;
+    entity_serial.encodeKey(S.Key, alice, &key_buf);
+    try std.testing.expect((try db.get(&key_buf)) == null);
+
+    try current_txn.abort();
+}
+
+test "live load merges overlay over base" {
+    const S = MutableStore(Account);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const env = try openTestEnv(&tmp);
+    defer env.deinit() catch {};
+
+    const alice = [_]u8{0xAA} ** 20;
+
+    // Seed MDBX with alice.balance = 100 via the backfill path.
+    {
+        var current_txn = try env.transaction(.{});
+        var store = try S.open(std.testing.allocator, &current_txn, "accounts");
+        defer store.deinit();
+        try store.save(.{ .id = alice, .balance = 100 });
+        try store.flush();
+        try current_txn.commit();
+    }
+
+    // Open in live mode; overlay holds a fresher value for the same key.
+    var current_txn = try env.transaction(.{});
+    var store = try S.open(std.testing.allocator, &current_txn, "accounts");
+    defer store.deinit();
+    store.live = true;
+    store.live_block = 200;
+    try store.save(.{ .id = alice, .balance = 500 });
+
+    const got = (try store.load(alice)).?;
+    try std.testing.expectEqual(@as(u256, 500), got.balance);
+
+    try current_txn.abort();
+}
+
+test "commitBlock flushes only the matching block's slice" {
+    const S = MutableStore(Account);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const env = try openTestEnv(&tmp);
+    defer env.deinit() catch {};
+
+    var current_txn = try env.transaction(.{});
+    var store = try S.open(std.testing.allocator, &current_txn, "accounts");
+    defer store.deinit();
+    store.live = true;
+
+    const alice = [_]u8{0xAA} ** 20;
+    const bob = [_]u8{0xBB} ** 20;
+    store.live_block = 100;
+    try store.save(.{ .id = alice, .balance = 100 });
+    store.live_block = 101;
+    try store.save(.{ .id = bob, .balance = 200 });
+
+    try store.commitBlock(100);
+
+    // Block 100's slice landed in MDBX; alice is gone from overlay.
+    const db = lmdbx.Database{ .txn = current_txn, .dbi = store.dbi };
+    var key_buf: [S.key_size]u8 = undefined;
+    entity_serial.encodeKey(S.Key, alice, &key_buf);
+    try std.testing.expect((try db.get(&key_buf)) != null);
+    // Block 101's slice (bob) is still pending — no MDBX entry yet.
+    entity_serial.encodeKey(S.Key, bob, &key_buf);
+    try std.testing.expect((try db.get(&key_buf)) == null);
+    try std.testing.expectEqual(@as(u32, 1), store.pendingCount());
+
+    try current_txn.commit();
+}
+
+test "discardAll drops the entire overlay" {
+    const S = MutableStore(Account);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const env = try openTestEnv(&tmp);
+    defer env.deinit() catch {};
+
+    var current_txn = try env.transaction(.{});
+    var store = try S.open(std.testing.allocator, &current_txn, "accounts");
+    defer store.deinit();
+    store.live = true;
+    store.live_block = 100;
+
+    try store.save(.{ .id = [_]u8{0xAA} ** 20, .balance = 100 });
+    store.live_block = 101;
+    try store.save(.{ .id = [_]u8{0xBB} ** 20, .balance = 200 });
+    try std.testing.expectEqual(@as(u32, 2), store.pendingCount());
+
+    store.discardAll();
+    try std.testing.expectEqual(@as(u32, 0), store.pendingCount());
+
+    try current_txn.abort();
+}
+
+test "backfill leaves the overlay empty" {
+    const S = MutableStore(Account);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const env = try openTestEnv(&tmp);
+    defer env.deinit() catch {};
+
+    var current_txn = try env.transaction(.{});
+    var store = try S.open(std.testing.allocator, &current_txn, "accounts");
+    defer store.deinit();
+
+    // live defaults to false; save takes the M2 cache path.
+    try store.save(.{ .id = [_]u8{0xAA} ** 20, .balance = 100 });
+    try store.save(.{ .id = [_]u8{0xBB} ** 20, .balance = 200 });
+    try std.testing.expectEqual(@as(u32, 0), store.pendingCount());
+    try std.testing.expectEqual(@as(u32, 2), store.count());
+
     try current_txn.abort();
 }
 

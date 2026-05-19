@@ -109,8 +109,7 @@ pub fn replay(
     var timer = try std.time.Timer.start();
     var events_since_commit: u32 = 0;
 
-    const Dispatcher = handler_mod.dispatcherFor(m);
-    comptime Dispatcher.validateHandler(Handler);
+    comptime handler_mod.dispatcherFor(m).validateHandler(Handler);
 
     const txn = try env.transaction(.{ .mode = .ReadOnly });
     defer txn.abort() catch {};
