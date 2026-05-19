@@ -30,6 +30,11 @@ const types = core.types;
 
 pub const ReplayOptions = struct {
     commit_interval: u32 = 100_000,
+    /// Skip every filter env block whose number is at or below `start_block`.
+    /// `entry.init` seeds this from the entity env's `_meta.cursor`, so
+    /// replay against an existing entity store re-dispatches only the
+    /// uncovered range. The default 0 starts from the oldest filter env key.
+    start_block: u64 = 0,
 };
 
 pub const ReplayResult = struct {
@@ -114,14 +119,14 @@ pub fn replay(
     const txn = try env.transaction(.{ .mode = .ReadOnly });
     defer txn.abort() catch {};
 
-    var primary = try CursorWalker.open(txn, filter_builder.DBI_PRIMARY);
+    var primary = try CursorWalker.open(txn, filter_builder.DBI_PRIMARY, options.start_block);
     defer primary.deinit();
 
     const has_children = comptime m.factories.len > 0;
     var children_storage: CursorWalker = undefined;
     var children: ?*CursorWalker = null;
     if (has_children) {
-        if (CursorWalker.open(txn, filter_builder.DBI_CHILDREN)) |w| {
+        if (CursorWalker.open(txn, filter_builder.DBI_CHILDREN, options.start_block)) |w| {
             children_storage = w;
             children = &children_storage;
         } else |_| {
@@ -180,10 +185,18 @@ pub fn replay(
             try handler_mod.dispatchLog(m, Handler, ctx, log);
             result.logs_dispatched += 1;
             events_since_commit += 1;
-            if (events_since_commit >= options.commit_interval) {
-                try maybeCommit(ctx);
-                events_since_commit = 0;
-            }
+        }
+
+        // Block boundary: every log in `block_number` is now dispatched. The
+        // cursor invariant ("blocks ≤ _last_dispatched_block have every log
+        // dispatched") only holds at this point, so we both record the
+        // boundary and gate the commit_interval check here — never mid-block.
+        // ctx types that don't carry a cursor field (tests with the Counter
+        // shape) skip the assignment.
+        setLastDispatched(ctx, block_number);
+        if (events_since_commit >= options.commit_interval) {
+            try maybeCommit(ctx);
+            events_since_commit = 0;
         }
     }
 
@@ -210,6 +223,15 @@ inline fn maybeCommit(ctx: anytype) !void {
     }
 }
 
+/// Set the ctx's cursor-boundary field, if it has one. Counter-shaped
+/// test contexts don't, and skip silently.
+inline fn setLastDispatched(ctx: anytype, block: u64) void {
+    const T = std.meta.Child(@TypeOf(ctx));
+    if (comptime @hasField(T, "_last_dispatched_block")) {
+        ctx._last_dispatched_block = block;
+    }
+}
+
 fn pickMin(a: ?u64, b: ?u64) u64 {
     if (a) |va| if (b) |vb| return @min(va, vb) else return va;
     if (b) |vb| return vb;
@@ -228,10 +250,19 @@ const CursorWalker = struct {
     cursor: lmdbx.Cursor,
     next_key: ?[]const u8,
 
-    fn open(txn: lmdbx.Transaction, dbi_name: [*:0]const u8) !CursorWalker {
+    /// `start_block == 0` walks from the oldest key. Any other value seeks
+    /// past keys `<= start_block` via `cursor.seek(blockKey(start_block + 1))`,
+    /// so resume-against-existing-store skips the already-dispatched range
+    /// without per-block iteration.
+    fn open(txn: lmdbx.Transaction, dbi_name: [*:0]const u8, start_block: u64) !CursorWalker {
         const db = try lmdbx.Database.open(txn, dbi_name, .{});
         var cursor = try db.cursor();
-        const first = cursor.goToFirst() catch null;
+        const first: ?[]const u8 = if (start_block == 0)
+            cursor.goToFirst() catch null
+        else blk: {
+            var seek_key = filter_builder.blockKey(start_block + 1);
+            break :blk cursor.seek(&seek_key) catch null;
+        };
         return .{ .cursor = cursor, .next_key = first };
     }
 
@@ -577,6 +608,64 @@ test "replay: dispatches logs in canonical (block, tx, log_index) order across o
     try testing.expectEqual(@as(u64, 100), counter.dispatched.items[1].block_number);
     try testing.expectEqual(@as(u16, 1), counter.dispatched.items[1].log_index);
     try testing.expectEqual(@as(u64, 101), counter.dispatched.items[2].block_number);
+}
+
+test "replay seeks past start_block so already-dispatched range is skipped" {
+    // cursor: when init reads a non-zero cursor from `_meta`, scanner
+    // walks `cursor.seek(blockKey(start_block + 1))` to skip the
+    // already-covered range without per-block iteration. Plant three
+    // blocks, run replay with start_block = 100, expect only blocks 101
+    // and 102 dispatched.
+    const allocator = testing.allocator;
+    var src_tmp = testing.tmpDir(.{});
+    defer src_tmp.cleanup();
+
+    const tt = topicOf(Transfer);
+    const blocks = [_]TestBlock{
+        .{ .block_number = 100, .logs = &.{.{ .address = ADDR_TOKEN, .topic0 = tt }} },
+        .{ .block_number = 101, .logs = &.{.{ .address = ADDR_TOKEN, .topic0 = tt }} },
+        .{ .block_number = 102, .logs = &.{.{ .address = ADDR_TOKEN, .topic0 = tt }} },
+    };
+    try writeFlatStore(src_tmp.dir, &blocks, allocator);
+
+    var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
+    var reader = try FlatStoreReader.open(src_path);
+    defer reader.close();
+
+    const Manifest: sdk_manifest.Manifest = .{
+        .name = "test",
+        .chain_id = 1,
+        .start_block = 0,
+        .contracts = &.{.{ .name = "T", .address = ADDR_TOKEN, .events = &.{Transfer} }},
+    };
+
+    var dst_tmp = testing.tmpDir(.{});
+    defer dst_tmp.cleanup();
+    var dst_path_z: [std.fs.max_path_bytes:0]u8 = undefined;
+    const dst_path = try realpathZ(&dst_tmp, &dst_path_z);
+
+    _ = try filter_builder.build(&reader, Manifest, dst_path, allocator);
+
+    const env = try lmdbx.Environment.init(dst_path, .{ .max_dbs = 2 });
+    defer env.deinit() catch {};
+
+    var counter = Counter{ .allocator = allocator };
+    defer counter.deinit();
+
+    const result = try replay(env, Manifest, Counter, &counter, .{ .start_block = 100 });
+    try testing.expectEqual(@as(u64, 2), result.logs_dispatched);
+    try testing.expectEqual(@as(u64, 2), result.blocks_dispatched);
+    try testing.expectEqual(@as(u32, 2), counter.transfers);
+    try testing.expectEqual(@as(u64, 101), counter.dispatched.items[0].block_number);
+    try testing.expectEqual(@as(u64, 102), counter.dispatched.items[1].block_number);
+
+    // start_block at or beyond the max key dispatches nothing.
+    var counter2 = Counter{ .allocator = allocator };
+    defer counter2.deinit();
+    const result2 = try replay(env, Manifest, Counter, &counter2, .{ .start_block = 102 });
+    try testing.expectEqual(@as(u64, 0), result2.logs_dispatched);
+    try testing.expectEqual(@as(u64, 0), result2.blocks_dispatched);
 }
 
 test "replay: k-way merge across BLOCKS_PRIMARY and BLOCKS_CHILDREN preserves block order" {

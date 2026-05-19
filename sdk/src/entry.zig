@@ -50,6 +50,44 @@ pub const CANONICAL_MULTICALL3: [20]u8 = .{
     0x02, 0x88, 0x62, 0xbe, 0x2a, 0x17, 0x39, 0x76, 0xca, 0x11,
 };
 
+/// Reserved DBI name in the entity env. Holds SDK-internal bookkeeping keys
+/// (currently just `cursor`). The `_` prefix is unreachable by the
+/// `entityFieldName` derivation (which lowercases an alphabetic first byte),
+/// so user entity types cannot collide.
+const META_DBI: [*:0]const u8 = "_meta";
+
+/// Key inside `_meta` holding an 8-byte BE u64 — the last block whose
+/// dispatch was fully committed to MDBX. Atomic with the entity-store
+/// commit that produced it, so `cursor` and entity state are never out of
+/// sync across crashes.
+const CURSOR_KEY: []const u8 = "cursor";
+
+/// Open the `_meta` DBI under an open write txn. Creates the DBI on first
+/// touch; cheap to call on every init.
+fn openMetaDbi(txn: lmdbx.Transaction) !lmdbx.Database.DBI {
+    const db = try lmdbx.Database.open(txn, META_DBI, .{ .create = true });
+    return db.dbi;
+}
+
+/// Read the cursor from `_meta` under `txn`. Opens the DBI without
+/// `.create`, so a read-only txn works; a missing DBI (fresh env, before
+/// any commit) degrades to 0. Same fate for an absent `cursor` key or a
+/// malformed payload — all caller-safe defaults.
+fn readCursorIn(txn: lmdbx.Transaction) !u64 {
+    const db = lmdbx.Database.open(txn, META_DBI, .{}) catch return 0;
+    const data = (try db.get(CURSOR_KEY)) orelse return 0;
+    if (data.len != 8) return 0;
+    return std.mem.readInt(u64, data[0..8], .big);
+}
+
+/// Write the cursor into `_meta` under `txn`. The caller commits.
+fn writeCursorIn(txn: lmdbx.Transaction, dbi: lmdbx.Database.DBI, block: u64) !void {
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &buf, block, .big);
+    const db = lmdbx.Database{ .txn = txn, .dbi = dbi };
+    try db.set(CURSOR_KEY, &buf, .Upsert);
+}
+
 /// Result of a backfill run; returned from `run` and embedded in `Context`.
 /// `elapsed_ns - (filter_build_ns + scan_creations_ns + append_children_ns +
 /// replay_ns)` is overhead (entity-store open, final commit, env init).
@@ -111,6 +149,14 @@ pub fn Context(comptime entities: anytype) type {
         /// runs without prefetch declared — every `ethCall` then returns
         /// `error.NotPrefetched`, matching the strict-mode semantics.
         _cache: ?*ethcall.Cache = null,
+        /// Reserved `_meta` DBI in the entity env; holds the resume cursor.
+        _meta_dbi: lmdbx.Database.DBI = 0,
+        /// Highest block whose every log has been dispatched. Updated by
+        /// `scanner.replay` at every block boundary (never mid-block) and
+        /// by the live loop's finalization path. `commitCycle` writes this
+        /// value into `_meta.cursor` inside the same txn as the entity
+        /// flush, so cursor and entity state are byte-atomic.
+        _last_dispatched_block: u64 = 0,
 
         /// Tear down: abort the open txn, deinit every entity store, close
         /// the entity env, close + free the heap-allocated ethcall cache
@@ -129,14 +175,18 @@ pub fn Context(comptime entities: anytype) type {
             self._allocator.destroy(self);
         }
 
-        /// Flush every entity store to MDBX, commit the active txn, open a
-        /// new write txn. Called by `scanner.replay` every commit_interval
-        /// events and once more from `init` after replay completes.
+        /// Flush every entity store to MDBX, write the resume cursor into
+        /// `_meta` inside the same txn, commit, open a new write txn.
+        /// Called by `scanner.replay` at every block boundary that crosses
+        /// the commit_interval threshold and once more from `init` after
+        /// replay completes. Cursor and entity state ride the same commit,
+        /// so a crash inside this call rolls back both together.
         pub fn commitCycle(self: *Self) !void {
             inline for (std.meta.fields(Stores)) |f| {
                 var s = &@field(self.stores, f.name);
                 try s.flush();
             }
+            try writeCursorIn(self._active_txn, self._meta_dbi, self._last_dispatched_block);
             try self._active_txn.commit();
             self._active_txn = try self._env.transaction(.{});
             self.stats.commits_performed += 1;
@@ -223,7 +273,9 @@ pub fn init(
     const ctx = try allocator.create(C);
     errdefer allocator.destroy(ctx);
 
-    const max_dbs = comptime entitiesLen(entities);
+    // +1 reserves a slot for the SDK-internal `_meta` DBI alongside the
+    // user's entity DBIs. The cursor key lives there.
+    const max_dbs = comptime entitiesLen(entities) + 1;
     const env = try lmdbx.Environment.init(entity_dir_z, .{ .max_dbs = max_dbs });
     errdefer env.deinit() catch {};
 
@@ -234,6 +286,11 @@ pub fn init(
         .stores = undefined,
     };
     errdefer ctx._active_txn.abort() catch {};
+
+    // Open the cursor DBI before any store work so the very first commit
+    // cycle (in backfill) can write the cursor atomically with the flush.
+    ctx._meta_dbi = try openMetaDbi(ctx._active_txn);
+    ctx._last_dispatched_block = try readCursorIn(ctx._active_txn);
 
     // Handler-only re-run gate: skip Phases 1-3 when the filter env has any
     // prior `BLOCKS_PRIMARY` entries.
@@ -306,13 +363,18 @@ pub fn init(
         @field(ctx.stores, dbi_name) = try StoreT.open(allocator, &ctx._active_txn, dbi_name);
     }
 
-    // Phase 5: handler replay.
+    // Phase 5: handler replay. `start_block` skips the range already covered
+    // by a prior run's cursor (zero on a fresh env, so the full filter env
+    // is walked).
     const replay_result = try scanner.replay(
         filter_env,
         m,
         Handler,
         ctx,
-        .{ .commit_interval = options.commit_interval },
+        .{
+            .commit_interval = options.commit_interval,
+            .start_block = ctx._last_dispatched_block,
+        },
     );
     ctx.stats.logs_dispatched = replay_result.logs_dispatched;
     ctx.stats.blocks_dispatched = replay_result.blocks_dispatched;
@@ -538,6 +600,88 @@ const LBTCBalance = struct {
 };
 
 const ADDR_TOKEN: [20]u8 = [_]u8{0xAE} ** 20;
+
+test "cursor round-trips across env close + reopen via _meta DBI" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpathZ(".", &path_buf);
+    var path_z: [std.fs.max_path_bytes:0]u8 = undefined;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+
+    {
+        const env = try lmdbx.Environment.init(@ptrCast(&path_z), .{ .max_dbs = 2 });
+        defer env.deinit() catch {};
+        const txn = try env.transaction(.{});
+        // Fresh env: DBI doesn't exist yet → 0.
+        try testing.expectEqual(@as(u64, 0), try readCursorIn(txn));
+        const dbi = try openMetaDbi(txn);
+        try writeCursorIn(txn, dbi, 12345);
+        try txn.commit();
+    }
+
+    {
+        const env = try lmdbx.Environment.init(@ptrCast(&path_z), .{ .max_dbs = 2 });
+        defer env.deinit() catch {};
+        const txn = try env.transaction(.{ .mode = .ReadOnly });
+        defer txn.abort() catch {};
+        try testing.expectEqual(@as(u64, 12345), try readCursorIn(txn));
+    }
+}
+
+test "commit boundary lands at block end, not mid-block" {
+    // commit_interval = 1 with a 3-log single-block fixture: the old
+    // mid-block commit would have produced 3 in-replay commits + 1 final.
+    // The new block-boundary discipline produces 1 in-replay commit + 1
+    // final = 2. This is the invariant the cursor scheme depends on:
+    // every commit reflects a fully-dispatched block, never a partial.
+    const allocator = testing.allocator;
+    const ALICE: [20]u8 = [_]u8{0xA1} ** 20;
+    const BOB: [20]u8 = [_]u8{0xB2} ** 20;
+    const CARL: [20]u8 = [_]u8{0xC3} ** 20;
+
+    var src_tmp = testing.tmpDir(.{});
+    defer src_tmp.cleanup();
+
+    var data_bufs: [3][32]u8 = undefined;
+    const logs = [_]core.RawLog{
+        makeTransferLog(100, 0, [_]u8{0} ** 20, ALICE, 10, &data_bufs[0]),
+        makeTransferLog(100, 1, [_]u8{0} ** 20, BOB, 20, &data_bufs[1]),
+        makeTransferLog(100, 2, [_]u8{0} ** 20, CARL, 30, &data_bufs[2]),
+    };
+    const blocks = [_][]const core.RawLog{&logs};
+    try writeFlatStoreFromLogs(src_tmp.dir, &blocks, allocator);
+    var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
+
+    var data_tmp = testing.tmpDir(.{});
+    defer data_tmp.cleanup();
+    var data_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_path = try data_tmp.dir.realpath(".", &data_path_buf);
+
+    const Manifest: sdk_manifest.Manifest = .{
+        .name = "erc20",
+        .chain_id = 1,
+        .start_block = 0,
+        .contracts = &.{.{ .name = "T", .address = ADDR_TOKEN, .events = &.{Transfer} }},
+    };
+
+    const ctx = try init(
+        Manifest,
+        TransferHandler,
+        .{Account},
+        .{ .engine_data_dir = src_path, .data_dir = data_path, .commit_interval = 1 },
+        allocator,
+    );
+    defer ctx.deinit();
+
+    try testing.expectEqual(@as(u64, 3), ctx.stats.logs_dispatched);
+    try testing.expectEqual(@as(u64, 1), ctx.stats.blocks_dispatched);
+    // 1 in-replay commit (after block 100's last log crossed interval=1) +
+    // 1 final commit from init = 2.
+    try testing.expectEqual(@as(u32, 2), ctx.stats.commits_performed);
+}
 
 test "requireCompleteFilter: zero drops succeeds, any drops escalate to error" {
     try requireCompleteFilter("test", .{ .blocks_matched = 100, .dropped_blocks = 0 });
@@ -1035,7 +1179,11 @@ test "phase 4 runs zero work for a manifest with no prefetch" {
     try testing.expectEqual(@as(u64, 0), ctx.stats.prefetch_ns);
 }
 
-test "handler-only re-run gate skips phases 1-3 on the second init" {
+test "handler-only re-run skips phases 1-3 and the cursor blocks re-dispatch" {
+    // cursor: the first init writes `_meta.cursor` reflecting the last
+    // dispatched block. The second init reads it, seeds `start_block`, and
+    // `scanner.replay` seeks past the already-covered range. The single
+    // planted block (number 100) is therefore *not* re-dispatched
     const allocator = testing.allocator;
 
     var src_tmp = testing.tmpDir(.{});
@@ -1065,6 +1213,8 @@ test "handler-only re-run gate skips phases 1-3 on the second init" {
     );
     try testing.expect(!ctx1.stats.phases_skipped);
     try testing.expect(ctx1.stats.filter_build_ns > 0);
+    try testing.expectEqual(@as(u64, 1), ctx1.stats.logs_dispatched);
+    try testing.expectEqual(@as(u64, 100), ctx1._last_dispatched_block);
     ctx1.deinit();
 
     const ctx2 = try init(
@@ -1077,5 +1227,8 @@ test "handler-only re-run gate skips phases 1-3 on the second init" {
     defer ctx2.deinit();
     try testing.expect(ctx2.stats.phases_skipped);
     try testing.expectEqual(@as(u64, 0), ctx2.stats.filter_build_ns);
-    try testing.expectEqual(@as(u64, 1), ctx2.stats.logs_dispatched);
+    // Cursor recovered from `_meta.cursor`: block 100 is already finalized
+    // in the entity env, so nothing is re-dispatched.
+    try testing.expectEqual(@as(u64, 100), ctx2._last_dispatched_block);
+    try testing.expectEqual(@as(u64, 0), ctx2.stats.logs_dispatched);
 }
