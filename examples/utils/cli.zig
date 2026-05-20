@@ -18,6 +18,9 @@ pub const StandardArgs = struct {
     /// gathers but skips Multicall3 — handlers see `error.NotPrefetched`
     /// for any uncached pair.
     node_rpc: ?[]const u8 = null,
+    /// When true, enter the live head-following loop after backfill +
+    /// gap-fill. The process never returns under normal operation.
+    follow: bool = false,
 };
 
 /// Parse the standard arg set: `--engine-data-dir`, `--data-dir`,
@@ -31,6 +34,7 @@ pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8) !S
     var data_dir: ?[]const u8 = null;
     var commit_interval: u32 = 100_000;
     var node_rpc: ?[]const u8 = null;
+    var follow: bool = false;
 
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -47,12 +51,14 @@ pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8) !S
         } else if (std.mem.eql(u8, a, "--node-rpc") and i + 1 < argv.len) {
             node_rpc = try allocator.dupe(u8, argv[i + 1]);
             i += 1;
+        } else if (std.mem.eql(u8, a, "--follow")) {
+            follow = true;
         }
     }
 
     if (engine_data_dir == null or data_dir == null) {
         std.debug.print(
-            "usage: {s} --engine-data-dir <path> --data-dir <path> [--commit-interval N] [--node-rpc URL]\n",
+            "usage: {s} --engine-data-dir <path> --data-dir <path> [--commit-interval N] [--node-rpc URL] [--follow]\n",
             .{prog_name},
         );
         if (engine_data_dir) |s| allocator.free(s);
@@ -66,6 +72,7 @@ pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8) !S
         .data_dir = data_dir.?,
         .commit_interval = commit_interval,
         .node_rpc = node_rpc,
+        .follow = follow,
     };
 }
 
@@ -150,7 +157,10 @@ pub fn run(
         .data_dir = args.data_dir,
         .commit_interval = args.commit_interval,
         .node_rpc = args.node_rpc,
+        .follow = args.follow,
     }, allocator);
 
+    // Unreachable under `--follow`: sdk.run enters the live loop and
+    // never returns. Falling through here means backfill-only completed.
     printStats(manifest.name, stats);
 }

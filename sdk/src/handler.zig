@@ -1,4 +1,23 @@
 /// Handler-side log shape and comptime topic0 dispatch.
+///
+/// ## Determinism contract
+///
+/// Handlers must be pure functions of `(log, prior state)`. The SDK
+/// re-dispatches blocks on reorg recovery and on restart against an
+/// existing entity store; both rely on a handler producing the same
+/// mutations for the same inputs.
+///
+/// Forbidden inside a handler:
+/// - `std.time` / wall-clock reads
+/// - randomness (`std.crypto.random`, `std.rand`, anything entropic)
+/// - direct HTTP / RPC calls
+/// - reads from the engine's pending file or any external state outside
+///   `log`, `ctx.stores.*.load*`, and `ctx.ethCall` (which is itself a
+///   strict cache read against pre-fetched immutable metadata)
+///
+/// Block time, if needed, comes from `ctx.timestamp` (derived from
+/// `block_number` via `humanize.blockTimestamp` — the 12 s consensus
+/// invariant, not the system clock). Anything else breaks replay.
 const std = @import("std");
 
 const core = @import("core");
