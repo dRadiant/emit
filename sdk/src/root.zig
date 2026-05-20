@@ -182,6 +182,9 @@ test {
     _ = filter_builder;
     _ = scanner;
     _ = entry;
+    // Test-only fixture
+    _ = @import("fake_engine.zig");
+    _ = @import("live.zig");
 }
 
 test "concat composes fixed-size byte arrays" {
