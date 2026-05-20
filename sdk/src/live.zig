@@ -234,12 +234,27 @@ pub const LiveSession = struct {
         );
         defer classification.deinit(self.allocator);
 
-        for (classification.new_blocks) |entry| {
-            setLiveBlock(ctx, entry.block_number);
-            try dispatchBlock(m, Handler, ctx, entry, self.decompress_buf, self.log_buf);
-        }
-
+        // Promote first so a finalized block's overlay slice lands in
+        // MDBX before this tick's dispatches could overwrite its tag.
         try promoteFinalized(ctx, classification.finalized);
+
+        if (classification.reorg_from != null or classification.reorged_out.len > 0) {
+            if (classification.reorg_from) |rf| {
+                if (rf <= ctx._last_dispatched_block) return error.ReorgExceedsFinalityDepth;
+            }
+            discardAllOverlays(ctx);
+            // Re-dispatch every block in fresh pending oldest to newest;
+            // re-applying mutations against an empty overlay is idempotent.
+            for (curr.entries) |entry| {
+                setLiveBlock(ctx, entry.block_number);
+                try dispatchBlock(m, Handler, ctx, entry, self.decompress_buf, self.log_buf);
+            }
+        } else {
+            for (classification.new_blocks) |entry| {
+                setLiveBlock(ctx, entry.block_number);
+                try dispatchBlock(m, Handler, ctx, entry, self.decompress_buf, self.log_buf);
+            }
+        }
 
         self.prev.deinit(self.allocator);
         self.prev = curr;
@@ -306,6 +321,15 @@ inline fn setLiveBlock(ctx: anytype, block: u64) void {
     const Stores = @FieldType(T, "stores");
     inline for (std.meta.fields(Stores)) |f| {
         @field(ctx.stores, f.name).live_block = block;
+    }
+}
+
+fn discardAllOverlays(ctx: anytype) void {
+    const T = std.meta.Child(@TypeOf(ctx));
+    if (comptime !@hasField(T, "stores")) return;
+    const Stores = @FieldType(T, "stores");
+    inline for (std.meta.fields(Stores)) |f| {
+        @field(ctx.stores, f.name).discardAll();
     }
 }
 
@@ -754,6 +778,70 @@ test "tick routes saves through the per-block overlay, not MDBX" {
     // `load` returns the overlay value (not MDBX).
     const loaded = (try ctx.stores.accounts.load(ALICE)).?;
     try testing.expectEqual(@as(u64, 100), loaded.balance);
+}
+
+test "reorg recovery drops overlay and re-dispatches fresh pending" {
+    var engine_tmp = testing.tmpDir(.{});
+    defer engine_tmp.cleanup();
+    var fake = fake_engine.FakeEngine.init(engine_tmp.dir, testing.allocator);
+    defer fake.deinit();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const engine_path = try engine_tmp.dir.realpath(".", &path_buf);
+
+    var session = try LiveSession.init(testing.allocator, engine_path);
+    defer session.deinit();
+
+    var runner = TestRunner{ ._allocator = testing.allocator };
+
+    const ALICE: [20]u8 = [_]u8{0xA1} ** 20;
+    var bufs: [3][32]u8 = undefined;
+    try fake.ingest(100, [_]u8{0xAA} ** 32, &.{makeTransferLog([_]u8{0} ** 20, ALICE, 1, &bufs[0])});
+    try fake.ingest(101, [_]u8{0xAA} ** 32, &.{makeTransferLog([_]u8{0} ** 20, ALICE, 2, &bufs[1])});
+    try fake.ingest(102, [_]u8{0xAA} ** 32, &.{makeTransferLog([_]u8{0} ** 20, ALICE, 3, &bufs[2])});
+
+    try session.tick(TestManifest, TestRunner, &runner, 200);
+    try testing.expectEqual(@as(u32, 3), runner.transfers);
+
+    // Reorg block 102 to a different hash. classifyChanges sees the
+    // mismatch → tick drops overlay (no-op for counter ctx) and
+    // re-dispatches all three curr blocks.
+    try fake.reorg(102);
+    var buf_b: [32]u8 = undefined;
+    try fake.ingest(102, [_]u8{0xBB} ** 32, &.{makeTransferLog([_]u8{0} ** 20, ALICE, 99, &buf_b)});
+
+    try session.tick(TestManifest, TestRunner, &runner, 200);
+    try testing.expectEqual(@as(u32, 6), runner.transfers);
+}
+
+test "reorg below the cursor raises ReorgExceedsFinalityDepth" {
+    var engine_tmp = testing.tmpDir(.{});
+    defer engine_tmp.cleanup();
+    var fake = fake_engine.FakeEngine.init(engine_tmp.dir, testing.allocator);
+    defer fake.deinit();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const engine_path = try engine_tmp.dir.realpath(".", &path_buf);
+
+    var session = try LiveSession.init(testing.allocator, engine_path);
+    defer session.deinit();
+
+    // Simulate prior finalization having advanced the cursor past block 200.
+    var runner = TestRunner{ ._allocator = testing.allocator, ._last_dispatched_block = 200 };
+
+    const ALICE: [20]u8 = [_]u8{0xA1} ** 20;
+    var buf_a: [32]u8 = undefined;
+    try fake.ingest(100, [_]u8{0xAA} ** 32, &.{makeTransferLog([_]u8{0} ** 20, ALICE, 1, &buf_a)});
+    try session.tick(TestManifest, TestRunner, &runner, 200);
+
+    // Reorg below cursor: engine truncates and re-ingests block 100 with a
+    // new hash. The bound check refuses recovery.
+    try fake.reorg(100);
+    var buf_b: [32]u8 = undefined;
+    try fake.ingest(100, [_]u8{0xBB} ** 32, &.{makeTransferLog([_]u8{0} ** 20, ALICE, 2, &buf_b)});
+
+    try testing.expectError(
+        error.ReorgExceedsFinalityDepth,
+        session.tick(TestManifest, TestRunner, &runner, 200),
+    );
 }
 
 test "finalized blocks promote to MDBX and advance the cursor" {
