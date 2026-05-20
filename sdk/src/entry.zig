@@ -360,6 +360,32 @@ pub fn init(
     ctx.stats.elapsed_ns = timer.read();
 
     if (options.follow) {
+        // Gap fill: the engine may have advanced during backfill. Re-open
+        // the reader so any flat-store entries added since the start of
+        // init are visible (the original `reader` mmap was sized at open).
+        const engine_last = try live.readMeta(options.engine_data_dir);
+        if (engine_last > ctx._last_dispatched_block) {
+            var gap_reader = try core.FlatStoreReader.open(options.engine_data_dir);
+            defer gap_reader.close();
+
+            _ = try filter_builder.appendBlocks(
+                &gap_reader,
+                m,
+                ctx._last_dispatched_block + 1,
+                engine_last,
+                filter_dir_z,
+                allocator,
+            );
+
+            const gap_env = try lmdbx.Environment.init(filter_dir_z, .{ .max_dbs = 2 });
+            defer gap_env.deinit() catch {};
+            _ = try scanner.replay(gap_env, m, Handler, ctx, .{
+                .commit_interval = options.commit_interval,
+                .start_block = ctx._last_dispatched_block,
+            });
+            try ctx.commitCycle();
+        }
+
         // Live-mode Multicall lives for the whole follow loop (never
         // returns under normal operation), so the transport + provider +
         // multicall sit on this stack frame and stay valid.

@@ -84,13 +84,29 @@ pub fn build(
     dest_path: [*:0]const u8,
     allocator: std.mem.Allocator,
 ) !BuildResult {
+    return appendBlocks(reader, m, m.start_block, m.end_block orelse std.math.maxInt(u64), dest_path, allocator);
+}
+
+/// Extend the primary filter env over `from_block..=to_block`. `build` is
+/// a special case with `from_block = manifest.start_block`. Used by the
+/// follow-mode gap fill in `entry.init`: when the engine advances during
+/// backfill, the SDK re-scans the new range and appends matching blocks
+/// to the existing filter env without rebuilding from scratch.
+pub fn appendBlocks(
+    reader: *const FlatStoreReader,
+    comptime m: sdk_manifest.Manifest,
+    from_block: u64,
+    to_block: u64,
+    dest_path: [*:0]const u8,
+    allocator: std.mem.Allocator,
+) !BuildResult {
     const known_addresses = comptime collectKnownAddresses(m);
     const all_topics = comptime collectAllTopics(m);
     return runPhase(
         reader,
         known_addresses,
-        m.start_block,
-        m.end_block orelse std.math.maxInt(u64),
+        from_block,
+        to_block,
         .{
             .match_addrs = known_addresses,
             .match_topics = all_topics,
@@ -991,6 +1007,62 @@ test "build: end_block clamps the scan range to a fixed window" {
     try testing.expectEqual(@as(usize, 20), decoded.items.len);
     try testing.expectEqual(@as(u64, 100), decoded.items[0].block_number);
     try testing.expectEqual(@as(u64, 119), decoded.items[19].block_number);
+}
+
+test "appendBlocks extends a primary filter env over the new range" {
+    const allocator = testing.allocator;
+
+    // 10 contiguous blocks, every one matches ContractA.
+    const a_topic = topicOf(ContractA);
+    var blocks_list: std.ArrayListUnmanaged(TestBlock) = .{};
+    defer blocks_list.deinit(allocator);
+    var log_arena = std.heap.ArenaAllocator.init(allocator);
+    defer log_arena.deinit();
+    const arena = log_arena.allocator();
+    for (0..10) |i| {
+        const buf = try arena.alloc(TestLog, 1);
+        buf[0] = .{ .address = ADDR_A, .topic0 = a_topic };
+        try blocks_list.append(allocator, .{ .block_number = 100 + i, .logs = buf });
+    }
+
+    var src_tmp = testing.tmpDir(.{});
+    defer src_tmp.cleanup();
+    try writeFlatStore(src_tmp.dir, blocks_list.items, allocator);
+    var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
+    var reader = try FlatStoreReader.open(src_path);
+    defer reader.close();
+
+    const M: sdk_manifest.Manifest = .{
+        .name = "ext",
+        .chain_id = 1,
+        .start_block = 0,
+        .contracts = &.{.{ .name = "A", .address = ADDR_A, .events = &.{ContractA} }},
+    };
+
+    var dst_tmp = testing.tmpDir(.{});
+    defer dst_tmp.cleanup();
+    var dst_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dst_path = try dst_tmp.dir.realpath(".", &dst_path_buf);
+    var dst_path_z: [std.fs.max_path_bytes:0]u8 = undefined;
+    @memcpy(dst_path_z[0..dst_path.len], dst_path);
+    dst_path_z[dst_path.len] = 0;
+
+    // First pass: cover blocks 100..=104.
+    const first = try appendBlocks(&reader, M, 100, 104, @ptrCast(&dst_path_z), allocator);
+    try testing.expectEqual(@as(u64, 5), first.blocks_matched);
+
+    // Second pass extends the env over 105..=109 — same DBI, appended.
+    const second = try appendBlocks(&reader, M, 105, 109, @ptrCast(&dst_path_z), allocator);
+    try testing.expectEqual(@as(u64, 5), second.blocks_matched);
+
+    const env = try lmdbx.Environment.init(@ptrCast(&dst_path_z), .{ .max_dbs = 2 });
+    defer env.deinit() catch {};
+    var decoded = try dumpDecodedBlocks(env, DBI_PRIMARY, allocator);
+    defer freeDecoded(&decoded, allocator);
+    try testing.expectEqual(@as(usize, 10), decoded.items.len);
+    try testing.expectEqual(@as(u64, 100), decoded.items[0].block_number);
+    try testing.expectEqual(@as(u64, 109), decoded.items[9].block_number);
 }
 
 test "processBlockEntry: corrupt entry counts as dropped_block (fail-loud safety net)" {
