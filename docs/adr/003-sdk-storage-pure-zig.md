@@ -175,6 +175,20 @@ Triggers for adopting option D in a follow-up change:
 - New deliverable: reference C and Python readers in `examples/readers/`.
 - Migration tool: one-shot scan of an MDBX entity store, write out as snapshot files. ~50 LoC.
 
+### Cursor atomicity follow-up
+
+The SDK's resume cursor lives at `_meta.cursor` inside the entity MDBX env. The location is chosen *specifically* because MDBX transactions let the cursor write ride the same commit as the entity flush — giving "crash any time, cursor and entity state are byte-atomic." A `cursor.bin` file written out-of-band was rejected because the file-write vs MDBX-commit gap could silently double-count `MutableStore` mutations on restart.
+
+If option D (or any non-MDBX backend) is adopted the cursor's atomicity story has to be re-derived. The principle survives — cursor and entity state must commit together — but the **mechanism** changes:
+
+- **If the snapshot file is itself the atomic unit** (tmp + fsync + rename), the cursor lives *inside* that snapshot. The entity-file header gains a `cursor: u64` field; reading it on startup is free, and the rename makes cursor + state byte-atomic without any additional primitive.
+- **If a write-ahead log is introduced for cross-store atomicity** (already noted under "Cross-store atomicity" above), the cursor goes into the WAL header. Same idea: one atomic checkpoint covers the cursor and the affected stores.
+- **If a "cursor file" is ever exposed as a separate artifact** (e.g. for external tooling), it must be written *before* the snapshot rename — the rename committing the new state implicitly also commits the cursor that referenced it.
+
+What the migration must NOT do: regress to a standalone `cursor.bin` whose write happens out-of-band from the entity snapshot. That reintroduces the exact failure mode the current design explicitly rejected.
+
+The migration must answer "what is the atomicity unit?" first, then the cursor location falls out. The current `writeCursorIn` / `readCursorIn` helpers against `_meta` map cleanly to whatever the answer is — these become writes into the new format's header or WAL record, not standalone file I/O.
+
 **Staying with A indefinitely:**
 
 - Continue documenting raw-C-API workarounds for each lmdbx-zig wrapper bug encountered.
