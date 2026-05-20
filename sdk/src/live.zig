@@ -239,12 +239,34 @@ pub const LiveSession = struct {
             try dispatchBlock(m, Handler, ctx, entry, self.decompress_buf, self.log_buf);
         }
 
-        // No commit on dispatch — saves landed in the overlay, not MDBX.
+        try promoteFinalized(ctx, classification.finalized);
 
         self.prev.deinit(self.allocator);
         self.prev = curr;
     }
 };
+
+/// For each finalized block: drain that block's overlay slice from every
+/// store into MDBX, advance `_last_dispatched_block`, commit. The cursor
+/// write rides the same txn as the entity flush — a crash mid-promotion
+/// rolls both back. Counter-shaped tests without a `stores` field skip.
+fn promoteFinalized(ctx: anytype, finalized: []const u64) !void {
+    if (finalized.len == 0) return;
+    const T = std.meta.Child(@TypeOf(ctx));
+    if (comptime !@hasField(T, "stores")) return;
+    const Stores = @FieldType(T, "stores");
+    for (finalized) |block| {
+        inline for (std.meta.fields(Stores)) |f| {
+            try @field(ctx.stores, f.name).commitBlock(block);
+        }
+        if (comptime @hasField(T, "_last_dispatched_block")) {
+            ctx._last_dispatched_block = block;
+        }
+        if (comptime @hasDecl(T, "commitCycle")) {
+            try ctx.commitCycle();
+        }
+    }
+}
 
 /// Block forever, dispatching new pending blocks as they arrive.
 pub fn run(
@@ -306,10 +328,10 @@ fn dispatchBlock(
         try handler_mod.dispatchLog(m, Handler, ctx, log.*);
     }
 
-    const T = std.meta.Child(@TypeOf(ctx));
-    if (comptime @hasField(T, "_last_dispatched_block")) {
-        ctx._last_dispatched_block = entry.block_number;
-    }
+    // `_last_dispatched_block` is the MDBX cursor write-back, not the
+    // dispatch HWM — live-mode saves land in the overlay, so dispatch
+    // itself can't advance the durable cursor. `promoteFinalized` sets
+    // it when a block actually commits.
 }
 
 // ── Watcher: inotify on the engine data dir ──────────────────────────────
@@ -616,7 +638,7 @@ test "tick dispatches a pending block ingested by FakeEngine" {
     try session.tick(TestManifest, TestRunner, &runner, 200);
 
     try testing.expectEqual(@as(u32, 1), runner.transfers);
-    try testing.expectEqual(@as(u64, 100), runner._last_dispatched_block);
+    try testing.expectEqual(@as(u64, 100), runner.block_number);
 }
 
 test "tick routes saves through the per-block overlay, not MDBX" {
@@ -732,6 +754,141 @@ test "tick routes saves through the per-block overlay, not MDBX" {
     // `load` returns the overlay value (not MDBX).
     const loaded = (try ctx.stores.accounts.load(ALICE)).?;
     try testing.expectEqual(@as(u64, 100), loaded.balance);
+}
+
+test "finalized blocks promote to MDBX and advance the cursor" {
+    const lmdbx = @import("lmdbx");
+    const root = @import("root.zig");
+    const mutable_store = @import("mutable_store.zig");
+    const entity_serial = @import("entity_serial.zig");
+
+    const Account = struct {
+        pub const storage: root.StorageMode = .mutable;
+        id: [20]u8,
+        balance: u64,
+    };
+
+    const OverlayHandler = struct {
+        pub fn handleTransfer(log: handler_mod.Log(TestTransfer), ctx: anytype) !void {
+            const to = log.topics[2][12..32].*;
+            const value: u64 = std.mem.readInt(u64, log.data[24..32], .big);
+            var receiver = try ctx.stores.accounts.loadOrInit(to);
+            receiver.balance +%= value;
+            try ctx.stores.accounts.save(receiver);
+        }
+    };
+
+    const Manifest: sdk_manifest.Manifest = .{
+        .name = "finalize",
+        .chain_id = 1,
+        .start_block = 0,
+        .contracts = &.{.{ .name = "T", .address = TEST_CONTRACT, .events = &.{TestTransfer} }},
+    };
+
+    const TestStores = struct { accounts: mutable_store.MutableStore(Account) };
+    const TestCtx = struct {
+        _allocator: std.mem.Allocator,
+        _env: lmdbx.Environment,
+        _active_txn: lmdbx.Transaction,
+        _meta_dbi: lmdbx.Database.DBI = 0,
+        block_number: u64 = 0,
+        timestamp: u64 = 0,
+        stores: TestStores,
+        _last_dispatched_block: u64 = 0,
+
+        // Minimal stand-in for entry.Context.commitCycle: flush stores +
+        // write cursor + commit + open new txn. Mirrors the real flow so
+        // promoteFinalized's call hits the same atomic path.
+        pub fn commitCycle(self: *@This()) !void {
+            inline for (std.meta.fields(TestStores)) |f| {
+                try @field(self.stores, f.name).flush();
+            }
+            try writeCursorInTest(self._active_txn, self._meta_dbi, self._last_dispatched_block);
+            try self._active_txn.commit();
+            self._active_txn = try self._env.transaction(.{});
+        }
+    };
+
+    var engine_tmp = testing.tmpDir(.{});
+    defer engine_tmp.cleanup();
+    var fake = fake_engine.FakeEngine.init(engine_tmp.dir, testing.allocator);
+    defer fake.deinit();
+    var engine_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const engine_path = try engine_tmp.dir.realpath(".", &engine_path_buf);
+
+    var entity_tmp = testing.tmpDir(.{});
+    defer entity_tmp.cleanup();
+    var entity_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const entity_path = try entity_tmp.dir.realpathZ(".", &entity_path_buf);
+    var entity_path_z: [std.fs.max_path_bytes:0]u8 = undefined;
+    @memcpy(entity_path_z[0..entity_path.len], entity_path);
+    entity_path_z[entity_path.len] = 0;
+
+    const env = try lmdbx.Environment.init(@ptrCast(&entity_path_z), .{ .max_dbs = 4 });
+    defer env.deinit() catch {};
+
+    const ctx = try testing.allocator.create(TestCtx);
+    defer testing.allocator.destroy(ctx);
+    ctx.* = .{
+        ._allocator = testing.allocator,
+        ._env = env,
+        ._active_txn = try env.transaction(.{}),
+        .stores = undefined,
+    };
+    ctx._meta_dbi = (try lmdbx.Database.open(ctx._active_txn, "_meta", .{ .create = true })).dbi;
+    ctx.stores.accounts = try mutable_store.MutableStore(Account).open(testing.allocator, &ctx._active_txn, "accounts");
+    defer ctx.stores.accounts.deinit();
+    defer ctx._active_txn.abort() catch {};
+
+    enter(ctx);
+
+    var session = try LiveSession.init(testing.allocator, engine_path);
+    defer session.deinit();
+
+    // Two pending blocks. Tick once → both land in the overlay.
+    const ALICE: [20]u8 = [_]u8{0xA1} ** 20;
+    const BOB: [20]u8 = [_]u8{0xB2} ** 20;
+    var bufs: [2][32]u8 = undefined;
+    try fake.ingest(100, [_]u8{0xAA} ** 32, &.{makeTransferLog([_]u8{0} ** 20, ALICE, 100, &bufs[0])});
+    try fake.ingest(101, [_]u8{0xAA} ** 32, &.{makeTransferLog([_]u8{0} ** 20, BOB, 200, &bufs[1])});
+    try session.tick(Manifest, OverlayHandler, ctx, 200);
+    try testing.expectEqual(@as(u32, 2), ctx.stores.accounts.pendingCount());
+
+    // Finalize block 100 on the engine side. Next tick's classifyChanges
+    // sees block 100 disappeared with last_finalized=100 → promote to MDBX.
+    try fake.finalize(100);
+    try session.tick(Manifest, OverlayHandler, ctx, 200);
+
+    // Block 100's slice is in MDBX; block 101 still pending.
+    try testing.expectEqual(@as(u32, 1), ctx.stores.accounts.pendingCount());
+    try testing.expectEqual(@as(u64, 100), ctx._last_dispatched_block);
+
+    const Store = mutable_store.MutableStore(Account);
+    const db = lmdbx.Database{ .txn = ctx._active_txn, .dbi = ctx.stores.accounts.dbi };
+    var alice_key: [20]u8 = undefined;
+    entity_serial.encodeKey([20]u8, ALICE, &alice_key);
+    const alice_bytes = (try db.get(&alice_key)) orelse return error.MissingAlice;
+    const alice_acct = entity_serial.deserialize(Account, alice_bytes[0..Store.value_size]);
+    try testing.expectEqual(@as(u64, 100), alice_acct.balance);
+
+    var bob_key: [20]u8 = undefined;
+    entity_serial.encodeKey([20]u8, BOB, &bob_key);
+    try testing.expect((try db.get(&bob_key)) == null);
+
+    // Cursor in `_meta.cursor` reflects the just-promoted block.
+    var cursor_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &cursor_buf, 0, .big);
+    const meta_db = lmdbx.Database{ .txn = ctx._active_txn, .dbi = ctx._meta_dbi };
+    const cursor_bytes = (try meta_db.get("cursor")) orelse return error.MissingCursor;
+    try testing.expectEqual(@as(u64, 100), std.mem.readInt(u64, cursor_bytes[0..8], .big));
+}
+
+fn writeCursorInTest(txn: anytype, dbi: anytype, block: u64) !void {
+    const lmdbx = @import("lmdbx");
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &buf, block, .big);
+    const db = lmdbx.Database{ .txn = txn, .dbi = dbi };
+    try db.set("cursor", &buf, .Upsert);
 }
 
 test "tick is a no-op when pending is unchanged" {
