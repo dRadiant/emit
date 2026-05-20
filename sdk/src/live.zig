@@ -235,12 +235,11 @@ pub const LiveSession = struct {
         defer classification.deinit(self.allocator);
 
         for (classification.new_blocks) |entry| {
+            setLiveBlock(ctx, entry.block_number);
             try dispatchBlock(m, Handler, ctx, entry, self.decompress_buf, self.log_buf);
         }
 
-        if (classification.new_blocks.len > 0) {
-            try ctx.commitCycle();
-        }
+        // No commit on dispatch — saves landed in the overlay, not MDBX.
 
         self.prev.deinit(self.allocator);
         self.prev = curr;
@@ -256,11 +255,35 @@ pub fn run(
 ) !void {
     comptime handler_mod.dispatcherFor(m).validateHandler(Handler);
 
+    enter(ctx);
+
     var session = try LiveSession.init(ctx._allocator, options.engine_data_dir);
     defer session.deinit();
 
     while (true) {
         try session.tick(m, Handler, ctx, options.tick_timeout_ms);
+    }
+}
+
+/// Flip `live = true` on every entity store. Saves from this point go
+/// to the per-block overlay instead of MDBX; `commitBlock` is the only
+/// path that promotes overlay state to durable storage. Idempotent —
+/// counter-shaped test contexts without a `stores` field are skipped.
+pub fn enter(ctx: anytype) void {
+    const T = std.meta.Child(@TypeOf(ctx));
+    if (comptime !@hasField(T, "stores")) return;
+    const Stores = @FieldType(T, "stores");
+    inline for (std.meta.fields(Stores)) |f| {
+        @field(ctx.stores, f.name).live = true;
+    }
+}
+
+inline fn setLiveBlock(ctx: anytype, block: u64) void {
+    const T = std.meta.Child(@TypeOf(ctx));
+    if (comptime !@hasField(T, "stores")) return;
+    const Stores = @FieldType(T, "stores");
+    inline for (std.meta.fields(Stores)) |f| {
+        @field(ctx.stores, f.name).live_block = block;
     }
 }
 
@@ -536,22 +559,17 @@ const TestManifest: sdk_manifest.Manifest = .{
 };
 
 /// Counter-shaped ctx + handler: cheap stand-in for a real Context that
-/// still exercises the dispatch pipeline. `commitCycle` is a no-op since
-/// no MDBX writes are in flight.
+/// still exercises the dispatch pipeline. No entity stores, so the
+/// overlay path is a no-op via the @hasField gate on `enter` / `tick`.
 const TestRunner = struct {
     _allocator: std.mem.Allocator,
     block_number: u64 = 0,
     timestamp: u64 = 0,
     transfers: u32 = 0,
     _last_dispatched_block: u64 = 0,
-    commits: u32 = 0,
 
     pub fn handleTransfer(_: handler_mod.Log(TestTransfer), self: *TestRunner) !void {
         self.transfers += 1;
-    }
-
-    pub fn commitCycle(self: *TestRunner) !void {
-        self.commits += 1;
     }
 };
 
@@ -599,7 +617,6 @@ test "tick dispatches a pending block ingested by FakeEngine" {
 
     try testing.expectEqual(@as(u32, 1), runner.transfers);
     try testing.expectEqual(@as(u64, 100), runner._last_dispatched_block);
-    try testing.expectEqual(@as(u32, 1), runner.commits);
 }
 
 test "tick is a no-op when pending is unchanged" {
@@ -622,11 +639,9 @@ test "tick is a no-op when pending is unchanged" {
     var runner = TestRunner{ ._allocator = testing.allocator };
     try session.tick(TestManifest, TestRunner, &runner, 100);
     try testing.expectEqual(@as(u32, 1), runner.transfers);
-    try testing.expectEqual(@as(u32, 1), runner.commits);
 
     try session.tick(TestManifest, TestRunner, &runner, 100);
     try testing.expectEqual(@as(u32, 1), runner.transfers);
-    try testing.expectEqual(@as(u32, 1), runner.commits);
 }
 
 test "readPending + readMeta against a FakeEngine snapshot" {
