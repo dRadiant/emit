@@ -187,12 +187,9 @@ pub fn replay(
             events_since_commit += 1;
         }
 
-        // Block boundary: every log in `block_number` is now dispatched. The
-        // cursor invariant ("blocks ≤ _last_dispatched_block have every log
-        // dispatched") only holds at this point, so we both record the
-        // boundary and gate the commit_interval check here — never mid-block.
-        // ctx types that don't carry a cursor field (tests with the Counter
-        // shape) skip the assignment.
+        // Block boundary. Record the cursor and gate the commit check here
+        // — mid-block commits would leave the cursor pointing at a
+        // partially-dispatched block.
         setLastDispatched(ctx, block_number);
         if (events_since_commit >= options.commit_interval) {
             try maybeCommit(ctx);

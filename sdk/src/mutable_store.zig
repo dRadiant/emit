@@ -1,19 +1,12 @@
-/// MutableStore(T): comptime-generated MDBX wrapper for mutable entities,
-/// fronted by an in-memory HashMap cache:
-///   - `load` hits the cache (~50ns) before falling through to MDBX (~1µs).
-///   - `save` updates the cache only and sets a dirty flag.
-///   - `flush` drains dirty entries to MDBX in bulk.
-///   - The cache persists across commits; only dirty flags are reset.
+/// MutableStore(T): MDBX-backed mutable entities with an in-memory HashMap
+/// cache. `flush` writes dirty entries; the cache survives commits.
 ///
-/// In live mode (`live = true`, set by `sdk/live.zig` before the first
-/// pending-block dispatch), saves route through a separate in-memory
-/// overlay tagged with the block that produced them. Reads check the
-/// overlay first, then fall through to the cache and MDBX. Finalization
-/// (`commitBlock`) drains a block's slice into the active txn; reorg
-/// recovery (`discardAll`) drops the entire overlay and the live loop
-/// re-dispatches the canonical pending entries from oldest to newest.
+/// In live mode, saves route through a per-block overlay tagged with the
+/// block that produced them. `commitBlock` drains a block's slice into
+/// the active txn; `discardAll` drops the overlay on reorg recovery.
+/// Backfill keeps the overlay's backing storage unallocated.
 ///
-/// Not thread-safe. Stage 2 dispatch is single-threaded.
+/// Not thread-safe.
 const std = @import("std");
 
 const lmdbx = @import("lmdbx");
@@ -48,12 +41,9 @@ pub fn MutableStore(comptime T: type) type {
         /// rebind the txn themselves.
         active_txn: *const lmdbx.Transaction,
 
-        // ── Live-mode state ────────────────────────────────────────────
-        // `pending` is zero-initialized — backfill never touches it, so no
-        // backing storage is allocated until the live loop's first `save`.
-        // The live loop sets `live = true` once at entry and updates
-        // `live_block` before each pending block's dispatch so saves carry
-        // the right tag.
+        // Live-mode state. `pending` is zero-init so backfill never
+        // allocates. The caller sets `live_block` before each block's
+        // dispatch and `live = true` once at loop entry.
         allocator: std.mem.Allocator,
         live: bool = false,
         live_block: u64 = 0,
@@ -136,10 +126,8 @@ pub fn MutableStore(comptime T: type) type {
             }
         }
 
-        /// Live-mode finalization: walk the overlay and upsert every entry
-        /// tagged with `block` into MDBX via the active txn, then drop those
-        /// entries from the overlay. Entries tagged with other blocks remain
-        /// pending. No-op when the overlay is empty.
+        /// Upsert every overlay entry tagged with `block` into MDBX via the
+        /// active txn, then drop them. Entries with other tags stay pending.
         pub fn commitBlock(self: *Self, block: u64) !void {
             if (self.pending.count() == 0) return;
             const db = lmdbx.Database{ .txn = self.active_txn.*, .dbi = self.dbi };
@@ -158,13 +146,10 @@ pub fn MutableStore(comptime T: type) type {
             for (to_remove.items) |k| _ = self.pending.remove(k);
         }
 
-        /// Drop the entire overlay. Reorg recovery uses this — the live loop
-        /// then re-dispatches every block in the fresh pending file from
-        /// oldest to newest, repopulating the overlay from the canonical
-        /// chain. Per-block partial discard is intentionally not exposed:
-        /// the single-value overlay loses pre-fork values when the same key
-        /// is written across multiple pending blocks, so partial discard is
-        /// unsafe.
+        /// Drop the entire overlay. Used on reorg — the caller re-dispatches
+        /// every block in the fresh pending file. Partial discard is not
+        /// exposed because the single-value-per-key overlay loses pre-fork
+        /// state for keys written across multiple pending blocks.
         pub fn discardAll(self: *Self) void {
             self.pending.clearRetainingCapacity();
         }

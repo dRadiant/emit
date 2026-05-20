@@ -28,9 +28,8 @@ pub const FINALITY_DEPTH = pending_format.FINALITY_DEPTH;
 const HASH_SIZE = pending_format.HASH_SIZE;
 const FIXED_ENTRY_SIZE = pending_format.FIXED_ENTRY_SIZE;
 
-/// Engine-side entry: same shape as `core.pending_format.Entry` but owns its
-/// `lz4_entry` bytes (the engine is the writer; the format's read view is
-/// non-owning). Layout constants live in `core.pending_format`.
+/// Same shape as `core.pending_format.Entry` but owns `lz4_entry` —
+/// the engine writes and frees these bytes.
 pub const Entry = struct {
     block_number: u64,
     hash: [HASH_SIZE]u8,
@@ -195,9 +194,8 @@ pub const PendingRing = struct {
         try self.dir.rename("pending.bin.tmp", "pending.bin");
     }
 
-    /// Load entries from pending.bin on startup. Routes parsing through
-    /// `core.pending_format` so the engine writer and SDK reader cannot
-    /// drift on byte layout.
+    /// Load pending.bin on startup via `core.pending_format.parse`, then
+    /// dupe each `lz4_entry` into ring-owned memory.
     fn load(self: *PendingRing) !void {
         const file = try self.dir.openFile("pending.bin", .{});
         defer file.close();

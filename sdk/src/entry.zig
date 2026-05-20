@@ -50,29 +50,18 @@ pub const CANONICAL_MULTICALL3: [20]u8 = .{
     0x02, 0x88, 0x62, 0xbe, 0x2a, 0x17, 0x39, 0x76, 0xca, 0x11,
 };
 
-/// Reserved DBI name in the entity env. Holds SDK-internal bookkeeping keys
-/// (currently just `cursor`). The `_` prefix is unreachable by the
-/// `entityFieldName` derivation (which lowercases an alphabetic first byte),
-/// so user entity types cannot collide.
+/// Reserved DBI for SDK-internal bookkeeping. The `_` prefix can't
+/// collide with `entityFieldName`-derived names (which start lowercase).
 const META_DBI: [*:0]const u8 = "_meta";
-
-/// Key inside `_meta` holding an 8-byte BE u64 — the last block whose
-/// dispatch was fully committed to MDBX. Atomic with the entity-store
-/// commit that produced it, so `cursor` and entity state are never out of
-/// sync across crashes.
 const CURSOR_KEY: []const u8 = "cursor";
 
-/// Open the `_meta` DBI under an open write txn. Creates the DBI on first
-/// touch; cheap to call on every init.
 fn openMetaDbi(txn: lmdbx.Transaction) !lmdbx.Database.DBI {
     const db = try lmdbx.Database.open(txn, META_DBI, .{ .create = true });
     return db.dbi;
 }
 
-/// Read the cursor from `_meta` under `txn`. Opens the DBI without
-/// `.create`, so a read-only txn works; a missing DBI (fresh env, before
-/// any commit) degrades to 0. Same fate for an absent `cursor` key or a
-/// malformed payload — all caller-safe defaults.
+/// Returns 0 when the DBI doesn't exist (fresh env), the key is absent,
+/// or the payload is malformed. Works in a read-only txn.
 fn readCursorIn(txn: lmdbx.Transaction) !u64 {
     const db = lmdbx.Database.open(txn, META_DBI, .{}) catch return 0;
     const data = (try db.get(CURSOR_KEY)) orelse return 0;
@@ -80,7 +69,6 @@ fn readCursorIn(txn: lmdbx.Transaction) !u64 {
     return std.mem.readInt(u64, data[0..8], .big);
 }
 
-/// Write the cursor into `_meta` under `txn`. The caller commits.
 fn writeCursorIn(txn: lmdbx.Transaction, dbi: lmdbx.Database.DBI, block: u64) !void {
     var buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &buf, block, .big);
@@ -149,13 +137,10 @@ pub fn Context(comptime entities: anytype) type {
         /// runs without prefetch declared — every `ethCall` then returns
         /// `error.NotPrefetched`, matching the strict-mode semantics.
         _cache: ?*ethcall.Cache = null,
-        /// Reserved `_meta` DBI in the entity env; holds the resume cursor.
         _meta_dbi: lmdbx.Database.DBI = 0,
-        /// Highest block whose every log has been dispatched. Updated by
-        /// `scanner.replay` at every block boundary (never mid-block) and
-        /// by the live loop's finalization path. `commitCycle` writes this
-        /// value into `_meta.cursor` inside the same txn as the entity
-        /// flush, so cursor and entity state are byte-atomic.
+        /// Highest fully-dispatched block. Updated at block boundaries.
+        /// `commitCycle` writes it into `_meta.cursor` inside the same
+        /// txn as the entity flush so cursor and state are byte-atomic.
         _last_dispatched_block: u64 = 0,
 
         /// Tear down: abort the open txn, deinit every entity store, close
@@ -175,12 +160,9 @@ pub fn Context(comptime entities: anytype) type {
             self._allocator.destroy(self);
         }
 
-        /// Flush every entity store to MDBX, write the resume cursor into
-        /// `_meta` inside the same txn, commit, open a new write txn.
-        /// Called by `scanner.replay` at every block boundary that crosses
-        /// the commit_interval threshold and once more from `init` after
-        /// replay completes. Cursor and entity state ride the same commit,
-        /// so a crash inside this call rolls back both together.
+        /// Flush stores, write the cursor, commit, open a fresh write txn.
+        /// Cursor and entity state ride the same commit — a crash inside
+        /// rolls both back together.
         pub fn commitCycle(self: *Self) !void {
             inline for (std.meta.fields(Stores)) |f| {
                 var s = &@field(self.stores, f.name);
@@ -287,8 +269,6 @@ pub fn init(
     };
     errdefer ctx._active_txn.abort() catch {};
 
-    // Open the cursor DBI before any store work so the very first commit
-    // cycle (in backfill) can write the cursor atomically with the flush.
     ctx._meta_dbi = try openMetaDbi(ctx._active_txn);
     ctx._last_dispatched_block = try readCursorIn(ctx._active_txn);
 
@@ -363,9 +343,7 @@ pub fn init(
         @field(ctx.stores, dbi_name) = try StoreT.open(allocator, &ctx._active_txn, dbi_name);
     }
 
-    // Phase 5: handler replay. `start_block` skips the range already covered
-    // by a prior run's cursor (zero on a fresh env, so the full filter env
-    // is walked).
+    // `start_block` skips the range a prior run already covered.
     const replay_result = try scanner.replay(
         filter_env,
         m,
@@ -1227,8 +1205,6 @@ test "handler-only re-run skips phases 1-3 and the cursor blocks re-dispatch" {
     defer ctx2.deinit();
     try testing.expect(ctx2.stats.phases_skipped);
     try testing.expectEqual(@as(u64, 0), ctx2.stats.filter_build_ns);
-    // Cursor recovered from `_meta.cursor`: block 100 is already finalized
-    // in the entity env, so nothing is re-dispatched.
     try testing.expectEqual(@as(u64, 100), ctx2._last_dispatched_block);
     try testing.expectEqual(@as(u64, 0), ctx2.stats.logs_dispatched);
 }

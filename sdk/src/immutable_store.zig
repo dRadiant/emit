@@ -1,32 +1,21 @@
-/// ImmutableStore(T): comptime-generated MDBX writer for immutable
-/// entities (event records, audit logs).
+/// ImmutableStore(T): MDBX-backed append-only entity store via `MDBX_APPEND`
+/// (sequential insert, no B-tree traversal). `load` is a `@compileError` so
+/// a MutableStore/ImmutableStore mixup fails at compile time.
 ///
-/// Writes use `MDBX_APPEND` (sequential insert, no B-tree traversal,
-/// ~5x faster than upsert). `load` is a `@compileError`. The API exists
-/// so a typo on a MutableStore-vs-ImmutableStore choice fails at compile
-/// time, not at runtime.
+/// Keys are big-endian so MDBX byte order matches numeric order. Fixed-size
+/// arrays pass through unchanged.
 ///
-/// Key encoding is big-endian for integer fields so MDBX byte order
-/// matches numeric order. Fixed-size arrays pass through unchanged:
-/// callers construct their primary keys (event IDs, addresses) with the
-/// byte layout they want.
-///
-/// In live mode (`live = true`), saves are appended to a per-block buffer
-/// instead of going directly to MDBX. Events can't shadow each other, so
-/// the buffer is keyed by block number and each block holds its own list.
-/// Finalization (`commitBlock`) drains a block's list into MDBX via
-/// `MDBX_APPEND`; reorg recovery (`discardAll`) drops the entire overlay
-/// and the live loop re-dispatches the canonical pending entries.
+/// In live mode, saves accumulate in a per-block buffer; `commitBlock` drains
+/// one block's list via `MDBX_APPEND`; `discardAll` drops everything on reorg.
 const std = @import("std");
 
 const lmdbx = @import("lmdbx");
 
 const entity_serial = @import("entity_serial.zig");
 
-/// SDK-stable error for an out-of-order save. Decoupled from lmdbx-zig's
-/// MDBX_EKEYMISMATCH so wrapper or upstream renames don't leak. `OutOfMemory`
-/// surfaces only from the live-mode per-block buffer's HashMap/ArrayList
-/// growth; backfill saves never allocate.
+/// Stable error for an out-of-order save. Decoupled from lmdbx-zig's
+/// MDBX_EKEYMISMATCH so wrapper renames don't leak. `OutOfMemory` only
+/// surfaces from live-mode buffer growth.
 pub const AppendError = error{ KeyOutOfOrder, OutOfMemory } || lmdbx.Error;
 
 pub fn ImmutableStore(comptime T: type) type {
@@ -48,12 +37,9 @@ pub fn ImmutableStore(comptime T: type) type {
         /// boundaries; the store reads through the pointer at every save.
         active_txn: *const lmdbx.Transaction,
 
-        // ── Live-mode state ────────────────────────────────────────────
-        // `pending` keys are block numbers; values are append buffers for
-        // events emitted while that block was pre-finality. Zero-initialized
-        // so backfill never allocates backing storage. The live loop sets
-        // `live = true` once and updates `live_block` before each block's
-        // dispatch.
+        // Live-mode per-block buffer. `pending` is zero-init so backfill
+        // never allocates. Keyed by block number; events can't shadow
+        // each other so each block holds its own list.
         allocator: std.mem.Allocator,
         live: bool = false,
         live_block: u64 = 0,
@@ -98,9 +84,8 @@ pub fn ImmutableStore(comptime T: type) type {
 
         pub fn flush(_: *Self) !void {}
 
-        /// Live-mode finalization: append every buffered entry for `block`
-        /// via `MDBX_APPEND` on the active txn, then drop the block's
-        /// buffer. No-op when no buffer exists for `block`.
+        /// Append every buffered entry for `block` via `MDBX_APPEND`, then
+        /// drop the block's buffer. No-op when nothing is buffered for `block`.
         pub fn commitBlock(self: *Self, block: u64) AppendError!void {
             const removed = self.pending.fetchRemove(block) orelse return;
             var entities = removed.value;
@@ -118,16 +103,14 @@ pub fn ImmutableStore(comptime T: type) type {
             }
         }
 
-        /// Drop the entire overlay. Reorg recovery uses this — the live loop
-        /// then re-dispatches every block in the fresh pending file, which
-        /// re-builds the per-block buffers from the canonical chain.
+        /// Drop the entire overlay. Used on reorg.
         pub fn discardAll(self: *Self) void {
             var it = self.pending.iterator();
             while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
             self.pending.clearRetainingCapacity();
         }
 
-        /// Total entries across every block buffer. For test assertions.
+        /// Total entries across every per-block buffer.
         pub fn pendingCount(self: *const Self) u32 {
             var total: u32 = 0;
             var it = self.pending.iterator();
