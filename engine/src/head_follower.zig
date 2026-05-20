@@ -21,7 +21,16 @@ pub const FollowConfig = struct {
     ws_url: ?[]const u8 = null,
     data_dir: []const u8,
     poll_interval_ms: u64 = 1000,
+    /// Accept a multi-hour RPC catch-up if the baseline is more than
+    /// `GAP_REFUSE_THRESHOLD` blocks behind chain tip. Default refuses
+    /// loud and points the operator at `import --rocksdb`.
+    allow_rpc_catchup: bool = false,
 };
+
+/// Block count above which the engine refuses an RPC-only catch-up on
+/// `follow` start. 1000 blocks ≈ 3.3 hours via serial `eth_getLogs`;
+/// past that, `rocksdb-import` is the right tool (~30 s at this scale).
+const GAP_REFUSE_THRESHOLD: u64 = 1000;
 
 pub fn run(config: FollowConfig) !void {
     const alloc = std.heap.page_allocator;
@@ -36,6 +45,31 @@ pub fn run(config: FollowConfig) !void {
         writer.commitMeta() catch {};
         ring.flush() catch {};
         ring.deinit();
+    }
+
+    // Refuse follow against a stale baseline. The check uses the highest
+    // known block — pending tip if any, else the last finalized — and
+    // compares to current chain tip. Skipped when the dir is fresh
+    // (baseline = 0) or when the operator opts in to RPC catch-up.
+    const baseline: u64 = if (ring.latestBlock()) |t| t else writer.meta.last_finalized_block;
+    if (baseline > 0 and !config.allow_rpc_catchup) {
+        const tip = try provider.getBlockNumber();
+        const gap: u64 = if (tip > baseline) tip - baseline else 0;
+        if (gap > GAP_REFUSE_THRESHOLD) {
+            std.debug.print(
+                \\
+                \\Refusing follow: flat store ends at block {d}, chain is at {d}
+                \\(gap of {d} blocks, ~{d}h via RPC). The fast path is:
+                \\
+                \\  emit-engine import --rocksdb <node_db_path> --data-dir {s}
+                \\
+                \\Then re-run follow. Or pass --catch-up-rpc to accept the wait.
+                \\
+            ,
+                .{ baseline, tip, gap, gap * 12 / 3600, config.data_dir },
+            );
+            return error.StaleBaselineGap;
+        }
     }
 
     if (config.ws_url) |ws_url| ws: {

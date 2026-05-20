@@ -31,6 +31,7 @@ pub fn main() !void {
             .rpc_url = rpc_url,
             .ws_url = getFlag(args, "--ws"),
             .data_dir = data_dir,
+            .allow_rpc_catchup = hasFlag(args, "--catch-up-rpc"),
         });
     }
 
@@ -97,6 +98,11 @@ fn getFlag(args: []const [:0]u8, flag: []const u8) ?[]const u8 {
     return null;
 }
 
+fn hasFlag(args: []const [:0]u8, flag: []const u8) bool {
+    for (args) |arg| if (std.mem.eql(u8, arg, flag)) return true;
+    return false;
+}
+
 fn usage() void {
     std.debug.print(
         \\Usage: emit-engine <command> [options]
@@ -104,7 +110,8 @@ fn usage() void {
         \\Commands:
         \\  import --rocksdb <path> --data-dir <path>   Bulk import from Nethermind
         \\  import --rpc <url> --data-dir <path>        Import via eth_getLogs
-        \\  follow --rpc <url> [--ws <url>] --data-dir <path>  Follow chain head
+        \\  follow --rpc <url> [--ws <url>] --data-dir <path> [--catch-up-rpc]
+        \\                                              Follow chain head
         \\  status --data-dir <path>                    Print store status
         \\
     , .{});
