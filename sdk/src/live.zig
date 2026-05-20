@@ -619,6 +619,121 @@ test "tick dispatches a pending block ingested by FakeEngine" {
     try testing.expectEqual(@as(u64, 100), runner._last_dispatched_block);
 }
 
+test "tick routes saves through the per-block overlay, not MDBX" {
+    const lmdbx = @import("lmdbx");
+    const root = @import("root.zig");
+    const mutable_store = @import("mutable_store.zig");
+    const entity_serial = @import("entity_serial.zig");
+
+    const Account = struct {
+        pub const storage: root.StorageMode = .mutable;
+        id: [20]u8,
+        balance: u64,
+    };
+
+    const OverlayHandler = struct {
+        pub fn handleTransfer(log: handler_mod.Log(TestTransfer), ctx: anytype) !void {
+            const to = log.topics[2][12..32].*;
+            const value: u64 = std.mem.readInt(u64, log.data[24..32], .big);
+            var receiver = try ctx.stores.accounts.loadOrInit(to);
+            receiver.balance +%= value;
+            try ctx.stores.accounts.save(receiver);
+        }
+    };
+
+    const Manifest: sdk_manifest.Manifest = .{
+        .name = "overlay",
+        .chain_id = 1,
+        .start_block = 0,
+        .contracts = &.{.{ .name = "T", .address = TEST_CONTRACT, .events = &.{TestTransfer} }},
+    };
+
+    const TestStores = struct { accounts: mutable_store.MutableStore(Account) };
+    const TestCtx = struct {
+        _allocator: std.mem.Allocator,
+        _env: lmdbx.Environment,
+        _active_txn: lmdbx.Transaction,
+        block_number: u64 = 0,
+        timestamp: u64 = 0,
+        stores: TestStores,
+        _last_dispatched_block: u64 = 0,
+    };
+
+    // Engine + SDK data dirs.
+    var engine_tmp = testing.tmpDir(.{});
+    defer engine_tmp.cleanup();
+    var fake = fake_engine.FakeEngine.init(engine_tmp.dir, testing.allocator);
+    defer fake.deinit();
+    var engine_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const engine_path = try engine_tmp.dir.realpath(".", &engine_path_buf);
+
+    var entity_tmp = testing.tmpDir(.{});
+    defer entity_tmp.cleanup();
+    var entity_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const entity_path = try entity_tmp.dir.realpathZ(".", &entity_path_buf);
+    var entity_path_z: [std.fs.max_path_bytes:0]u8 = undefined;
+    @memcpy(entity_path_z[0..entity_path.len], entity_path);
+    entity_path_z[entity_path.len] = 0;
+
+    const env = try lmdbx.Environment.init(@ptrCast(&entity_path_z), .{ .max_dbs = 4 });
+    defer env.deinit() catch {};
+
+    const ctx = try testing.allocator.create(TestCtx);
+    defer testing.allocator.destroy(ctx);
+    ctx.* = .{
+        ._allocator = testing.allocator,
+        ._env = env,
+        ._active_txn = try env.transaction(.{}),
+        .stores = undefined,
+    };
+    ctx.stores.accounts = try mutable_store.MutableStore(Account).open(testing.allocator, &ctx._active_txn, "accounts");
+    defer ctx.stores.accounts.deinit();
+    defer ctx._active_txn.abort() catch {};
+
+    enter(ctx);
+
+    var session = try LiveSession.init(testing.allocator, engine_path);
+    defer session.deinit();
+
+    // Three pending blocks, each crediting a different recipient.
+    const ALICE: [20]u8 = [_]u8{0xA1} ** 20;
+    const BOB: [20]u8 = [_]u8{0xB2} ** 20;
+    const CARL: [20]u8 = [_]u8{0xC3} ** 20;
+    var bufs: [3][32]u8 = undefined;
+    try fake.ingest(100, [_]u8{0xAA} ** 32, &.{makeTransferLog([_]u8{0} ** 20, ALICE, 100, &bufs[0])});
+    try fake.ingest(101, [_]u8{0xAA} ** 32, &.{makeTransferLog([_]u8{0} ** 20, BOB, 200, &bufs[1])});
+    try fake.ingest(102, [_]u8{0xAA} ** 32, &.{makeTransferLog([_]u8{0} ** 20, CARL, 300, &bufs[2])});
+
+    try session.tick(Manifest, OverlayHandler, ctx, 200);
+
+    // Overlay holds one entry per key, each tagged with its dispatch block.
+    try testing.expectEqual(@as(u32, 3), ctx.stores.accounts.pendingCount());
+
+    const alice_entry = ctx.stores.accounts.pending.get(ALICE).?;
+    try testing.expectEqual(@as(u64, 100), alice_entry.block);
+    try testing.expectEqual(@as(u64, 100), alice_entry.value.balance);
+
+    const bob_entry = ctx.stores.accounts.pending.get(BOB).?;
+    try testing.expectEqual(@as(u64, 101), bob_entry.block);
+    try testing.expectEqual(@as(u64, 200), bob_entry.value.balance);
+
+    const carl_entry = ctx.stores.accounts.pending.get(CARL).?;
+    try testing.expectEqual(@as(u64, 102), carl_entry.block);
+    try testing.expectEqual(@as(u64, 300), carl_entry.value.balance);
+
+    // MDBX is empty for every key — nothing was committed.
+    const db = lmdbx.Database{ .txn = ctx._active_txn, .dbi = ctx.stores.accounts.dbi };
+    inline for (.{ ALICE, BOB, CARL }) |addr| {
+        var key_buf: [20]u8 = undefined;
+        entity_serial.encodeKey([20]u8, addr, &key_buf);
+        try testing.expect((try db.get(&key_buf)) == null);
+    }
+
+    // `load` returns the overlay value (not MDBX).
+    const loaded = (try ctx.stores.accounts.load(ALICE)).?;
+    try testing.expectEqual(@as(u64, 100), loaded.balance);
+}
+
 test "tick is a no-op when pending is unchanged" {
     var engine_tmp = testing.tmpDir(.{});
     defer engine_tmp.cleanup();
