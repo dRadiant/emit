@@ -290,6 +290,88 @@ test "filterUncached drops entries already present in the cache" {
     try std.testing.expectEqualSlices(u8, &B, &remaining[0].target);
 }
 
+test "gatherOneBlock emits one Call per matching log per PrefetchCall" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const Sync = struct {
+        pub const signature = "Sync(uint112 reserve0, uint112 reserve1)";
+    };
+    const FACTORY: [20]u8 = [_]u8{0xF0} ** 20;
+    const PAIR: [20]u8 = [_]u8{0xC1} ** 20;
+
+    const m: sdk_manifest.Manifest = .{
+        .name = "uni",
+        .chain_id = 1,
+        .start_block = 0,
+        .factories = &.{.{
+            .name = "F",
+            .address = FACTORY,
+            .create_event = PairCreated,
+            .spawn_param = "pair",
+            .child_events = &.{Sync},
+        }},
+        .prefetch = &.{.{
+            .on_event = PairCreated,
+            .calls = &.{.{ .address = .{ .param = "pair" }, .method = "decimals()" }},
+        }},
+    };
+
+    // Plant one PairCreated log with the pair address in data[0..32].
+    const create_topic = sdk_manifest.eventTopic0(PairCreated);
+    var data: [32]u8 = std.mem.zeroes([32]u8);
+    @memcpy(data[12..32], &PAIR);
+    const log: RawLog = .{
+        .block_number = 100,
+        .tx_index = 0,
+        .log_index = 0,
+        .address = FACTORY,
+        .topic_count = 1,
+        .topics = .{ create_topic, [_]u8{0} ** 32, [_]u8{0} ** 32, [_]u8{0} ** 32 },
+        .data = &data,
+        .tx_hash = [_]u8{0xFE} ** 32,
+    };
+
+    const calls = try gatherOneBlock(arena, &.{log}, m);
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualSlices(u8, &PAIR, &calls[0].target);
+    const expected_sel = ethcall.selectorOf("decimals()");
+    try std.testing.expectEqualSlices(u8, &expected_sel, calls[0].calldata);
+}
+
+test "gatherOneBlock returns empty when no log matches a PrefetchDef" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const m: sdk_manifest.Manifest = .{
+        .name = "uni",
+        .chain_id = 1,
+        .start_block = 0,
+        .prefetch = &.{.{
+            .on_event = PairCreated,
+            .calls = &.{.{ .address = .{ .param = "pair" }, .method = "decimals()" }},
+        }},
+    };
+
+    // A Transfer log; topic0 doesn't match PairCreated.
+    const transfer_topic = sdk_manifest.eventTopic0(Transfer);
+    const log: RawLog = .{
+        .block_number = 100,
+        .tx_index = 0,
+        .log_index = 0,
+        .address = [_]u8{0xAA} ** 20,
+        .topic_count = 1,
+        .topics = .{ transfer_topic, [_]u8{0} ** 32, [_]u8{0} ** 32, [_]u8{0} ** 32 },
+        .data = &.{},
+        .tx_hash = [_]u8{0} ** 32,
+    };
+
+    const calls = try gatherOneBlock(arena, &.{log}, m);
+    try std.testing.expectEqual(@as(usize, 0), calls.len);
+}
+
 test "gatherDynamic returns empty for a manifest with no prefetch" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

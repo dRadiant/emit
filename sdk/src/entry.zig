@@ -360,7 +360,22 @@ pub fn init(
     ctx.stats.elapsed_ns = timer.read();
 
     if (options.follow) {
-        try live.run(m, Handler, ctx, .{ .engine_data_dir = options.engine_data_dir });
+        // Live-mode Multicall lives for the whole follow loop (never
+        // returns under normal operation), so the transport + provider +
+        // multicall sit on this stack frame and stay valid.
+        if (options.node_rpc) |rpc_url| {
+            var http = eth.http_transport.HttpTransport.init(allocator, rpc_url);
+            var provider = eth.provider.Provider.init(allocator, &http);
+            var mc = eth.multicall.Multicall.init(allocator, &provider, options.multicall_address);
+            defer mc.deinit();
+            try live.run(m, Handler, ctx, .{
+                .engine_data_dir = options.engine_data_dir,
+                .multicall = &mc,
+                .multicall_batch_size = options.multicall_batch_size,
+            });
+        } else {
+            try live.run(m, Handler, ctx, .{ .engine_data_dir = options.engine_data_dir });
+        }
         unreachable;
     }
     return ctx;

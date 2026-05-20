@@ -8,8 +8,12 @@ const builtin = @import("builtin");
 
 const core = @import("core");
 
+const eth = @import("eth");
+
+const ethcall = @import("ethcall.zig");
 const handler_mod = @import("handler.zig");
 const humanize = @import("humanize.zig");
+const prefetch = @import("prefetch.zig");
 const sdk_manifest = @import("manifest.zig");
 
 const flat_reader = core.flat_reader;
@@ -167,6 +171,11 @@ pub const RunOptions = struct {
     /// Maximum wait between inotify wakeups. On non-Linux hosts the stub
     /// sleeps for this duration before every tick.
     tick_timeout_ms: u32 = 500,
+    /// Optional Multicall3 pointer for per-block prefetch of factory
+    /// children. `null` keeps the live loop offline — handlers that hit
+    /// uncached `ethCall` get `error.NotPrefetched`.
+    multicall: ?*eth.multicall.Multicall = null,
+    multicall_batch_size: usize = ethcall.DEFAULT_BATCH_SIZE,
 };
 
 /// Resources that persist across ticks: the watcher, the last-seen
@@ -180,6 +189,11 @@ pub const LiveSession = struct {
     prev: PendingSnapshot,
     decompress_buf: []u8,
     log_buf: []core.RawLog,
+    /// Live Phase 4: when set, per-block prefetch issues Multicall3 batches
+    /// for factory events before child-event dispatch. Null leaves
+    /// uncached calls to surface as `error.NotPrefetched` in handlers.
+    multicall: ?*eth.multicall.Multicall = null,
+    multicall_batch_size: usize = ethcall.DEFAULT_BATCH_SIZE,
 
     pub fn init(allocator: std.mem.Allocator, engine_data_dir: []const u8) !LiveSession {
         var watcher = try Watcher.init(engine_data_dir);
@@ -247,12 +261,12 @@ pub const LiveSession = struct {
             // re-applying mutations against an empty overlay is idempotent.
             for (curr.entries) |entry| {
                 setLiveBlock(ctx, entry.block_number);
-                try dispatchBlock(m, Handler, ctx, entry, self.decompress_buf, self.log_buf);
+                try dispatchBlock(m, Handler, ctx, entry, self.decompress_buf, self.log_buf, self.multicall, self.multicall_batch_size);
             }
         } else {
             for (classification.new_blocks) |entry| {
                 setLiveBlock(ctx, entry.block_number);
-                try dispatchBlock(m, Handler, ctx, entry, self.decompress_buf, self.log_buf);
+                try dispatchBlock(m, Handler, ctx, entry, self.decompress_buf, self.log_buf, self.multicall, self.multicall_batch_size);
             }
         }
 
@@ -296,6 +310,8 @@ pub fn run(
 
     var session = try LiveSession.init(ctx._allocator, options.engine_data_dir);
     defer session.deinit();
+    session.multicall = options.multicall;
+    session.multicall_batch_size = options.multicall_batch_size;
 
     while (true) {
         try session.tick(m, Handler, ctx, options.tick_timeout_ms);
@@ -340,22 +356,63 @@ fn dispatchBlock(
     entry: Entry,
     decompress_buf: []u8,
     log_buf: []core.RawLog,
+    multicall: ?*eth.multicall.Multicall,
+    multicall_batch_size: usize,
 ) !void {
     const decoded = try log_serial.decompressEntry(entry.lz4_entry, decompress_buf);
     const log_count = log_serial.deserializeLogs(decoded, log_buf);
 
+    for (log_buf[0..log_count]) |*log| {
+        log.block_number = entry.block_number;
+    }
+
+    // Live Phase 4: gather + preload prefetch calls for this block before
+    // handler dispatch so child-event handlers hit warm cache.
+    try maybePrefetchBlock(m, ctx, log_buf[0..log_count], multicall, multicall_batch_size);
+
     ctx.block_number = entry.block_number;
     ctx.timestamp = humanize.blockTimestamp(entry.block_number);
 
-    for (log_buf[0..log_count]) |*log| {
-        log.block_number = entry.block_number;
-        try handler_mod.dispatchLog(m, Handler, ctx, log.*);
+    for (log_buf[0..log_count]) |log| {
+        try handler_mod.dispatchLog(m, Handler, ctx, log);
     }
 
     // `_last_dispatched_block` is the MDBX cursor write-back, not the
     // dispatch HWM — live-mode saves land in the overlay, so dispatch
     // itself can't advance the durable cursor. `promoteFinalized` sets
     // it when a block actually commits.
+}
+
+/// Live Phase 4: gather → dedupe → filterUncached → preload (when RPC
+/// available). Skips when the manifest declares no prefetch, when the
+/// ctx has no cache (counter-shaped tests), or when the block has no
+/// matching factory events. Missing entries surface as
+/// `error.NotPrefetched` in handlers when multicall isn't configured.
+fn maybePrefetchBlock(
+    comptime m: sdk_manifest.Manifest,
+    ctx: anytype,
+    logs: []const core.RawLog,
+    multicall: ?*eth.multicall.Multicall,
+    multicall_batch_size: usize,
+) !void {
+    if (comptime m.prefetch.len == 0) return;
+    const T = std.meta.Child(@TypeOf(ctx));
+    if (comptime !@hasField(T, "_cache")) return;
+    const cache = ctx._cache orelse return;
+
+    var arena_state = std.heap.ArenaAllocator.init(ctx._allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const calls = try prefetch.gatherOneBlock(arena, logs, m);
+    if (calls.len == 0) return;
+
+    const unique = try prefetch.dedupe(arena, calls);
+    const missing = try prefetch.filterUncached(arena, cache, unique);
+    if (missing.len == 0) return;
+
+    const mc = multicall orelse return;
+    try cache.preload(ctx._allocator, mc, missing, multicall_batch_size);
 }
 
 // ── Watcher: inotify on the engine data dir ──────────────────────────────
@@ -842,6 +899,100 @@ test "reorg below the cursor raises ReorgExceedsFinalityDepth" {
         error.ReorgExceedsFinalityDepth,
         session.tick(TestManifest, TestRunner, &runner, 200),
     );
+}
+
+test "live prefetch hits warm cache, issues no Multicall" {
+    // Group 11: a pending block carrying a PairCreated factory event runs
+    // through `maybePrefetchBlock`. With the cache pre-warmed for the
+    // expected decimals() call, filterUncached returns empty and no
+    // Multicall round-trip is attempted — proven by passing
+    // `multicall = null` (any attempt would have been a null deref).
+    var engine_tmp = testing.tmpDir(.{});
+    defer engine_tmp.cleanup();
+    var fake = fake_engine.FakeEngine.init(engine_tmp.dir, testing.allocator);
+    defer fake.deinit();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const engine_path = try engine_tmp.dir.realpath(".", &path_buf);
+
+    var cache_tmp = testing.tmpDir(.{});
+    defer cache_tmp.cleanup();
+    var cache_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cache_path = try cache_tmp.dir.realpathZ(".", &cache_path_buf);
+    var cache_path_z: [std.fs.max_path_bytes:0]u8 = undefined;
+    @memcpy(cache_path_z[0..cache_path.len], cache_path);
+    cache_path_z[cache_path.len] = 0;
+
+    var cache = try ethcall.Cache.open(@ptrCast(&cache_path_z));
+    defer cache.close();
+
+    const PairCreated = struct {
+        pub const signature = "PairCreated(address indexed token0, address indexed token1, address pair, uint256 allPairsLength)";
+    };
+    const FACTORY: [20]u8 = [_]u8{0xF0} ** 20;
+    const PAIR: [20]u8 = [_]u8{0xC1} ** 20;
+
+    // Warm the cache with the decimals() result the prefetch would fetch.
+    const sel = ethcall.selectorOf("decimals()");
+    var payload: [32]u8 = std.mem.zeroes([32]u8);
+    payload[31] = 18;
+    try cache.put(testing.allocator, PAIR, &sel, 0, &payload);
+
+    const Manifest: sdk_manifest.Manifest = .{
+        .name = "uni",
+        .chain_id = 1,
+        .start_block = 0,
+        .factories = &.{.{
+            .name = "F",
+            .address = FACTORY,
+            .create_event = PairCreated,
+            .spawn_param = "pair",
+            .child_events = &.{},
+        }},
+        .prefetch = &.{.{
+            .on_event = PairCreated,
+            .calls = &.{.{ .address = .{ .param = "pair" }, .method = "decimals()" }},
+        }},
+    };
+
+    const PrefetchRunner = struct {
+        _allocator: std.mem.Allocator,
+        _cache: ?*ethcall.Cache,
+        block_number: u64 = 0,
+        timestamp: u64 = 0,
+        _last_dispatched_block: u64 = 0,
+        creates: u32 = 0,
+
+        pub fn handlePairCreated(_: handler_mod.Log(PairCreated), self: *@This()) !void {
+            self.creates += 1;
+        }
+    };
+
+    var runner = PrefetchRunner{ ._allocator = testing.allocator, ._cache = &cache };
+
+    var session = try LiveSession.init(testing.allocator, engine_path);
+    defer session.deinit();
+    // session.multicall stays null — the warm cache must satisfy every
+    // prefetch call. A miss would surface here.
+
+    // Plant a PairCreated log with the pair address in data[0..32].
+    var data: [32]u8 = std.mem.zeroes([32]u8);
+    @memcpy(data[12..32], &PAIR);
+    const create_topic = sdk_manifest.eventTopic0(PairCreated);
+    const log: core.RawLog = .{
+        .block_number = 100,
+        .tx_index = 0,
+        .log_index = 0,
+        .address = FACTORY,
+        .topic_count = 1,
+        .topics = .{ create_topic, [_]u8{0} ** 32, [_]u8{0} ** 32, [_]u8{0} ** 32 },
+        .data = &data,
+        .tx_hash = [_]u8{0xFE} ** 32,
+    };
+    try fake.ingest(100, [_]u8{0xAA} ** 32, &.{log});
+
+    try session.tick(Manifest, PrefetchRunner, &runner, 200);
+
+    try testing.expectEqual(@as(u32, 1), runner.creates);
 }
 
 test "finalized blocks promote to MDBX and advance the cursor" {
