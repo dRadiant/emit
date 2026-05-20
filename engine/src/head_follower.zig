@@ -77,20 +77,29 @@ fn followWs(
         defer alloc.free(msg);
         const block_number = parseBlockNumber(msg) orelse continue;
 
-        // Defensive gap-fill: WS can drop messages (NAT, provider hiccup) and
-        // recovery loops can leave a partial ring after RPC failure or process
-        // restart. `followPoll` does this naturally via tip+1..latest; mirror
-        // that here so a non-dense ring cannot silently propagate into the
-        // flat store. Each gap block goes through the full `ingestBlock` so
-        // its own reorg check still runs.
         if (ring.latestBlock()) |tip| {
+            // Stale or duplicate WS message — providers occasionally
+            // re-broadcast. The dense-ring invariant in pending_ring.getHash
+            // breaks if we append a block we already have, so skip.
+            if (block_number <= tip) continue;
+
+            // Defensive gap-fill: WS can drop messages (NAT, provider
+            // hiccup) and recovery loops can leave a partial ring after
+            // RPC failure or process restart. `followPoll` does this
+            // naturally via tip+1..latest; mirror that here. If any gap
+            // block fails to ingest, abort the whole WS message — the
+            // next notification retries from the current tip. Partial
+            // gap-fill would leave pending non-dense and break getHash.
             var bn = tip + 1;
+            var gap_ok = true;
             while (bn < block_number) : (bn += 1) {
                 ingestBlock(bn, provider, ring, alloc) catch |err| {
-                    std.debug.print("Block {d}: {s}\n", .{ bn, @errorName(err) });
+                    std.debug.print("Gap-fill block {d}: {s}\n", .{ bn, @errorName(err) });
+                    gap_ok = false;
                     break;
                 };
             }
+            if (!gap_ok) continue;
         }
 
         ingestBlock(block_number, provider, ring, alloc) catch |err| {
@@ -185,9 +194,17 @@ fn ingestBlockCore(
     const hex = try std.fmt.bufPrint(&num_buf, "0x{x}", .{block_number});
     const eth_logs = try provider.getLogs(.{ .fromBlock = hex, .toBlock = hex });
 
-    const count = @min(eth_logs.len, types.MAX_LOGS_PER_BLOCK);
-    const raw_logs = try alloc.alloc(types.RawLog, count);
-    for (eth_logs[0..count], 0..) |log, i| {
+    // Fail loud per the contract in core/src/types.zig — a silent truncate
+    // would land an incomplete block in pending + flat store.
+    if (eth_logs.len > types.MAX_LOGS_PER_BLOCK) {
+        std.debug.print(
+            "Block {d}: {d} logs exceeds MAX_LOGS_PER_BLOCK ({d}). Bump the constant in core/src/types.zig.\n",
+            .{ block_number, eth_logs.len, types.MAX_LOGS_PER_BLOCK },
+        );
+        return error.TooManyLogsInBlock;
+    }
+    const raw_logs = try alloc.alloc(types.RawLog, eth_logs.len);
+    for (eth_logs, 0..) |log, i| {
         raw_logs[i] = toRawLog(log, block_number, alloc);
     }
 
@@ -201,7 +218,7 @@ fn ingestBlockCore(
     const entry_len = try log_serial.compressEntry(serialize_buf[0..serialized_len], compress_buf);
 
     try ring.insert(block_number, header.hash, &topic_bloom.bits, &addr_bloom.bits, compress_buf[0..entry_len]);
-    std.debug.print("Block {d}: {d} logs\n", .{ block_number, count });
+    std.debug.print("Block {d}: {d} logs\n", .{ block_number, raw_logs.len });
 }
 
 /// Truncate divergent pending entries down to the fork point and return it,

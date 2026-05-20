@@ -120,6 +120,7 @@ pub const FlatStoreReader = struct {
 
     /// Get (offset, length) for a block in blocks.dat. Used by io_uring pipeline.
     pub fn getBlockLoc(self: *const FlatStoreReader, block_number: u64) !BlockLoc {
+        if (block_number < self.first_block) return error.BlockNotFound;
         const idx = block_number - self.first_block;
         if (idx >= self.index_count) return error.BlockNotFound;
         const entry_offset = INDEX_HEADER_SIZE + idx * INDEX_ENTRY_SIZE;
@@ -284,6 +285,10 @@ test "getBlockLoc from in-memory index" {
     try std.testing.expectEqual(@as(u32, 6), loc1.length);
 
     try std.testing.expectError(error.BlockNotFound, reader.getBlockLoc(999));
+    // Below-first-block: would underflow `block_number - first_block` if
+    // the guard were missing. Must surface as BlockNotFound, not panic.
+    try std.testing.expectError(error.BlockNotFound, reader.getBlockLoc(99));
+    try std.testing.expectError(error.BlockNotFound, reader.getBlockLoc(0));
 }
 
 test "readBlock via tmpfile" {

@@ -84,6 +84,11 @@ pub const FlatStoreWriter = struct {
             _ = try self.index_file.pwrite(&hdr, 0);
         }
 
+        // Reject below-first-block appends — index uses block_number -
+        // first_block as the dense slot; an unsigned underflow here would
+        // silently scribble somewhere far past the file end.
+        if (block_number < self.first_block) return error.BlockBeforeFirst;
+
         // Append to blocks.dat
         const offset = self.meta.blocks_dat_size;
         _ = try self.blocks_file.pwrite(lz4_entry, offset);
@@ -191,6 +196,23 @@ test "write blocks then read back via core reader" {
     const data2 = try reader.readBlock(101, &buf);
     try std.testing.expectEqual(@as(usize, 6), data2.len);
     try std.testing.expectEqual(@as(u8, 0xDD), data2[4]);
+}
+
+test "appendBlock rejects block_number below first_block" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var writer = openFromDir(tmp.dir);
+    defer closeFilesOnly(&writer);
+
+    const entry = [_]u8{ 1, 0, 0, 0, 0x42 };
+    var topic = [_]u8{0} ** bloom.BLOOM_SIZE;
+    var addr = [_]u8{0} ** bloom.ADDR_BLOOM_SIZE;
+
+    // First write sets first_block = 100.
+    try writer.appendBlock(100, &entry, &topic, &addr);
+    // Below first_block: would underflow `block_number - first_block` and
+    // scribble somewhere far past the file end without the guard.
+    try std.testing.expectError(error.BlockBeforeFirst, writer.appendBlock(99, &entry, &topic, &addr));
 }
 
 test "meta persists across reopen" {

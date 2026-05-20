@@ -116,8 +116,7 @@ pub const RunStats = struct {
 ///
 /// Underscore-prefixed fields are SDK internals — handlers should not read
 /// or mutate them. Public surface for handlers is `block_number`,
-/// `timestamp`, `stores`, `stats`, and the `ethCall` / `registerContract`
-/// methods.
+/// `timestamp`, `stores`, `stats`, and `ethCall`.
 /// `entities` may be either a tuple of entity types — `.{ Account, … }` —
 /// or the entities module itself, e.g. `@import("entities.zig")`. The
 /// module form scans `pub` decls for any struct declaring
@@ -194,12 +193,6 @@ pub fn Context(comptime entities: anytype) type {
             return ethcall.decodeAs(T, entry.bytes);
         }
 
-        /// Factory pre-pass discovers child addresses directly from logs,
-        /// so this is a stub for the full dynamic-registration API that
-        /// will arrive with head following.
-        pub fn registerContract(_: *Self, _: [20]u8) !void {
-            return error.NotYetImplemented;
-        }
     };
 }
 
