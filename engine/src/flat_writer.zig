@@ -46,12 +46,29 @@ pub const FlatStoreWriter = struct {
             }
         } else |_| {}
 
-        // Read first_block from index header
+        // Read first_block from index header, or pre-initialize empty
+        // headers so a `FlatStoreReader` can open this dir before the
+        // first block is finalized. Without this the SDK's `--follow`
+        // path fails with `error.InvalidIndex` when an engine has only
+        // been writing pending.bin (no finalizations yet, ~13 min cold
+        // start at 12 s/block × FINALITY_DEPTH = 64).
         {
             var hdr: [flat_reader.INDEX_HEADER_SIZE]u8 = undefined;
             const n = index_file.pread(&hdr, 0) catch 0;
             if (n == flat_reader.INDEX_HEADER_SIZE) {
                 first_block = std.mem.readInt(u64, hdr[0..8], .little);
+            } else if (n == 0) {
+                // Zero-init header: first_block placeholder=0, count=0.
+                // `appendBlock` rewrites the header on the first append.
+                @memset(&hdr, 0);
+                _ = try index_file.pwrite(&hdr, 0);
+            }
+        }
+        {
+            const blooms_size = (try blooms_file.stat()).size;
+            if (blooms_size == 0) {
+                var bhdr: [flat_reader.BLOOM_HEADER_SIZE]u8 = std.mem.zeroes([flat_reader.BLOOM_HEADER_SIZE]u8);
+                _ = try blooms_file.pwrite(&bhdr, 0);
             }
         }
 

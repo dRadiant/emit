@@ -119,8 +119,16 @@ pub fn replay(
     const txn = try env.transaction(.{ .mode = .ReadOnly });
     defer txn.abort() catch {};
 
-    var primary = try CursorWalker.open(txn, filter_builder.DBI_PRIMARY, options.start_block);
-    defer primary.deinit();
+    // PRIMARY may not exist when filter_builder.build matched zero blocks
+    // (e.g. a fresh `--follow` run before any historical match). Treat
+    // identically to the BLOCKS_CHILDREN absence: empty walker, no work.
+    var primary_storage: CursorWalker = undefined;
+    var primary: ?*CursorWalker = null;
+    if (CursorWalker.open(txn, filter_builder.DBI_PRIMARY, options.start_block)) |w| {
+        primary_storage = w;
+        primary = &primary_storage;
+    } else |_| {}
+    defer if (primary) |p| p.deinit();
 
     const has_children = comptime m.factories.len > 0;
     var children_storage: CursorWalker = undefined;
@@ -129,9 +137,7 @@ pub fn replay(
         if (CursorWalker.open(txn, filter_builder.DBI_CHILDREN, options.start_block)) |w| {
             children_storage = w;
             children = &children_storage;
-        } else |_| {
-            // BLOCKS_CHILDREN may not exist (no factory discoveries) — fine.
-        }
+        } else |_| {}
     }
     defer if (children) |c| c.deinit();
 
@@ -148,15 +154,15 @@ pub fn replay(
     defer if (has_children) allocator.free(log_buf_children);
 
     while (true) {
-        const next_p: ?u64 = primary.peek();
+        const next_p: ?u64 = if (primary) |p| p.peek() else null;
         const next_c: ?u64 = if (children) |c| c.peek() else null;
         if (next_p == null and next_c == null) break;
 
         const block_number = pickMin(next_p, next_c);
 
         var merge_count: usize = 0;
-        if (next_p) |bn| if (bn == block_number) {
-            const logs = try primary.consume(block_number, decompress_primary, log_buf_primary);
+        if (primary) |p| if (next_p) |bn| if (bn == block_number) {
+            const logs = try p.consume(block_number, decompress_primary, log_buf_primary);
             for (logs) |log| {
                 merge_buf[merge_count] = log;
                 merge_count += 1;
