@@ -19,6 +19,7 @@ const lmdbx = @import("lmdbx");
 const eth = @import("eth");
 const ethcall = @import("ethcall.zig");
 const filter_builder = @import("filter_builder.zig");
+const live = @import("live.zig");
 const prefetch = @import("prefetch.zig");
 const root = @import("root.zig");
 const scanner = @import("scanner.zig");
@@ -43,6 +44,9 @@ pub const Options = struct {
     /// for chains without the canonical deployment.
     multicall_address: [20]u8 = CANONICAL_MULTICALL3,
     multicall_batch_size: usize = ethcall.DEFAULT_BATCH_SIZE,
+    /// When true, `run` and `init` block after backfill and enter the
+    /// live head-following loop; `init` never returns.
+    follow: bool = false,
 };
 
 pub const CANONICAL_MULTICALL3: [20]u8 = .{
@@ -361,6 +365,11 @@ pub fn init(
     // Final commit so any logs since the last commit boundary land.
     try ctx.commitCycle();
     ctx.stats.elapsed_ns = timer.read();
+
+    if (options.follow) {
+        try live.run(m, Handler, ctx, .{ .engine_data_dir = options.engine_data_dir });
+        unreachable;
+    }
     return ctx;
 }
 

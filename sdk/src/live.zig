@@ -8,8 +8,14 @@ const builtin = @import("builtin");
 
 const core = @import("core");
 
+const handler_mod = @import("handler.zig");
+const humanize = @import("humanize.zig");
+const sdk_manifest = @import("manifest.zig");
+
 const flat_reader = core.flat_reader;
+const log_serial = core.log_serial;
 const pending_format = core.pending_format;
+const types = core.types;
 
 /// Linux-only: `Watcher` falls back to a sleep-based stub elsewhere.
 pub const inotify_supported = builtin.target.os.tag == .linux;
@@ -152,6 +158,135 @@ pub fn classifyChanges(
         .finalized = try finalized.toOwnedSlice(allocator),
         .reorged_out = try reorged_out.toOwnedSlice(allocator),
     };
+}
+
+// ── Live session ─────────────────────────────────────────────────────────
+
+pub const RunOptions = struct {
+    engine_data_dir: []const u8,
+    /// Maximum wait between inotify wakeups. On non-Linux hosts the stub
+    /// sleeps for this duration before every tick.
+    tick_timeout_ms: u32 = 500,
+};
+
+/// Resources that persist across ticks: the watcher, the last-seen
+/// pending snapshot, and the per-block decompress + log buffers. Held
+/// here so `tick` doesn't reallocate per call. `run` constructs one
+/// session and loops; tests drive `tick` directly.
+pub const LiveSession = struct {
+    allocator: std.mem.Allocator,
+    engine_data_dir: []const u8,
+    watcher: Watcher,
+    prev: PendingSnapshot,
+    decompress_buf: []u8,
+    log_buf: []core.RawLog,
+
+    pub fn init(allocator: std.mem.Allocator, engine_data_dir: []const u8) !LiveSession {
+        var watcher = try Watcher.init(engine_data_dir);
+        errdefer watcher.deinit();
+
+        var prev = try readPending(allocator, engine_data_dir);
+        errdefer prev.deinit(allocator);
+
+        const decompress_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
+        errdefer allocator.free(decompress_buf);
+        const log_buf = try allocator.alloc(core.RawLog, types.MAX_LOGS_PER_BLOCK);
+        errdefer allocator.free(log_buf);
+
+        return .{
+            .allocator = allocator,
+            .engine_data_dir = engine_data_dir,
+            .watcher = watcher,
+            .prev = prev,
+            .decompress_buf = decompress_buf,
+            .log_buf = log_buf,
+        };
+    }
+
+    pub fn deinit(self: *LiveSession) void {
+        self.allocator.free(self.log_buf);
+        self.allocator.free(self.decompress_buf);
+        self.prev.deinit(self.allocator);
+        self.watcher.deinit();
+    }
+
+    /// One pass of the live loop: wait, classify, dispatch new blocks,
+    /// commit.
+    pub fn tick(
+        self: *LiveSession,
+        comptime m: sdk_manifest.Manifest,
+        comptime Handler: type,
+        ctx: anytype,
+        timeout_ms: u32,
+    ) !void {
+        try self.watcher.wait(timeout_ms);
+
+        var curr = try readPending(self.allocator, self.engine_data_dir);
+        errdefer curr.deinit(self.allocator);
+
+        const last_finalized = try readMeta(self.engine_data_dir);
+
+        var classification = try classifyChanges(
+            self.allocator,
+            self.prev.entries,
+            curr.entries,
+            last_finalized,
+        );
+        defer classification.deinit(self.allocator);
+
+        for (classification.new_blocks) |entry| {
+            try dispatchBlock(m, Handler, ctx, entry, self.decompress_buf, self.log_buf);
+        }
+
+        if (classification.new_blocks.len > 0) {
+            try ctx.commitCycle();
+        }
+
+        self.prev.deinit(self.allocator);
+        self.prev = curr;
+    }
+};
+
+/// Block forever, dispatching new pending blocks as they arrive.
+pub fn run(
+    comptime m: sdk_manifest.Manifest,
+    comptime Handler: type,
+    ctx: anytype,
+    options: RunOptions,
+) !void {
+    comptime handler_mod.dispatcherFor(m).validateHandler(Handler);
+
+    var session = try LiveSession.init(ctx._allocator, options.engine_data_dir);
+    defer session.deinit();
+
+    while (true) {
+        try session.tick(m, Handler, ctx, options.tick_timeout_ms);
+    }
+}
+
+fn dispatchBlock(
+    comptime m: sdk_manifest.Manifest,
+    comptime Handler: type,
+    ctx: anytype,
+    entry: Entry,
+    decompress_buf: []u8,
+    log_buf: []core.RawLog,
+) !void {
+    const decoded = try log_serial.decompressEntry(entry.lz4_entry, decompress_buf);
+    const log_count = log_serial.deserializeLogs(decoded, log_buf);
+
+    ctx.block_number = entry.block_number;
+    ctx.timestamp = humanize.blockTimestamp(entry.block_number);
+
+    for (log_buf[0..log_count]) |*log| {
+        log.block_number = entry.block_number;
+        try handler_mod.dispatchLog(m, Handler, ctx, log.*);
+    }
+
+    const T = std.meta.Child(@TypeOf(ctx));
+    if (comptime @hasField(T, "_last_dispatched_block")) {
+        ctx._last_dispatched_block = entry.block_number;
+    }
 }
 
 // ── Watcher: inotify on the engine data dir ──────────────────────────────
@@ -383,8 +518,118 @@ test "readPending: missing pending.bin returns empty snapshot" {
     try testing.expectEqual(@as(usize, 0), snap.entries.len);
 }
 
+// ── Live tick integration ────────────────────────────────────────────────
+
+const fake_engine = @import("fake_engine.zig");
+
+const TestTransfer = struct {
+    pub const signature = "Transfer(address,address,uint256)";
+};
+
+const TEST_CONTRACT: [20]u8 = [_]u8{0xAB} ** 20;
+
+const TestManifest: sdk_manifest.Manifest = .{
+    .name = "live-tick",
+    .chain_id = 1,
+    .start_block = 0,
+    .contracts = &.{.{ .name = "T", .address = TEST_CONTRACT, .events = &.{TestTransfer} }},
+};
+
+/// Counter-shaped ctx + handler: cheap stand-in for a real Context that
+/// still exercises the dispatch pipeline. `commitCycle` is a no-op since
+/// no MDBX writes are in flight.
+const TestRunner = struct {
+    _allocator: std.mem.Allocator,
+    block_number: u64 = 0,
+    timestamp: u64 = 0,
+    transfers: u32 = 0,
+    _last_dispatched_block: u64 = 0,
+    commits: u32 = 0,
+
+    pub fn handleTransfer(_: handler_mod.Log(TestTransfer), self: *TestRunner) !void {
+        self.transfers += 1;
+    }
+
+    pub fn commitCycle(self: *TestRunner) !void {
+        self.commits += 1;
+    }
+};
+
+fn makeTransferLog(from: [20]u8, to: [20]u8, value: u64, data_buf: *[32]u8) core.RawLog {
+    var from_topic: [32]u8 = std.mem.zeroes([32]u8);
+    @memcpy(from_topic[12..32], &from);
+    var to_topic: [32]u8 = std.mem.zeroes([32]u8);
+    @memcpy(to_topic[12..32], &to);
+    @memset(data_buf, 0);
+    std.mem.writeInt(u64, data_buf[24..32], value, .big);
+    return .{
+        .block_number = 0,
+        .tx_index = 0,
+        .log_index = 0,
+        .address = TEST_CONTRACT,
+        .topic_count = 3,
+        .topics = .{ sdk_manifest.eventTopic0(TestTransfer), from_topic, to_topic, [_]u8{0} ** 32 },
+        .data = data_buf,
+        .tx_hash = [_]u8{0xFE} ** 32,
+    };
+}
+
+test "tick dispatches a pending block ingested by FakeEngine" {
+    var engine_tmp = testing.tmpDir(.{});
+    defer engine_tmp.cleanup();
+    var fake = fake_engine.FakeEngine.init(engine_tmp.dir, testing.allocator);
+    defer fake.deinit();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const engine_path = try engine_tmp.dir.realpath(".", &path_buf);
+
+    // Session must initialize BEFORE the ingest so its `prev` snapshot
+    // starts empty — otherwise the planted block would already be in
+    // `prev` and the diff would report no new blocks.
+    var session = try LiveSession.init(testing.allocator, engine_path);
+    defer session.deinit();
+
+    const ALICE: [20]u8 = [_]u8{0xA1} ** 20;
+    var data_buf: [32]u8 = undefined;
+    const log = makeTransferLog([_]u8{0} ** 20, ALICE, 100, &data_buf);
+    try fake.ingest(100, [_]u8{0xAA} ** 32, &.{log});
+
+    var runner = TestRunner{ ._allocator = testing.allocator };
+    try session.tick(TestManifest, TestRunner, &runner, 200);
+
+    try testing.expectEqual(@as(u32, 1), runner.transfers);
+    try testing.expectEqual(@as(u64, 100), runner._last_dispatched_block);
+    try testing.expectEqual(@as(u32, 1), runner.commits);
+}
+
+test "tick is a no-op when pending is unchanged" {
+    var engine_tmp = testing.tmpDir(.{});
+    defer engine_tmp.cleanup();
+    var fake = fake_engine.FakeEngine.init(engine_tmp.dir, testing.allocator);
+    defer fake.deinit();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const engine_path = try engine_tmp.dir.realpath(".", &path_buf);
+
+    var session = try LiveSession.init(testing.allocator, engine_path);
+    defer session.deinit();
+
+    const ALICE: [20]u8 = [_]u8{0xA1} ** 20;
+    var data_buf: [32]u8 = undefined;
+    const log = makeTransferLog([_]u8{0} ** 20, ALICE, 100, &data_buf);
+    try fake.ingest(100, [_]u8{0xAA} ** 32, &.{log});
+
+    var runner = TestRunner{ ._allocator = testing.allocator };
+    try session.tick(TestManifest, TestRunner, &runner, 100);
+    try testing.expectEqual(@as(u32, 1), runner.transfers);
+    try testing.expectEqual(@as(u32, 1), runner.commits);
+
+    try session.tick(TestManifest, TestRunner, &runner, 100);
+    try testing.expectEqual(@as(u32, 1), runner.transfers);
+    try testing.expectEqual(@as(u32, 1), runner.commits);
+}
+
 test "readPending + readMeta against a FakeEngine snapshot" {
-    const fake_engine = @import("fake_engine.zig");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var fake = fake_engine.FakeEngine.init(tmp.dir, testing.allocator);
