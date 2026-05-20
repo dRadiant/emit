@@ -29,6 +29,41 @@ pub fn gatherStatic(
     return out;
 }
 
+/// Live-mode counterpart to `gatherDynamic`: walks the logs of a single
+/// pending block and emits one `Call` per `(matching log, declared
+/// PrefetchCall)`. The live loop calls this before child-event dispatch
+/// so factory children's metadata lands in the cache in time.
+pub fn gatherOneBlock(
+    arena: std.mem.Allocator,
+    logs: []const RawLog,
+    comptime m: sdk_manifest.Manifest,
+) ![]ethcall.Call {
+    if (comptime m.prefetch.len == 0) return &.{};
+
+    var out: std.ArrayList(ethcall.Call) = .empty;
+    for (logs) |*log| {
+        if (log.topic_count == 0) continue;
+        inline for (m.prefetch) |def| {
+            const on_topic = comptime sdk_manifest.eventTopic0(def.on_event);
+            if (std.mem.eql(u8, &log.topics[0], &on_topic)) {
+                inline for (def.calls) |pc| {
+                    const sel = comptime ethcall.selectorOf(pc.method);
+                    const addr = sdk_manifest.extractAddress(
+                        def.on_event,
+                        pc.address,
+                        log.address,
+                        &log.topics,
+                        log.data,
+                    );
+                    const calldata = try arena.dupe(u8, &sel);
+                    try out.append(arena, .{ .target = addr, .calldata = calldata });
+                }
+            }
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
 /// Walk the filtered index (`BLOCKS_PRIMARY` + `BLOCKS_CHILDREN` when
 /// present) and emit one `Call` per `(matching log, declared PrefetchCall)`.
 pub fn gatherDynamic(
