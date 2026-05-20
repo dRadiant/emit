@@ -315,11 +315,6 @@ pub fn init(
         }
     }
 
-    // Open the filter env once for Phases 4 and 5. Borrowed by both
-    // `prefetch.gatherDynamic` and `scanner.replay`.
-    const filter_env = try lmdbx.Environment.init(filter_dir_z, .{ .max_dbs = 2 });
-    defer filter_env.deinit() catch {};
-
     // Phase 4: prefetch.
     const cache = try allocator.create(ethcall.Cache);
     errdefer allocator.destroy(cache);
@@ -327,36 +322,43 @@ pub fn init(
     errdefer cache.close();
     ctx._cache = cache;
 
-    if (comptime (m.prefetch.len > 0 or m.static_prefetch.len > 0)) {
-        var phase4_timer = try std.time.Timer.start();
-        try runPhase4(m, options, ctx, filter_env);
-        ctx.stats.prefetch_ns = phase4_timer.read();
+    // Phases 4 + 5 hold one filter env open. Block-scoped so it closes
+    // before the follow path's gap-fill or live loop reopens the same
+    // path — concurrent opens contend on the MDBX lock and surface as
+    // EAGAIN from fcntl(F_OFD_SETLK).
+    {
+        const filter_env = try lmdbx.Environment.init(filter_dir_z, .{ .max_dbs = 2 });
+        defer filter_env.deinit() catch {};
+
+        if (comptime (m.prefetch.len > 0 or m.static_prefetch.len > 0)) {
+            var phase4_timer = try std.time.Timer.start();
+            try runPhase4(m, options, ctx, filter_env);
+            ctx.stats.prefetch_ns = phase4_timer.read();
+        }
+
+        inline for (comptime resolveEntities(entities)) |T| {
+            const StoreT = root.storeFor(T);
+            const dbi_name = comptime entityFieldName(T);
+            @field(ctx.stores, dbi_name) = try StoreT.open(allocator, &ctx._active_txn, dbi_name);
+        }
+
+        const replay_result = try scanner.replay(
+            filter_env,
+            m,
+            Handler,
+            ctx,
+            .{
+                .commit_interval = options.commit_interval,
+                .start_block = ctx._last_dispatched_block,
+            },
+        );
+        ctx.stats.logs_dispatched = replay_result.logs_dispatched;
+        ctx.stats.blocks_dispatched = replay_result.blocks_dispatched;
+        ctx.stats.replay_ns = replay_result.elapsed_ns;
+
+        // Final commit so any logs since the last commit boundary land.
+        try ctx.commitCycle();
     }
-
-    // Phase 5 store open.
-    inline for (comptime resolveEntities(entities)) |T| {
-        const StoreT = root.storeFor(T);
-        const dbi_name = comptime entityFieldName(T);
-        @field(ctx.stores, dbi_name) = try StoreT.open(allocator, &ctx._active_txn, dbi_name);
-    }
-
-    // `start_block` skips the range a prior run already covered.
-    const replay_result = try scanner.replay(
-        filter_env,
-        m,
-        Handler,
-        ctx,
-        .{
-            .commit_interval = options.commit_interval,
-            .start_block = ctx._last_dispatched_block,
-        },
-    );
-    ctx.stats.logs_dispatched = replay_result.logs_dispatched;
-    ctx.stats.blocks_dispatched = replay_result.blocks_dispatched;
-    ctx.stats.replay_ns = replay_result.elapsed_ns;
-
-    // Final commit so any logs since the last commit boundary land.
-    try ctx.commitCycle();
     ctx.stats.elapsed_ns = timer.read();
 
     if (options.follow) {
