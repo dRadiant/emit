@@ -148,6 +148,14 @@ pub const FlatStoreWriter = struct {
         std.mem.writeInt(u64, &bloom_count_buf, self.meta.blooms_count, .little);
         _ = try self.blooms_file.pwrite(&bloom_count_buf, 0);
 
+        // Flush data files so meta.bin doesn't durably reference bytes that
+        // are still in the kernel page cache. Without this a power-loss
+        // window between the data writes and the meta rename can leave
+        // meta pointing at non-existent offsets.
+        try self.blocks_file.sync();
+        try self.index_file.sync();
+        try self.blooms_file.sync();
+
         self.meta.checksum = self.meta.computeChecksum();
         var meta_buf: [flat_reader.META_SIZE]u8 = undefined;
         self.meta.serialize(&meta_buf);
