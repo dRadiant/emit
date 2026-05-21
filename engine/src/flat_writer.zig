@@ -148,18 +148,10 @@ pub const FlatStoreWriter = struct {
         std.mem.writeInt(u64, &bloom_count_buf, self.meta.blooms_count, .little);
         _ = try self.blooms_file.pwrite(&bloom_count_buf, 0);
 
-        // Atomic meta write: tmp → sync → rename
         self.meta.checksum = self.meta.computeChecksum();
         var meta_buf: [flat_reader.META_SIZE]u8 = undefined;
         self.meta.serialize(&meta_buf);
-
-        {
-            const tmp = try self.dir.createFile("meta.bin.tmp", .{});
-            defer tmp.close();
-            _ = try tmp.pwrite(&meta_buf, 0);
-            try tmp.sync();
-        }
-        try self.dir.rename("meta.bin.tmp", "meta.bin");
+        try core.writeAtomicFile(self.dir, "meta.bin.tmp", "meta.bin", &meta_buf);
 
         self.blocks_since_commit = 0;
     }

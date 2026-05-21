@@ -26,7 +26,6 @@ const pending_format = core.pending_format;
 pub const FINALITY_DEPTH = pending_format.FINALITY_DEPTH;
 
 const HASH_SIZE = pending_format.HASH_SIZE;
-const FIXED_ENTRY_SIZE = pending_format.FIXED_ENTRY_SIZE;
 
 /// Same shape as `core.pending_format.Entry` but owns `lz4_entry` —
 /// the engine writes and frees these bytes.
@@ -36,10 +35,6 @@ pub const Entry = struct {
     topic_bloom: [bloom.BLOOM_SIZE]u8,
     addr_bloom: [bloom.ADDR_BLOOM_SIZE]u8,
     lz4_entry: []u8,
-
-    fn totalSize(self: Entry) usize {
-        return FIXED_ENTRY_SIZE + self.lz4_entry.len;
-    }
 };
 
 pub const PendingRing = struct {
@@ -158,40 +153,10 @@ pub const PendingRing = struct {
 
     // ── Persistence ──────────────────────────────────────────────────────
 
-    /// Serialize all entries to pending.bin via tmp + rename.
     fn persist(self: *PendingRing) !void {
-        var total_size: usize = 4; // count header
-        for (self.entries.items) |e| total_size += e.totalSize();
-
-        const buf = try self.alloc.alloc(u8, total_size);
+        const buf = try pending_format.serialize(self.alloc, self.entries.items);
         defer self.alloc.free(buf);
-
-        var pos: usize = 0;
-        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(self.entries.items.len), .little);
-        pos += 4;
-
-        for (self.entries.items) |e| {
-            std.mem.writeInt(u64, buf[pos..][0..8], e.block_number, .big);
-            pos += 8;
-            @memcpy(buf[pos..][0..HASH_SIZE], &e.hash);
-            pos += HASH_SIZE;
-            @memcpy(buf[pos..][0..bloom.BLOOM_SIZE], &e.topic_bloom);
-            pos += bloom.BLOOM_SIZE;
-            @memcpy(buf[pos..][0..bloom.ADDR_BLOOM_SIZE], &e.addr_bloom);
-            pos += bloom.ADDR_BLOOM_SIZE;
-            std.mem.writeInt(u32, buf[pos..][0..4], @intCast(e.lz4_entry.len), .little);
-            pos += 4;
-            @memcpy(buf[pos..][0..e.lz4_entry.len], e.lz4_entry);
-            pos += e.lz4_entry.len;
-        }
-
-        {
-            const tmp = try self.dir.createFile("pending.bin.tmp", .{});
-            defer tmp.close();
-            try tmp.writeAll(buf[0..pos]);
-            try tmp.sync();
-        }
-        try self.dir.rename("pending.bin.tmp", "pending.bin");
+        try core.writeAtomicFile(self.dir, "pending.bin.tmp", "pending.bin", buf);
     }
 
     /// Load pending.bin on startup via `core.pending_format.parse`, then
