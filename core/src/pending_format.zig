@@ -35,6 +35,38 @@ pub const Entry = struct {
 
 pub const ParseError = error{ Truncated, OutOfMemory };
 
+/// Serialize a slice of entries into a freshly-allocated `pending.bin`
+/// buffer. Caller frees with `allocator.free(buf)`. `entries` is
+/// `anytype` to accept both `pending_format.Entry` (zero-copy view) and
+/// engine-side owning variants of the same shape.
+pub fn serialize(allocator: std.mem.Allocator, entries: anytype) ![]u8 {
+    var total_size: usize = 4;
+    for (entries) |e| total_size += FIXED_ENTRY_SIZE + e.lz4_entry.len;
+
+    const buf = try allocator.alloc(u8, total_size);
+    errdefer allocator.free(buf);
+
+    var pos: usize = 0;
+    std.mem.writeInt(u32, buf[pos..][0..4], @intCast(entries.len), .little);
+    pos += 4;
+
+    for (entries) |e| {
+        std.mem.writeInt(u64, buf[pos..][0..8], e.block_number, .big);
+        pos += 8;
+        @memcpy(buf[pos..][0..HASH_SIZE], &e.hash);
+        pos += HASH_SIZE;
+        @memcpy(buf[pos..][0..bloom.BLOOM_SIZE], &e.topic_bloom);
+        pos += bloom.BLOOM_SIZE;
+        @memcpy(buf[pos..][0..bloom.ADDR_BLOOM_SIZE], &e.addr_bloom);
+        pos += bloom.ADDR_BLOOM_SIZE;
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(e.lz4_entry.len), .little);
+        pos += 4;
+        @memcpy(buf[pos..][0..e.lz4_entry.len], e.lz4_entry);
+        pos += e.lz4_entry.len;
+    }
+    return buf;
+}
+
 /// Parse `pending.bin` contents into a slice of entries. Entries are
 /// zero-copy views into `buf`; the returned slice itself is owned by
 /// `allocator` and freed with `allocator.free`.
@@ -70,33 +102,6 @@ pub fn parse(allocator: std.mem.Allocator, buf: []const u8) ParseError![]Entry {
 
 const testing = std.testing;
 
-/// Build a pending.bin byte buffer from one entry. Used by tests here and by
-/// the engine's own round-trip checks.
-fn writeOne(
-    buf: []u8,
-    block_number: u64,
-    hash: [HASH_SIZE]u8,
-    topic_bloom: *const [bloom.BLOOM_SIZE]u8,
-    addr_bloom: *const [bloom.ADDR_BLOOM_SIZE]u8,
-    lz4: []const u8,
-) usize {
-    std.mem.writeInt(u32, buf[0..4], 1, .little);
-    var pos: usize = 4;
-    std.mem.writeInt(u64, buf[pos..][0..8], block_number, .big);
-    pos += 8;
-    @memcpy(buf[pos..][0..HASH_SIZE], &hash);
-    pos += HASH_SIZE;
-    @memcpy(buf[pos..][0..bloom.BLOOM_SIZE], topic_bloom);
-    pos += bloom.BLOOM_SIZE;
-    @memcpy(buf[pos..][0..bloom.ADDR_BLOOM_SIZE], addr_bloom);
-    pos += bloom.ADDR_BLOOM_SIZE;
-    std.mem.writeInt(u32, buf[pos..][0..4], @intCast(lz4.len), .little);
-    pos += 4;
-    @memcpy(buf[pos..][0..lz4.len], lz4);
-    pos += lz4.len;
-    return pos;
-}
-
 test "parse empty buffer returns empty slice" {
     const empty = try parse(testing.allocator, &.{});
     defer testing.allocator.free(empty);
@@ -111,16 +116,24 @@ test "parse count=0 returns empty slice" {
     try testing.expectEqual(@as(usize, 0), parsed.len);
 }
 
-test "parse round-trips a single entry" {
+test "serialize + parse round-trip preserves every field" {
     const hash = [_]u8{0xCD} ** 32;
     const topic = [_]u8{0xAA} ** bloom.BLOOM_SIZE;
     const addr = [_]u8{0xBB} ** bloom.ADDR_BLOOM_SIZE;
     const lz4 = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
 
-    var buf: [4 + FIXED_ENTRY_SIZE + 4]u8 = undefined;
-    const written = writeOne(&buf, 12345, hash, &topic, &addr, &lz4);
+    const original = [_]Entry{.{
+        .block_number = 12345,
+        .hash = hash,
+        .topic_bloom = topic,
+        .addr_bloom = addr,
+        .lz4_entry = &lz4,
+    }};
 
-    const parsed = try parse(testing.allocator, buf[0..written]);
+    const buf = try serialize(testing.allocator, &original);
+    defer testing.allocator.free(buf);
+
+    const parsed = try parse(testing.allocator, buf);
     defer testing.allocator.free(parsed);
 
     try testing.expectEqual(@as(usize, 1), parsed.len);
@@ -129,6 +142,13 @@ test "parse round-trips a single entry" {
     try testing.expectEqualSlices(u8, &topic, &parsed[0].topic_bloom);
     try testing.expectEqualSlices(u8, &addr, &parsed[0].addr_bloom);
     try testing.expectEqualSlices(u8, &lz4, parsed[0].lz4_entry);
+}
+
+test "serialize empty slice produces just the count header" {
+    const buf = try serialize(testing.allocator, &[_]Entry{});
+    defer testing.allocator.free(buf);
+    try testing.expectEqual(@as(usize, 4), buf.len);
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, buf[0..4], .little));
 }
 
 test "parse rejects truncated entry header" {
