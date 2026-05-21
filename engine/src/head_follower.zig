@@ -239,7 +239,7 @@ fn ingestBlockCore(
     }
     const raw_logs = try alloc.alloc(types.RawLog, eth_logs.len);
     for (eth_logs, 0..) |log, i| {
-        raw_logs[i] = toRawLog(log, block_number, alloc);
+        raw_logs[i] = try toRawLog(log, block_number, alloc);
     }
 
     const topic_bloom = log_serial.buildTopicBloom(raw_logs);
@@ -275,13 +275,19 @@ fn resolveReorg(ring: *PendingRing, from: u64, provider: *eth.provider.Provider)
 }
 
 /// Move blocks with 64+ confirmations from pending ring to flat store.
-/// Batches ring persistence. One flush after all pops.
+/// Peek-then-pop: appendBlock failure must leave the entry on the ring so
+/// the next finalize attempt retries — popping first would orphan the
+/// block (pending forgets it, flat never recorded it).
 fn finalizeReady(ring: *PendingRing, writer: *FlatStoreWriter, head: u64, alloc: std.mem.Allocator) void {
     var finalized: u32 = 0;
     while (ring.canFinalize(head)) {
-        const oldest = ring.popOldest() orelse break;
-        defer alloc.free(oldest.lz4_entry);
-        writer.appendBlock(oldest.block_number, oldest.lz4_entry, &oldest.topic_bloom, &oldest.addr_bloom) catch break;
+        const oldest = ring.peekOldest() orelse break;
+        writer.appendBlock(oldest.block_number, oldest.lz4_entry, &oldest.topic_bloom, &oldest.addr_bloom) catch |err| {
+            std.debug.print("Finalize block {d}: {s}\n", .{ oldest.block_number, @errorName(err) });
+            break;
+        };
+        const popped = ring.popOldest().?;
+        alloc.free(popped.lz4_entry);
         finalized += 1;
     }
     if (finalized > 0) {
@@ -291,7 +297,7 @@ fn finalizeReady(ring: *PendingRing, writer: *FlatStoreWriter, head: u64, alloc:
     }
 }
 
-fn toRawLog(log: eth.receipt.Log, block_number: u64, alloc: std.mem.Allocator) types.RawLog {
+fn toRawLog(log: eth.receipt.Log, block_number: u64, alloc: std.mem.Allocator) !types.RawLog {
     var topics: [types.MAX_TOPICS][32]u8 = std.mem.zeroes([types.MAX_TOPICS][32]u8);
     var topic_count: u8 = 0;
     for (log.topics) |t| {
@@ -300,10 +306,7 @@ fn toRawLog(log: eth.receipt.Log, block_number: u64, alloc: std.mem.Allocator) t
         topic_count += 1;
     }
 
-    const data: []const u8 = if (log.data.len > 0)
-        alloc.dupe(u8, log.data) catch &.{}
-    else
-        &.{};
+    const data: []const u8 = if (log.data.len > 0) try alloc.dupe(u8, log.data) else &.{};
 
     return .{
         .block_number = block_number,
