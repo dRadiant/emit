@@ -102,7 +102,7 @@ pub const FakeEngine = struct {
     fn persistPending(self: *FakeEngine) !void {
         const buf = try pending_format.serialize(self.alloc, self.entries.items);
         defer self.alloc.free(buf);
-        try core.writeAtomicFile(self.dir, PENDING_TMP, PENDING_FILE, buf);
+        try core.atomic_file.write(self.dir, PENDING_TMP, PENDING_FILE, buf);
     }
 
     fn persistMeta(self: *FakeEngine) !void {
@@ -117,7 +117,7 @@ pub const FakeEngine = struct {
         };
         var buf: [flat_reader.META_SIZE]u8 = undefined;
         meta.serialize(&buf);
-        try core.writeAtomicFile(self.dir, META_TMP, META_FILE, &buf);
+        try core.atomic_file.write(self.dir, META_TMP, META_FILE, &buf);
     }
 };
 

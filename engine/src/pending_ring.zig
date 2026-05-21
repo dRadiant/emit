@@ -156,7 +156,7 @@ pub const PendingRing = struct {
     fn persist(self: *PendingRing) !void {
         const buf = try pending_format.serialize(self.alloc, self.entries.items);
         defer self.alloc.free(buf);
-        try core.writeAtomicFile(self.dir, "pending.bin.tmp", "pending.bin", buf);
+        try core.atomic_file.write(self.dir, "pending.bin.tmp", "pending.bin", buf);
     }
 
     /// Load pending.bin on startup via `core.pending_format.parse`, then

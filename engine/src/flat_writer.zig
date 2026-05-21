@@ -151,7 +151,7 @@ pub const FlatStoreWriter = struct {
         self.meta.checksum = self.meta.computeChecksum();
         var meta_buf: [flat_reader.META_SIZE]u8 = undefined;
         self.meta.serialize(&meta_buf);
-        try core.writeAtomicFile(self.dir, "meta.bin.tmp", "meta.bin", &meta_buf);
+        try core.atomic_file.write(self.dir, "meta.bin.tmp", "meta.bin", &meta_buf);
 
         self.blocks_since_commit = 0;
     }
