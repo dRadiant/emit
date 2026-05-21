@@ -34,30 +34,10 @@ pub fn EventLog(comptime T: type) type {
         file: std.fs.File,
 
         /// Open `<dir>/<name>` for append + random read. Creates the file
-        /// with a fresh magic header on first use. A header-truncated file
-        /// from a power loss before any record made it to disk is treated
-        /// as freshly created.
+        /// with a fresh magic header on first use; a wrong magic surfaces
+        /// `error.InvalidMagic` so the caller can fail loud.
         pub fn openOrCreate(allocator: std.mem.Allocator, dir: std.fs.Dir, name: []const u8) !Self {
-            if (dir.openFile(name, .{ .mode = .read_write })) |file| {
-                errdefer file.close();
-                var hdr: [HEADER_SIZE]u8 = undefined;
-                const n = file.pread(&hdr, 0) catch 0;
-                if (n < HEADER_SIZE) {
-                    file.close();
-                    return createFresh(allocator, dir, name);
-                }
-                try core.flat_format.validateMagic(&hdr, MAGIC);
-                return Self{ .allocator = allocator, .file = file };
-            } else |err| switch (err) {
-                error.FileNotFound => return createFresh(allocator, dir, name),
-                else => return err,
-            }
-        }
-
-        fn createFresh(allocator: std.mem.Allocator, dir: std.fs.Dir, name: []const u8) !Self {
-            const file = try dir.createFile(name, .{ .read = true, .truncate = true });
-            errdefer file.close();
-            try file.writeAll(&MAGIC);
+            const file = try core.flat_format.openOrCreateWithMagic(dir, name, MAGIC);
             return Self{ .allocator = allocator, .file = file };
         }
 
