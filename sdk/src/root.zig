@@ -15,6 +15,7 @@ const entity_serial = @import("entity_serial.zig");
 const entry = @import("entry.zig");
 const ethcall = @import("ethcall.zig");
 const filter_builder = @import("filter_builder.zig");
+const filtered_store = @import("filtered_store.zig");
 const humanize = @import("humanize.zig");
 const prefetch = @import("prefetch.zig");
 const handler = @import("handler.zig");
@@ -182,6 +183,7 @@ test {
     _ = @import("humanize.zig");
     _ = handler;
     _ = filter_builder;
+    _ = filtered_store;
     _ = scanner;
     _ = state_snap;
     _ = event_log;
