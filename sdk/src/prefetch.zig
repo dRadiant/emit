@@ -41,6 +41,20 @@ pub fn gatherOneBlock(
     if (comptime m.prefetch.len == 0) return &.{};
 
     var out: std.ArrayList(ethcall.Call) = .empty;
+    try matchAndAppend(arena, &out, logs, m);
+    return out.toOwnedSlice(arena);
+}
+
+/// Walk `logs` and append one `Call` to `out` per `(matching log, declared
+/// PrefetchCall)`. The matching shape is identical between live (one
+/// block's logs) and backfill (every block's logs in the filtered index);
+/// keep this in one place so the two paths can't drift.
+fn matchAndAppend(
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(ethcall.Call),
+    logs: []const RawLog,
+    comptime m: sdk_manifest.Manifest,
+) !void {
     for (logs) |*log| {
         if (log.topic_count == 0) continue;
         inline for (m.prefetch) |def| {
@@ -61,7 +75,6 @@ pub fn gatherOneBlock(
             }
         }
     }
-    return out.toOwnedSlice(arena);
 }
 
 /// Walk the filtered index (`BLOCKS_PRIMARY` + `BLOCKS_CHILDREN` when
@@ -90,27 +103,7 @@ pub fn gatherDynamic(
                 const value = try cursor.getCurrentValue();
                 const decoded = log_serial.decompressEntry(value, decompress_buf) catch continue;
                 const log_count = log_serial.deserializeLogs(decoded, log_buf);
-
-                for (log_buf[0..log_count]) |*log| {
-                    if (log.topic_count == 0) continue;
-                    inline for (m.prefetch) |def| {
-                        const on_topic = comptime sdk_manifest.eventTopic0(def.on_event);
-                        if (std.mem.eql(u8, &log.topics[0], &on_topic)) {
-                            inline for (def.calls) |pc| {
-                                const sel = comptime ethcall.selectorOf(pc.method);
-                                const addr = sdk_manifest.extractAddress(
-                                    def.on_event,
-                                    pc.address,
-                                    log.address,
-                                    &log.topics,
-                                    log.data,
-                                );
-                                const calldata = try arena.dupe(u8, &sel);
-                                try out.append(arena, .{ .target = addr, .calldata = calldata });
-                            }
-                        }
-                    }
-                }
+                try matchAndAppend(arena, &out, log_buf[0..log_count], m);
             }
         } else |_| {}
     }
