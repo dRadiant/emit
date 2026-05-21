@@ -43,14 +43,19 @@ pub const PendingRing = struct {
     alloc: std.mem.Allocator,
 
     /// Open or create a pending ring in the given directory.
-    /// Loads existing pending.bin if present.
+    /// Loads existing pending.bin if present; missing file is fine, but
+    /// any other I/O or corruption error surfaces so the engine fails loud
+    /// instead of silently starting from an empty ring on a populated dir.
     pub fn open(dir: std.fs.Dir, alloc: std.mem.Allocator) !PendingRing {
         var ring = PendingRing{
             .entries = .{},
             .dir = dir,
             .alloc = alloc,
         };
-        ring.load() catch {};
+        ring.load() catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
         return ring;
     }
 
@@ -108,6 +113,14 @@ pub const PendingRing = struct {
     pub fn canFinalize(self: *const PendingRing, current_head: u64) bool {
         const oldest = self.oldestBlock() orelse return false;
         return current_head >= oldest + FINALITY_DEPTH;
+    }
+
+    /// Borrow the oldest entry without removing it. Lets the caller commit
+    /// to durable storage first and only pop after the commit succeeds, so
+    /// a failed flat-store append leaves the block on the ring for retry.
+    pub fn peekOldest(self: *const PendingRing) ?*const Entry {
+        if (self.entries.items.len == 0) return null;
+        return &self.entries.items[0];
     }
 
     /// Remove and return the oldest entry. Does not persist.
@@ -171,7 +184,7 @@ pub const PendingRing = struct {
         defer self.alloc.free(buf);
         const n = try file.readAll(buf);
 
-        const parsed = try pending_format.parse(self.alloc, buf[0..n]);
+        const parsed = try pending_format.parseValidated(self.alloc, buf[0..n]);
         defer self.alloc.free(parsed);
 
         try self.entries.ensureUnusedCapacity(self.alloc, parsed.len);

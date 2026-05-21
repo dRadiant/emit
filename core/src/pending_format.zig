@@ -34,6 +34,7 @@ pub const Entry = struct {
 };
 
 pub const ParseError = error{ Truncated, OutOfMemory };
+pub const ValidateError = ParseError || error{ NonDense, Oversized };
 
 /// Serialize a slice of entries into a freshly-allocated `pending.bin`
 /// buffer. Caller frees with `allocator.free(buf)`. `entries` is
@@ -98,6 +99,26 @@ pub fn parse(allocator: std.mem.Allocator, buf: []const u8) ParseError![]Entry {
     return entries;
 }
 
+/// Parse + enforce the engine's structural invariants on the ring:
+/// strictly monotonic, gap-free block numbers and at most FINALITY_DEPTH
+/// entries. Either invariant failing means pending.bin is corrupt — the
+/// engine's reorg recovery indexes the ring as a dense array and would
+/// silently mis-report block presence on a non-dense ring.
+pub fn parseValidated(allocator: std.mem.Allocator, buf: []const u8) ValidateError![]Entry {
+    if (buf.len >= 4) {
+        const declared: usize = std.mem.readInt(u32, buf[0..4], .little);
+        if (declared > FINALITY_DEPTH) return error.Oversized;
+    }
+    const entries = try parse(allocator, buf);
+    errdefer allocator.free(entries);
+
+    var i: usize = 1;
+    while (i < entries.len) : (i += 1) {
+        if (entries[i].block_number != entries[i - 1].block_number + 1) return error.NonDense;
+    }
+    return entries;
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -155,6 +176,52 @@ test "parse rejects truncated entry header" {
     var buf: [4 + 10]u8 = undefined;
     std.mem.writeInt(u32, buf[0..4], 1, .little);
     try testing.expectError(error.Truncated, parse(testing.allocator, &buf));
+}
+
+test "parseValidated accepts a dense ring" {
+    const hash = [_]u8{0} ** 32;
+    const topic = [_]u8{0} ** bloom.BLOOM_SIZE;
+    const addr = [_]u8{0} ** bloom.ADDR_BLOOM_SIZE;
+    const lz4 = [_]u8{ 1, 2, 3 };
+
+    var entries: [3]Entry = undefined;
+    for (&entries, 100..) |*e, blk| e.* = .{
+        .block_number = blk,
+        .hash = hash,
+        .topic_bloom = topic,
+        .addr_bloom = addr,
+        .lz4_entry = &lz4,
+    };
+
+    const buf = try serialize(testing.allocator, &entries);
+    defer testing.allocator.free(buf);
+
+    const parsed = try parseValidated(testing.allocator, buf);
+    defer testing.allocator.free(parsed);
+    try testing.expectEqual(@as(usize, 3), parsed.len);
+}
+
+test "parseValidated rejects a gap" {
+    const hash = [_]u8{0} ** 32;
+    const topic = [_]u8{0} ** bloom.BLOOM_SIZE;
+    const addr = [_]u8{0} ** bloom.ADDR_BLOOM_SIZE;
+    const lz4 = [_]u8{1};
+
+    const entries = [_]Entry{
+        .{ .block_number = 100, .hash = hash, .topic_bloom = topic, .addr_bloom = addr, .lz4_entry = &lz4 },
+        .{ .block_number = 102, .hash = hash, .topic_bloom = topic, .addr_bloom = addr, .lz4_entry = &lz4 },
+    };
+
+    const buf = try serialize(testing.allocator, &entries);
+    defer testing.allocator.free(buf);
+
+    try testing.expectError(error.NonDense, parseValidated(testing.allocator, buf));
+}
+
+test "parseValidated rejects ring larger than FINALITY_DEPTH" {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, FINALITY_DEPTH + 1, .little);
+    try testing.expectError(error.Oversized, parseValidated(testing.allocator, &buf));
 }
 
 test "parse rejects truncated lz4 payload" {
