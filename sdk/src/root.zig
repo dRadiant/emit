@@ -19,6 +19,7 @@ const humanize = @import("humanize.zig");
 const prefetch = @import("prefetch.zig");
 const handler = @import("handler.zig");
 const immutable_store = @import("immutable_store.zig");
+const event_log = @import("event_log.zig");
 const mutable_store = @import("mutable_store.zig");
 const scanner = @import("scanner.zig");
 const state_snap = @import("state_snap.zig");
@@ -183,6 +184,7 @@ test {
     _ = filter_builder;
     _ = scanner;
     _ = state_snap;
+    _ = event_log;
     _ = entry;
     // Test-only fixture
     _ = @import("fake_engine.zig");
