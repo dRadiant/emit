@@ -73,7 +73,7 @@ fn readCursorIn(txn: lmdbx.Transaction) !u64 {
     return std.mem.readInt(u64, data[0..8], .big);
 }
 
-fn writeCursorIn(txn: lmdbx.Transaction, dbi: lmdbx.Database.DBI, block: u64) !void {
+pub fn writeCursorIn(txn: lmdbx.Transaction, dbi: lmdbx.Database.DBI, block: u64) !void {
     var buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &buf, block, .big);
     const db = lmdbx.Database{ .txn = txn, .dbi = dbi };

@@ -22,15 +22,15 @@ const pending_format = core.pending_format;
 const types = core.types;
 
 /// Linux-only: `Watcher` falls back to a sleep-based stub elsewhere.
-pub const inotify_supported = builtin.target.os.tag == .linux;
+const inotify_supported = builtin.target.os.tag == .linux;
 
-pub const Entry = pending_format.Entry;
+const Entry = pending_format.Entry;
 
 const PENDING_FILE = "pending.bin";
 const META_FILE = "meta.bin";
 
 /// Entries view into `buf`; both must stay alive together.
-pub const PendingSnapshot = struct {
+const PendingSnapshot = struct {
     buf: []u8,
     entries: []Entry,
 
@@ -43,7 +43,7 @@ pub const PendingSnapshot = struct {
 
 /// Missing or empty pending.bin returns an empty snapshot — the engine
 /// may not have written anything yet.
-pub fn readPending(allocator: std.mem.Allocator, engine_data_dir: []const u8) !PendingSnapshot {
+fn readPending(allocator: std.mem.Allocator, engine_data_dir: []const u8) !PendingSnapshot {
     var dir = try std.fs.cwd().openDir(engine_data_dir, .{});
     defer dir.close();
 
@@ -92,7 +92,7 @@ pub fn readMeta(engine_data_dir: []const u8) !u64 {
 ///
 /// The finalized/reorged_out split needs the meta.bin cross-check —
 /// pending.bin alone can't distinguish age-out from `truncateFrom`.
-pub const Classification = struct {
+const Classification = struct {
     reorg_from: ?u64 = null,
     new_blocks: []const Entry = &.{},
     finalized: []const u64 = &.{},
@@ -105,7 +105,7 @@ pub const Classification = struct {
     }
 };
 
-pub fn classifyChanges(
+fn classifyChanges(
     allocator: std.mem.Allocator,
     prev: []const Entry,
     curr: []const Entry,
@@ -182,16 +182,15 @@ pub const RunOptions = struct {
 /// pending snapshot, and the per-block decompress + log buffers. Held
 /// here so `tick` doesn't reallocate per call. `run` constructs one
 /// session and loops; tests drive `tick` directly.
-pub const LiveSession = struct {
+const LiveSession = struct {
     allocator: std.mem.Allocator,
     engine_data_dir: []const u8,
     watcher: Watcher,
     prev: PendingSnapshot,
     decompress_buf: []u8,
     log_buf: []core.RawLog,
-    /// Live Phase 4: when set, per-block prefetch issues Multicall3 batches
-    /// for factory events before child-event dispatch. Null leaves
-    /// uncached calls to surface as `error.NotPrefetched` in handlers.
+    /// Optional Multicall3 for per-block prefetch of factory children.
+    /// Null leaves uncached calls to surface as `error.NotPrefetched`.
     multicall: ?*eth.multicall.Multicall = null,
     multicall_batch_size: usize = ethcall.DEFAULT_BATCH_SIZE,
 
@@ -261,17 +260,71 @@ pub const LiveSession = struct {
             // re-applying mutations against an empty overlay is idempotent.
             for (curr.entries) |entry| {
                 setLiveBlock(ctx, entry.block_number);
-                try dispatchBlock(m, Handler, ctx, entry, self.decompress_buf, self.log_buf, self.multicall, self.multicall_batch_size);
+                try self.dispatchBlock(m, Handler, ctx, entry);
             }
         } else {
             for (classification.new_blocks) |entry| {
                 setLiveBlock(ctx, entry.block_number);
-                try dispatchBlock(m, Handler, ctx, entry, self.decompress_buf, self.log_buf, self.multicall, self.multicall_batch_size);
+                try self.dispatchBlock(m, Handler, ctx, entry);
             }
         }
 
         self.prev.deinit(self.allocator);
         self.prev = curr;
+    }
+
+    fn dispatchBlock(
+        self: *LiveSession,
+        comptime m: sdk_manifest.Manifest,
+        comptime Handler: type,
+        ctx: anytype,
+        entry: Entry,
+    ) !void {
+        const decoded = try log_serial.decompressEntry(entry.lz4_entry, self.decompress_buf);
+        const log_count = log_serial.deserializeLogs(decoded, self.log_buf);
+
+        for (self.log_buf[0..log_count]) |*log| {
+            log.block_number = entry.block_number;
+        }
+
+        try self.maybePrefetchBlock(m, ctx, self.log_buf[0..log_count]);
+
+        ctx.block_number = entry.block_number;
+        ctx.timestamp = humanize.blockTimestamp(entry.block_number);
+
+        for (self.log_buf[0..log_count]) |log| {
+            try handler_mod.dispatchLog(m, Handler, ctx, log);
+        }
+    }
+
+    /// Gather → dedupe → filterUncached → preload. Skips when the manifest
+    /// declares no prefetch, when ctx has no cache (counter-shaped tests),
+    /// or when the block has no matching factory events. Missing entries
+    /// surface as `error.NotPrefetched` in handlers when multicall is null.
+    fn maybePrefetchBlock(
+        self: *LiveSession,
+        comptime m: sdk_manifest.Manifest,
+        ctx: anytype,
+        logs: []const core.RawLog,
+    ) !void {
+        if (comptime m.prefetch.len == 0) return;
+        const T = std.meta.Child(@TypeOf(ctx));
+        if (comptime !@hasField(T, "_cache")) return;
+        const cache = ctx._cache orelse return;
+
+        var arena_state = std.heap.ArenaAllocator.init(ctx._allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const calls = try prefetch.gatherOneBlock(arena, logs, m);
+        if (calls.len == 0) return;
+
+        const unique = try prefetch.dedupe(arena, calls);
+        const missing = try prefetch.filterUncached(arena, cache, unique);
+        if (missing.len == 0) return;
+
+        const mc = self.multicall orelse return;
+        try cache.preload(ctx._allocator, mc, missing, self.multicall_batch_size);
     }
 };
 
@@ -320,9 +373,9 @@ pub fn run(
 
 /// Flip `live = true` on every entity store. Saves from this point go
 /// to the per-block overlay instead of MDBX; `commitBlock` is the only
-/// path that promotes overlay state to durable storage. Idempotent —
-/// counter-shaped test contexts without a `stores` field are skipped.
-pub fn enter(ctx: anytype) void {
+/// path that promotes overlay state to durable storage. Counter-shaped
+/// test contexts without a `stores` field are skipped.
+fn enter(ctx: anytype) void {
     const T = std.meta.Child(@TypeOf(ctx));
     if (comptime !@hasField(T, "stores")) return;
     const Stores = @FieldType(T, "stores");
@@ -349,77 +402,11 @@ fn discardAllOverlays(ctx: anytype) void {
     }
 }
 
-fn dispatchBlock(
-    comptime m: sdk_manifest.Manifest,
-    comptime Handler: type,
-    ctx: anytype,
-    entry: Entry,
-    decompress_buf: []u8,
-    log_buf: []core.RawLog,
-    multicall: ?*eth.multicall.Multicall,
-    multicall_batch_size: usize,
-) !void {
-    const decoded = try log_serial.decompressEntry(entry.lz4_entry, decompress_buf);
-    const log_count = log_serial.deserializeLogs(decoded, log_buf);
-
-    for (log_buf[0..log_count]) |*log| {
-        log.block_number = entry.block_number;
-    }
-
-    // Live Phase 4: gather + preload prefetch calls for this block before
-    // handler dispatch so child-event handlers hit warm cache.
-    try maybePrefetchBlock(m, ctx, log_buf[0..log_count], multicall, multicall_batch_size);
-
-    ctx.block_number = entry.block_number;
-    ctx.timestamp = humanize.blockTimestamp(entry.block_number);
-
-    for (log_buf[0..log_count]) |log| {
-        try handler_mod.dispatchLog(m, Handler, ctx, log);
-    }
-
-    // `_last_dispatched_block` is the MDBX cursor write-back, not the
-    // dispatch HWM — live-mode saves land in the overlay, so dispatch
-    // itself can't advance the durable cursor. `promoteFinalized` sets
-    // it when a block actually commits.
-}
-
-/// Live Phase 4: gather → dedupe → filterUncached → preload (when RPC
-/// available). Skips when the manifest declares no prefetch, when the
-/// ctx has no cache (counter-shaped tests), or when the block has no
-/// matching factory events. Missing entries surface as
-/// `error.NotPrefetched` in handlers when multicall isn't configured.
-fn maybePrefetchBlock(
-    comptime m: sdk_manifest.Manifest,
-    ctx: anytype,
-    logs: []const core.RawLog,
-    multicall: ?*eth.multicall.Multicall,
-    multicall_batch_size: usize,
-) !void {
-    if (comptime m.prefetch.len == 0) return;
-    const T = std.meta.Child(@TypeOf(ctx));
-    if (comptime !@hasField(T, "_cache")) return;
-    const cache = ctx._cache orelse return;
-
-    var arena_state = std.heap.ArenaAllocator.init(ctx._allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const calls = try prefetch.gatherOneBlock(arena, logs, m);
-    if (calls.len == 0) return;
-
-    const unique = try prefetch.dedupe(arena, calls);
-    const missing = try prefetch.filterUncached(arena, cache, unique);
-    if (missing.len == 0) return;
-
-    const mc = multicall orelse return;
-    try cache.preload(ctx._allocator, mc, missing, multicall_batch_size);
-}
-
 // ── Watcher: inotify on the engine data dir ──────────────────────────────
 
 /// Inotify-driven wakeup on `IN_MOVED_TO` in the watched dir. Non-Linux
 /// falls back to a `timeout_ms` sleep so the SDK still functions.
-pub const Watcher = struct {
+const Watcher = struct {
     fd: i32 = -1,
 
     pub fn init(dir_path: []const u8) !Watcher {
@@ -902,11 +889,11 @@ test "reorg below the cursor raises ReorgExceedsFinalityDepth" {
 }
 
 test "live prefetch hits warm cache, issues no Multicall" {
-    // Group 11: a pending block carrying a PairCreated factory event runs
-    // through `maybePrefetchBlock`. With the cache pre-warmed for the
-    // expected decimals() call, filterUncached returns empty and no
-    // Multicall round-trip is attempted — proven by passing
-    // `multicall = null` (any attempt would have been a null deref).
+    // A pending block carrying a PairCreated factory event runs through
+    // `maybePrefetchBlock`. With the cache pre-warmed for the expected
+    // decimals() call, `filterUncached` returns empty and no Multicall
+    // round-trip is attempted — proven by passing `multicall = null`
+    // (any attempt would have been a null deref).
     var engine_tmp = testing.tmpDir(.{});
     defer engine_tmp.cleanup();
     var fake = fake_engine.FakeEngine.init(engine_tmp.dir, testing.allocator);
@@ -1042,7 +1029,7 @@ test "finalized blocks promote to MDBX and advance the cursor" {
             inline for (std.meta.fields(TestStores)) |f| {
                 try @field(self.stores, f.name).flush();
             }
-            try writeCursorInTest(self._active_txn, self._meta_dbi, self._last_dispatched_block);
+            try @import("entry.zig").writeCursorIn(self._active_txn, self._meta_dbi, self._last_dispatched_block);
             try self._active_txn.commit();
             self._active_txn = try self._env.transaction(.{});
         }
@@ -1122,13 +1109,6 @@ test "finalized blocks promote to MDBX and advance the cursor" {
     try testing.expectEqual(@as(u64, 100), std.mem.readInt(u64, cursor_bytes[0..8], .big));
 }
 
-fn writeCursorInTest(txn: anytype, dbi: anytype, block: u64) !void {
-    const lmdbx = @import("lmdbx");
-    var buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &buf, block, .big);
-    const db = lmdbx.Database{ .txn = txn, .dbi = dbi };
-    try db.set("cursor", &buf, .Upsert);
-}
 
 test "tick is a no-op when pending is unchanged" {
     var engine_tmp = testing.tmpDir(.{});
