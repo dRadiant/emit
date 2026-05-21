@@ -21,6 +21,7 @@ const handler = @import("handler.zig");
 const immutable_store = @import("immutable_store.zig");
 const mutable_store = @import("mutable_store.zig");
 const scanner = @import("scanner.zig");
+const state_snap = @import("state_snap.zig");
 
 // Public submodules: handler-helper utilities the user calls by name.
 pub const manifest = @import("manifest.zig");
@@ -181,6 +182,7 @@ test {
     _ = handler;
     _ = filter_builder;
     _ = scanner;
+    _ = state_snap;
     _ = entry;
     // Test-only fixture
     _ = @import("fake_engine.zig");
