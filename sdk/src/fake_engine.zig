@@ -100,32 +100,9 @@ pub const FakeEngine = struct {
     // ── Internal: file I/O ──────────────────────────────────────────────────
 
     fn persistPending(self: *FakeEngine) !void {
-        var total_size: usize = 4;
-        for (self.entries.items) |e| total_size += pending_format.FIXED_ENTRY_SIZE + e.lz4_entry.len;
-
-        const buf = try self.alloc.alloc(u8, total_size);
+        const buf = try pending_format.serialize(self.alloc, self.entries.items);
         defer self.alloc.free(buf);
-
-        var pos: usize = 0;
-        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(self.entries.items.len), .little);
-        pos += 4;
-
-        for (self.entries.items) |e| {
-            std.mem.writeInt(u64, buf[pos..][0..8], e.block_number, .big);
-            pos += 8;
-            @memcpy(buf[pos..][0..pending_format.HASH_SIZE], &e.hash);
-            pos += pending_format.HASH_SIZE;
-            @memcpy(buf[pos..][0..bloom.BLOOM_SIZE], &e.topic_bloom);
-            pos += bloom.BLOOM_SIZE;
-            @memcpy(buf[pos..][0..bloom.ADDR_BLOOM_SIZE], &e.addr_bloom);
-            pos += bloom.ADDR_BLOOM_SIZE;
-            std.mem.writeInt(u32, buf[pos..][0..4], @intCast(e.lz4_entry.len), .little);
-            pos += 4;
-            @memcpy(buf[pos..][0..e.lz4_entry.len], e.lz4_entry);
-            pos += e.lz4_entry.len;
-        }
-
-        try self.atomicWrite(PENDING_TMP, PENDING_FILE, buf[0..pos]);
+        try core.writeAtomicFile(self.dir, PENDING_TMP, PENDING_FILE, buf);
     }
 
     fn persistMeta(self: *FakeEngine) !void {
@@ -140,17 +117,7 @@ pub const FakeEngine = struct {
         };
         var buf: [flat_reader.META_SIZE]u8 = undefined;
         meta.serialize(&buf);
-        try self.atomicWrite(META_TMP, META_FILE, &buf);
-    }
-
-    fn atomicWrite(self: *FakeEngine, tmp_name: []const u8, final_name: []const u8, bytes: []const u8) !void {
-        {
-            const tmp = try self.dir.createFile(tmp_name, .{});
-            defer tmp.close();
-            try tmp.writeAll(bytes);
-            try tmp.sync();
-        }
-        try self.dir.rename(tmp_name, final_name);
+        try core.writeAtomicFile(self.dir, META_TMP, META_FILE, &buf);
     }
 };
 
