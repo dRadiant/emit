@@ -43,13 +43,17 @@ pub fn entitySize(comptime T: type) comptime_int {
     return n;
 }
 
-/// Pack an entity into `out` (little-endian for ints, memcpy for arrays).
+/// Pack an entity into `out`. The first field (primary key) is big-endian
+/// so a sorted-by-bytes slab matches key-numeric order — binary search over
+/// the serialized records is correct without a separate key encoding. The
+/// remaining fields are little-endian for native reads.
 pub fn serialize(comptime T: type, entity: T, out: []u8) void {
     const fields = @typeInfo(T).@"struct".fields;
     var pos: usize = 0;
-    inline for (fields) |f| {
+    inline for (fields, 0..) |f, i| {
         const sz = comptime fixedSize(f.type, @typeName(T) ++ "." ++ f.name);
-        writeField(f.type, @field(entity, f.name), out[pos..][0..sz], .little);
+        const endian: std.builtin.Endian = if (i == 0) .big else .little;
+        writeField(f.type, @field(entity, f.name), out[pos..][0..sz], endian);
         pos += sz;
     }
 }
@@ -58,9 +62,10 @@ pub fn deserialize(comptime T: type, in: []const u8) T {
     const fields = @typeInfo(T).@"struct".fields;
     var entity: T = undefined;
     var pos: usize = 0;
-    inline for (fields) |f| {
+    inline for (fields, 0..) |f, i| {
         const sz = comptime fixedSize(f.type, @typeName(T) ++ "." ++ f.name);
-        @field(entity, f.name) = readField(f.type, in[pos..][0..sz], .little);
+        const endian: std.builtin.Endian = if (i == 0) .big else .little;
+        @field(entity, f.name) = readField(f.type, in[pos..][0..sz], endian);
         pos += sz;
     }
     return entity;
