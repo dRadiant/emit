@@ -1,8 +1,8 @@
 # ADR-003: SDK Storage — Pure Zig Snapshot Files
 
-**Status**: Proposed
-**Date**: 2026-05-07
-**Context**: Entity stores and the filtered index ship on MDBX via lmdbx-zig. We are evaluating whether to replace one or both with pure-Zig storage in a future change.
+**Status**: Accepted
+**Date**: 2026-05-07 (proposed) / 2026-05-21 (accepted)
+**Context**: Entity stores and the filtered index ship on MDBX via lmdbx-zig. This ADR captures the evaluation of pure-Zig alternatives and the decision to adopt one.
 
 ## Problem
 
@@ -69,55 +69,64 @@ Filtered index becomes pure-Zig flat files matching the engine's `blocks.dat` / 
 - ~3-5x slower than MDBX on raw KV. MutableStore mitigates for the hot path; flush cost is the open question.
 - For very large entity counts (~5M+), SQLite write amplification becomes a real cost.
 
-### D: Pure Zig sorted snapshot files for entity stores, flat files for filtered index
+### D: Pure-Zig storage. Combined state file for mutable entities, append-only flat files for immutable entities
 
 **Filtered index** uses the engine's flat-store pattern: `filtered.dat` (LZ4 entries) + `filtered.idx` (dense `(block_number, offset, length)` array, mmap'd). Internal artifact, no user access required.
 
-**Entity stores** use a single sorted binary file per entity type:
+**Mutable entity stores** colocate inside a single `state.snap` file. That file's atomic rename is the only primitive needed to commit cursor + every MutableStore consistently.
 
 ```
-File layout (one file per entity type):
-  [magic 8 bytes "EMITSTOR"]
-  [version u32 LE]
-  [reserved u32 LE]
-  [count u64 LE]
-  [records: count × (key bytes ++ value bytes), sorted ascending by key]
-
-Key and value sizes are comptime-known per entity type.
-Records are fixed-size, no length prefix needed.
+state.snap layout:
+  magic              [8]u8       "EMITSTAT"
+  version            u32 LE
+  cursor             u64 LE      last fully-dispatched block whose state is durable
+  mutable_bytes      [N]u64 LE   slab byte length per MutableStore type, tuple order
+  immutable_counts   [M]u64 LE   authoritative record count per ImmutableStore type
+  [body: N MutableStore slabs concatenated in tuple order, each sorted ascending by primary key]
 ```
+
+The entities tuple is comptime-known. The arrays index by tuple position, so no in-file name strings, record-size fields, or descriptor table are needed.
+
+**Immutable entity stores** use append-only flat files mirroring the engine's `blocks.dat`. One file per immutable entity type; filename derived at comptime from the entity type (e.g. `Transfer` → `transfer.events.dat`, following the SDK's lowercase-first-plus-`s` rule).
+
+```
+<entity>.events.dat layout:
+  magic            [8]u8       "EMITEVTS"
+  records          [count × record_size]   fixed-size, sorted by (block_number, log_index)
+```
+
+`count` is *not* stored in the file. The authoritative count lives in `state.snap.immutable_counts`. The on-disk file may transiently hold orphan trailing records from a crashed commit; those bytes are invisible to readers (bounded by the count) and are overwritten by the next append.
 
 Indexer access pattern:
 
-- `load(key)` is a HashMap lookup with cold-fault read from the mmap'd snapshot via binary search.
-- `save(key, value)` is a HashMap put with dirty flag.
-- `flush()` collects dirty entries, sorts the full set by key, writes via tmp + fsync + rename.
-- `close()` is a no-op.
+- `MutableStore.load(key)`: HashMap lookup; cold-fault binary-searches the mmap'd slab.
+- `MutableStore.save(key, value)`: HashMap put with dirty flag.
+- `ImmutableStore.save(record)`: sequential append to `<entity>.events.dat`.
+- `flush()`: append any new ImmutableStore records and fsync; serialize the new `state.snap` (cursor + mutable_bytes + immutable_counts + slabs) to `state.snap.tmp`; fsync; rename over `state.snap`; fsync the directory.
+- `close()`: no-op.
 
 External (other-language) access pattern:
 
-- Open and mmap the file.
-- Read header (24 bytes).
-- Binary search the sorted records for point lookup (`O(log N)`).
-- Binary search to find a range start, sequential read for range scans on primary key (`O(log N + K)` for K results).
-- Full scan reads sequentially.
+- Open and mmap `state.snap`. Read the fixed-size header and the two u64 arrays (sizes are known from the schema spec).
+- Mutable slabs: slice the body at offsets computed from `mutable_bytes`. Binary search the sorted records for point lookup (`O(log N)`); binary search + sequential read for range scans on primary key (`O(log N + K)`).
+- Immutable records: open `<entity>.events.dat`, read `count` from `state.snap.immutable_counts`, slice `count × record_size` bytes. Binary search on the composite `(block_number, log_index)` key.
 
 No library required. A Python reader is ~12 lines using `struct.unpack` and `bisect`. A C reader is ~30 lines.
 
 **Pros**
 - Pure Zig. Zero C dependencies for the SDK's core storage.
-- Lowest LoC. Roughly 200 lines for both `MutableStore` and `ImmutableStore` combined, including the comptime serializer carried from the prototype.
+- Lowest LoC. Roughly 150 lines for both `MutableStore` and `ImmutableStore` combined, including the comptime serializer carried from the prototype.
 - Eliminates lmdbx-zig entirely from the SDK.
 - File format is documented and stable. A user with a hex editor can decode any record.
-- Beats MDBX on commit latency at the expected scales because sequential `pwrite` of contiguous bytes is faster than B-tree page modification + WAL.
+- Cursor and every MutableStore commit atomically via a single rename of `state.snap` — no WAL, no generation table, no orphan GC.
+- ImmutableStore growth is handled natively by append-only flat files; per-commit cost is `O(dirty)`, not `O(total)`.
 - Cross-language access requires no library, just bytes and a spec.
-- Time complexity is bounded everywhere: `O(1)` hot path, `O(log N)` cold lookup, `O(N log N)` flush.
+- Time complexity is bounded everywhere: `O(1)` hot path, `O(log N)` cold lookup, `O(N log N)` MutableStore flush, `O(dirty)` ImmutableStore append.
 
 **Cons**
-- Full snapshot rewrite per commit. `O(N)` not `O(dirty)`. Acceptable up to ~5M entities at typical commit cadence; beyond that, an incremental log + compaction pattern is needed (~50 more LoC).
+- MutableStore is rewritten in full on every commit. `O(N)` not `O(dirty)` *for MutableStore only*. Acceptable up to ~5M entities per type at typical commit cadence; beyond that, an incremental scheme would be needed. ImmutableStore is not subject to this — its growth is the unbounded chain-history dimension and is handled by append.
 - No secondary indexes. Range scans on non-primary fields require either a denormalized entity type with the desired primary key or a sidecar that loads the snapshot into PostgreSQL/SQLite for SQL access.
 - No concurrent writer. Atomic rename gives readers a consistent snapshot but a brief window during rename can stall a reader for milliseconds. Acceptable for typical API server usage; not acceptable for high-frequency mutating workloads (which an indexer is not).
-- No ACID across multiple entity types. Each file is atomic individually. If an indexer needs cross-store transactional guarantees, this design does not provide them. The current entity-storage-spec does not require cross-store atomicity.
 
 ## Considerations
 
@@ -130,7 +139,7 @@ No library required. A Python reader is ~12 lines using `struct.unpack` and `bis
 | 500K (Polymarket) | ~30 ms | ~30 ms | ~50 to 100 ms |
 | 2M (All ERC20) | ~150 ms | ~120 ms | ~50 to 200 ms |
 
-Pure-Zig wins or ties on commit latency up through ~2M entities. At ~5M+ the full-rewrite cost dominates and an incremental scheme becomes necessary.
+Pure-Zig wins or ties on MutableStore commit latency up through ~2M entities per type. At ~5M+ per type the full-rewrite cost dominates and an incremental scheme would become necessary. ImmutableStore is not subject to this curve — append-only writes are `O(dirty)` regardless of total record count.
 
 **Range-scan complexity.** Sorted by primary key. Point lookup is binary search (`O(log N)`). Range scans on the primary key are binary search to start + sequential read until end (`O(log N + K)`). For ImmutableStore (event records keyed by `block_number || log_index`), this gives efficient block-range queries naturally. For MutableStore (state keyed by entity identity), it gives prefix scans.
 
@@ -142,63 +151,66 @@ Pure-Zig wins or ties on commit latency up through ~2M entities. At ~5M+ the ful
 
 **Reorg recovery.** Per `entity-storage-spec.md`, the reorg path is "wipe entities and re-backfill". Pure-Zig snapshot supports this trivially: delete the entity files, re-run. No range-delete needed.
 
-**Cross-store atomicity.** The current spec does not require it. Each entity type's file is atomic via tmp + rename. If a future feature needs multi-file atomicity, group flushes can use a write-ahead log of intended renames, replayed on startup. Not in this proposal.
+**Cross-store atomicity.** Provided. The `state.snap` rename is one primitive that commits the cursor and every MutableStore atomically. ImmutableStore appends ride alongside via the authoritative count field in `state.snap` — bytes past that count are invisible until the next `state.snap` rename publishes them.
 
 **Ecosystem.** SQLite is the most portable choice for cross-language access in absolute terms. The pure-Zig snapshot format with documented spec is the most portable in *zero-dependency* terms. For a user already pulling Python or Rust into their stack, SQLite via existing bindings is cheaper. For a user wanting to write a 30-line C reader on an embedded target, the pure-Zig format wins.
 
 ## Decision
 
-**Defer. Ship option A (MDBX via lmdbx-zig with raw-C-API workarounds).** Revisit this ADR after live verification has produced measured numbers.
+**Adopt option D.** Pure-Zig sorted snapshot files for entity stores; flat files for the filtered index; flat KV file for the ethcall cache. Remove lmdbx-zig from the SDK.
 
 Rationale:
 
-- The current SDK has a working, well-specified plan against MDBX. Re-orienting now adds churn and design risk before any code is written.
-- The prototype validated the architecture against MDBX. We have measured numbers to compare against.
-- The pure-Zig design needs validation: can we actually beat MDBX commit latency at the expected scales, or are the estimates above optimistic?
-- The user's API surface (`load`, `save`, `flush`, comptime markers) is identical between options A and D. Migrating storage backends later does not affect handler code.
-
-Triggers for adopting option D in a follow-up change:
-
-- Live verification surfaces more lmdbx-zig wrapper bugs than the two we already know about, and raw-C-API workarounds become onerous.
-- A user explicitly needs cross-language access from a language without good MDBX bindings.
-- We benchmark the pure-Zig snapshot design at production scales and confirm it ties or beats MDBX.
-- The dependency reduction becomes valuable for distribution (e.g., publishing the SDK on a registry where C deps add friction).
+- Live verification surfaced wrapper friction. Raw-C-API workarounds already exist for `cursor_del` and `dbi_stat`; each new path is another opportunity for the wrapper to misbehave under load.
+- The commit-latency analysis in the considerations section holds at the entity counts the SDK targets (≤ ~5M per type per commit). Sort-and-rewrite ties or beats MDBX's B-tree + WAL path at those scales.
+- The handler API (`load`, `save`, `flush`, comptime markers) is unchanged. This is a backend swap; user code is untouched.
+- Dependency reduction is a first-class deliverable for SDK distribution. A pure-Zig core with no transitive C dependencies is easier to package, audit, and consume from a Zig package registry.
+- Cross-language readers (C, Python) become trivial. The binary format is documented and small enough that a hex editor decodes a record.
 
 ## Consequences
 
-**Adopting D later (likely):**
-
-- The handler API and entity-storage-spec contract stay the same.
-- `MutableStore` and `ImmutableStore` get new internal implementations, swapped via build flag or migrated wholesale.
+- The handler API and entity-storage-spec contract are unchanged.
+- `MutableStore` and `ImmutableStore` get new internal implementations.
 - lmdbx-zig is removed from the SDK's dependencies.
-- New deliverable: `docs/entity-format.md` documenting the binary file format.
-- New deliverable: reference C and Python readers in `examples/readers/`.
-- Migration tool: one-shot scan of an MDBX entity store, write out as snapshot files. ~50 LoC.
+- New deliverables: `docs/entity-format.md` documenting the binary file format; reference C and Python readers in `examples/readers/`. No migration tool — operators delete the data dir and re-backfill (the architectural pitch is that re-backfill is fast).
 
-### Cursor atomicity follow-up
+### Cursor location and atomicity
 
-The SDK's resume cursor lives at `_meta.cursor` inside the entity MDBX env. The location is chosen *specifically* because MDBX transactions let the cursor write ride the same commit as the entity flush — giving "crash any time, cursor and entity state are byte-atomic." A `cursor.bin` file written out-of-band was rejected because the file-write vs MDBX-commit gap could silently double-count `MutableStore` mutations on restart.
+The SDK's resume cursor previously rode the entity MDBX transaction at `_meta.cursor` so the cursor write committed atomically with the entity flush — giving "crash any time, cursor and entity state are byte-atomic." A standalone `cursor.bin` written out-of-band was rejected because the file-write vs entity-commit gap could silently double-count `MutableStore` mutations on restart. That invariant must survive the storage migration.
 
-If option D (or any non-MDBX backend) is adopted the cursor's atomicity story has to be re-derived. The principle survives — cursor and entity state must commit together — but the **mechanism** changes:
+**Mechanism: `state.snap` as the single atomic commit point.**
 
-- **If the snapshot file is itself the atomic unit** (tmp + fsync + rename), the cursor lives *inside* that snapshot. The entity-file header gains a `cursor: u64` field; reading it on startup is free, and the rename makes cursor + state byte-atomic without any additional primitive.
-- **If a write-ahead log is introduced for cross-store atomicity** (already noted under "Cross-store atomicity" above), the cursor goes into the WAL header. Same idea: one atomic checkpoint covers the cursor and the affected stores.
-- **If a "cursor file" is ever exposed as a separate artifact** (e.g. for external tooling), it must be written *before* the snapshot rename — the rename committing the new state implicitly also commits the cursor that referenced it.
+The cursor lives in the `state.snap` header alongside the MutableStore slabs and the authoritative ImmutableStore record counts. One file rename publishes all three simultaneously.
 
-What the migration must NOT do: regress to a standalone `cursor.bin` whose write happens out-of-band from the entity snapshot. That reintroduces the exact failure mode the current design explicitly rejected.
+Commit sequence on each flush boundary:
 
-The migration must answer "what is the atomicity unit?" first, then the cursor location falls out. The current `writeCursorIn` / `readCursorIn` helpers against `_meta` map cleanly to whatever the answer is — these become writes into the new format's header or WAL record, not standalone file I/O.
+```
+1. For each ImmutableStore T with new records:
+     append records to T.events.dat at offset count[T] × record_size[T]
+     fsync(T.events.dat)
+2. Build new state.snap contents in memory:
+     cursor = new_cursor
+     mutable_bytes = current sorted slab sizes
+     immutable_counts = updated counts
+     body = serialized mutable slabs
+3. Write to state.snap.tmp → fsync → rename(state.snap.tmp, state.snap)
+4. fsync(dir)
+```
 
-**Staying with A indefinitely:**
+The atomic primitive is step 3's rename. Before it lands, `state.snap` still references the previous cursor, slab contents, and immutable counts — any newly-appended bytes in `events.dat` past the previous count are invisible to readers. After it lands, the new cursor, new mutable slabs, and new immutable counts are all visible together. There is no intermediate state.
 
-- Continue documenting raw-C-API workarounds for each lmdbx-zig wrapper bug encountered.
-- Cross-language users install MDBX bindings.
-- Performance and feature set match the prototype. No surprises.
+Crash recovery:
 
-**Not chosen (option B, raw mdbx C API):**
+- Crash between 1 and 3: `events.dat` files hold orphan trailing records, but `state.snap` still has the previous `immutable_counts`. Readers bounded by the count see nothing extra. The next commit's append seeks to `count × record_size`, overwriting the orphan bytes. No truncation needed.
+- Crash during 3 (between write and rename): `state.snap.tmp` exists; startup unlinks it. `state.snap` is unchanged.
+- Crash after 3: complete commit. Routine startup.
 
-- Removes wrapper bug surface immediately but does not address cross-language friction or dependency reduction. The migration cost (touch every MDBX call site to replace wrapper calls with raw C) is comparable to the migration to option D, but the destination is less compelling.
+`writeCursorIn` becomes "set cursor field in the in-flight `state.snap` struct"; `readCursorIn` becomes "read `state.snap` header on startup, return cursor field." No out-of-band cursor write is ever introduced — the previously rejected failure mode is structurally impossible under this design.
 
-**Not chosen (option C, SQLite):**
+### Options not chosen
 
-- Best cross-language ecosystem but slower than MDBX and not pure Zig. Useful as an opt-in backend for users who want SQL access, not as the default.
+**Option A — status quo with raw-C-API workarounds.** Wrapper bug surface keeps growing. Cross-language story unchanged. Dependency footprint unchanged.
+
+**Option B — raw mdbx C API.** Eliminates wrapper bugs immediately but does not address cross-language friction or dependency reduction. Migration cost comparable to option D for a less compelling destination.
+
+**Option C — SQLite for entity stores.** Best cross-language ecosystem but slower than MDBX and not pure Zig. Useful as an opt-in backend for users who want SQL access, not as the default.
