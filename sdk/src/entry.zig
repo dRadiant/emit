@@ -188,7 +188,7 @@ pub fn Context(comptime entities: anytype) type {
         ) !T {
             const cache = self._cache orelse return error.NotPrefetched;
             const selector = comptime ethcall.selectorOf(method);
-            const entry = (try cache.get(to, &selector)) orelse return error.NotPrefetched;
+            const entry = cache.get(to, &selector) orelse return error.NotPrefetched;
             if (entry.status != 0) return error.CallReverted;
             return ethcall.decodeAs(T, entry.bytes);
         }
@@ -316,9 +316,10 @@ pub fn init(
     }
 
     // Phase 4: prefetch.
+    const ethcall_dh = try std.fs.cwd().openDir(ethcall_dir, .{});
     const cache = try allocator.create(ethcall.Cache);
     errdefer allocator.destroy(cache);
-    cache.* = try ethcall.Cache.open(ethcall_dir_z);
+    cache.* = try ethcall.Cache.open(allocator, ethcall_dh);
     errdefer cache.close();
     ctx._cache = cache;
 
@@ -1020,12 +1021,7 @@ fn ethCallTestContext(cache: *ethcall.Cache) Context(.{}) {
 }
 
 fn openTestCache(tmp: *std.testing.TmpDir) !ethcall.Cache {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp.dir.realpathZ(".", &path_buf);
-    var path_z: [std.fs.max_path_bytes:0]u8 = undefined;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-    return try ethcall.Cache.open(@ptrCast(&path_z));
+    return try ethcall.Cache.open(testing.allocator, tmp.dir);
 }
 
 test "ethCall returns the cached u8 for a prefetched decimals() pair" {
@@ -1038,7 +1034,7 @@ test "ethCall returns the cached u8 for a prefetched decimals() pair" {
     const SEL = ethcall.selectorOf("decimals()");
     var payload: [32]u8 = std.mem.zeroes([32]u8);
     payload[31] = 6;
-    try cache.put(testing.allocator, USDC, &SEL, 0, &payload);
+    try cache.put(USDC, &SEL, 0, &payload);
 
     var ctx = ethCallTestContext(&cache);
     try testing.expectEqual(@as(u8, 6), try ctx.ethCall(u8, USDC, "decimals()"));
@@ -1075,7 +1071,7 @@ test "ethCall returns CallReverted for a status=1 cached entry" {
 
     const MKR = [_]u8{0x9F} ** 20;
     const SEL = ethcall.selectorOf("decimals()");
-    try cache.put(testing.allocator, MKR, &SEL, 1, &.{});
+    try cache.put(MKR, &SEL, 1, &.{});
 
     var ctx = ethCallTestContext(&cache);
     try testing.expectError(error.CallReverted, ctx.ethCall(u8, MKR, "decimals()"));
@@ -1092,7 +1088,7 @@ test "ethCall decodes [20]u8 from the trailing word bytes" {
     const SEL = ethcall.selectorOf("factory()");
     var payload: [32]u8 = std.mem.zeroes([32]u8);
     @memcpy(payload[12..32], &FACTORY);
-    try cache.put(testing.allocator, ROUTER, &SEL, 0, &payload);
+    try cache.put(ROUTER, &SEL, 0, &payload);
 
     var ctx = ethCallTestContext(&cache);
     const got = try ctx.ethCall([20]u8, ROUTER, "factory()");
@@ -1109,7 +1105,7 @@ test "ethCall decodes u256 from the full word" {
     const SEL = ethcall.selectorOf("totalSupply()");
     var payload: [32]u8 = undefined;
     std.mem.writeInt(u256, &payload, 1_000_000_000_000_000_000_000, .big);
-    try cache.put(testing.allocator, TOKEN, &SEL, 0, &payload);
+    try cache.put(TOKEN, &SEL, 0, &payload);
 
     var ctx = ethCallTestContext(&cache);
     try testing.expectEqual(

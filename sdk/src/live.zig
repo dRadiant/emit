@@ -903,13 +903,8 @@ test "live prefetch hits warm cache, issues no Multicall" {
 
     var cache_tmp = testing.tmpDir(.{});
     defer cache_tmp.cleanup();
-    var cache_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cache_path = try cache_tmp.dir.realpathZ(".", &cache_path_buf);
-    var cache_path_z: [std.fs.max_path_bytes:0]u8 = undefined;
-    @memcpy(cache_path_z[0..cache_path.len], cache_path);
-    cache_path_z[cache_path.len] = 0;
 
-    var cache = try ethcall.Cache.open(@ptrCast(&cache_path_z));
+    var cache = try ethcall.Cache.open(testing.allocator, cache_tmp.dir);
     defer cache.close();
 
     const PairCreated = struct {
@@ -922,7 +917,7 @@ test "live prefetch hits warm cache, issues no Multicall" {
     const sel = ethcall.selectorOf("decimals()");
     var payload: [32]u8 = std.mem.zeroes([32]u8);
     payload[31] = 18;
-    try cache.put(testing.allocator, PAIR, &sel, 0, &payload);
+    try cache.put(PAIR, &sel, 0, &payload);
 
     const Manifest: sdk_manifest.Manifest = .{
         .name = "uni",

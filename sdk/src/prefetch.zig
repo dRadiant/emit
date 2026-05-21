@@ -132,23 +132,20 @@ pub fn dedupe(arena: std.mem.Allocator, calls: []const ethcall.Call) ![]ethcall.
     return out.toOwnedSlice(arena);
 }
 
-/// Drop entries already in the cache; order-preserving. Holds one ro-txn
-/// for the entire scan so we don't pay N txn opens for N calls.
+/// Drop entries already in the cache; order-preserving. Cache lookups
+/// are in-memory hash hits, so no transaction or batch helper is needed.
 pub fn filterUncached(
     arena: std.mem.Allocator,
-    cache: *ethcall.Cache,
+    cache: *const ethcall.Cache,
     calls: []const ethcall.Call,
 ) ![]ethcall.Call {
     if (calls.len == 0) return &.{};
-
-    const txn = try cache.beginRead();
-    defer txn.abort() catch {};
 
     var out: std.ArrayList(ethcall.Call) = .empty;
     try out.ensureTotalCapacity(arena, calls.len);
 
     for (calls) |c| {
-        if ((try cache.lookupInTxn(txn, c.target, c.calldata)) == null) {
+        if (cache.get(c.target, c.calldata) == null) {
             try out.append(arena, c);
         }
     }
@@ -253,12 +250,7 @@ test "filterUncached drops entries already present in the cache" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp.dir.realpathZ(".", &path_buf);
-    var path_z: [std.fs.max_path_bytes:0]u8 = undefined;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-    var cache = try ethcall.Cache.open(@ptrCast(&path_z));
+    var cache = try ethcall.Cache.open(std.testing.allocator, tmp.dir);
     defer cache.close();
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -272,7 +264,7 @@ test "filterUncached drops entries already present in the cache" {
     // Pre-warm A's decimals() in the cache.
     var payload: [32]u8 = std.mem.zeroes([32]u8);
     payload[31] = 18;
-    try cache.put(std.testing.allocator, A, &SEL, 0, &payload);
+    try cache.put(A, &SEL, 0, &payload);
 
     var raw = try arena.alloc(ethcall.Call, 2);
     raw[0] = .{ .target = A, .calldata = &SEL }; // already cached

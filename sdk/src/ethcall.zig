@@ -1,39 +1,46 @@
-/// MDBX-backed cache for immutable eth_call results, kept in its own env at
-/// `<data_dir>/ethcall/` so wiping the entity store doesn't invalidate it.
+/// Flat-file cache for immutable eth_call results, kept at
+/// `<data_dir>/ethcall.dat` so wiping the entity state doesn't invalidate it.
 ///
-/// Key layout (52 bytes): address [20]u8 || keccak256(calldata) [32]u8
-/// Value layout (1 + N): status u8(0 ok, 1 revert) || raw return bytes
+/// On-disk record (length-prefixed):
+///   target           [20]u8
+///   calldata_hash    [32]u8       keccak256(calldata), forms the cache key suffix
+///   status           u8           0 = success, 1 = reverted
+///   value_len        u32 LE
+///   value            [value_len]u8
 ///
 /// Entries never expire: results are immutable at the call site (decimals,
-/// symbol, factory address, etc.) and we always call at `latest`.
+/// symbol, factory address, etc.) and we always call at `latest`. The cache
+/// is advisory; corruption is detected on open, the file is reset, and the
+/// next prefetch pass repopulates from RPC.
+///
+/// Lookups are O(1) via an in-memory hash map built on open. Writes append
+/// to the file and update the map; an out-of-band crash leaves a truncated
+/// last record which `open` detects and truncates away, so the next append
+/// continues from a clean boundary.
 const std = @import("std");
 
+const core = @import("core");
 const eth = @import("eth");
-const lmdbx = @import("lmdbx");
 
-/// Default Multicall3 chunk size; fits comfortably under typical RPC payload
-/// limits and the Multicall3 gas budget.
 pub const DEFAULT_BATCH_SIZE: usize = 500;
 
-/// One declared eth_call. `calldata` is the full call payload (4-byte
-/// selector for no-argument methods).
+const MAGIC: core.flat_format.Magic = "EMITCALL".*;
+const HEADER_SIZE: usize = core.flat_format.MAGIC_SIZE;
+const RECORD_HEADER_SIZE: usize = 20 + 32 + 1 + 4;
+
 pub const Call = struct {
     target: [20]u8,
     calldata: []const u8,
 };
 
-/// Result of a cache lookup. `bytes` points into the mmap'd MDBX value and
-/// remains valid for the lifetime of the env (entries are never deleted).
+/// Borrowed view of a cached entry. `bytes` is owned by the cache and
+/// remains valid until the next overwrite (rare; entries are upserted) or
+/// `close`. Callers must not free.
 pub const CachedEntry = struct {
     status: u8,
     bytes: []const u8,
 };
 
-/// Comptime 4-byte selector for a Solidity method. Shared between
-/// `prefetch.zig` (queue calldata) and `entry.zig` (cache lookup) so the
-/// method string produces the same selector at both sites. `eth.keccak.hash`
-/// sets only a 10k eval-branch quota internally, which is insufficient for
-/// the keccak permutation at comptime — hence the 200k bump here.
 pub fn selectorOf(comptime method: []const u8) [4]u8 {
     return comptime blk: {
         @setEvalBranchQuota(200_000);
@@ -42,9 +49,6 @@ pub fn selectorOf(comptime method: []const u8) [4]u8 {
     };
 }
 
-/// Decode an ABI-encoded 32-byte word into `T`. Supports any int (truncated
-/// from the big-endian u256), `bool` (LSB), `[20]u8` (trailing bytes — EVM
-/// address layout), and `[N]u8` for N ≤ 32 (left-aligned bytes32-class).
 pub fn decodeAs(comptime T: type, bytes: []const u8) !T {
     if (bytes.len < 32) return error.MalformedResult;
     const word = bytes[0..32];
@@ -59,8 +63,6 @@ pub fn decodeAs(comptime T: type, bytes: []const u8) !T {
             if (arr.child != u8) @compileError(
                 "ethcall.decodeAs: arrays must be `[N]u8`; got `" ++ @typeName(T) ++ "`",
             );
-            // [20]u8 is the EVM address layout: trailing 20 bytes of the word.
-            // Any other fixed length is bytes32-class: left-aligned.
             if (arr.len == 20) break :blk word[12..32].*;
             if (arr.len > 32) @compileError(
                 "ethcall.decodeAs: arrays larger than 32 bytes cannot fit in one ABI word",
@@ -74,8 +76,6 @@ pub fn decodeAs(comptime T: type, bytes: []const u8) !T {
     };
 }
 
-/// Form the 52-byte cache key for a `(target, calldata)` pair. Stable across
-/// SDK versions so the cache survives upgrades.
 pub fn cacheKey(target: [20]u8, calldata: []const u8) [52]u8 {
     var k: [52]u8 = undefined;
     @memcpy(k[0..20], &target);
@@ -84,108 +84,138 @@ pub fn cacheKey(target: [20]u8, calldata: []const u8) [52]u8 {
     return k;
 }
 
+const OwnedEntry = struct {
+    status: u8,
+    bytes: []u8,
+};
+
 pub const Cache = struct {
-    env: lmdbx.Environment,
-    dbi: lmdbx.Database.DBI,
+    allocator: std.mem.Allocator,
+    file: std.fs.File,
+    entries: std.AutoHashMapUnmanaged([52]u8, OwnedEntry),
 
-    /// Open or create the cache at `dir_path` (caller mkdir's).
-    pub fn open(dir_path: [*:0]const u8) !Cache {
-        const env = try lmdbx.Environment.init(dir_path, .{ .max_dbs = 1 });
-        errdefer env.deinit() catch {};
+    /// Open or create `<dir>/ethcall.dat`. A corrupted-on-disk file (bad
+    /// magic, truncated record) is reset to empty; the next prefetch pass
+    /// rebuilds the relevant entries from RPC.
+    pub fn open(allocator: std.mem.Allocator, dir: std.fs.Dir) !Cache {
+        var self = Cache{
+            .allocator = allocator,
+            .file = core.flat_format.openOrCreateWithMagic(dir, "ethcall.dat", MAGIC) catch |err| switch (err) {
+                error.InvalidMagic => try core.flat_format.createWithMagic(dir, "ethcall.dat", MAGIC),
+                else => return err,
+            },
+            .entries = .{},
+        };
 
-        const txn = try lmdbx.Transaction.init(env, .{});
-        errdefer txn.abort() catch {};
-        const db = try lmdbx.Database.open(txn, "calls", .{ .create = true });
-        try txn.commit();
+        self.loadFromFile() catch {
+            // Corruption past the magic: reset to empty.
+            self.clearEntries();
+            self.file.close();
+            self.file = try core.flat_format.createWithMagic(dir, "ethcall.dat", MAGIC);
+        };
+        return self;
+    }
 
-        return .{ .env = env, .dbi = db.dbi };
+    /// Scan records past the magic into the in-memory map. A truncated
+    /// last record is detected and the file is truncated back to the last
+    /// good boundary so the next append continues cleanly. Any unrecoverable
+    /// corruption (mid-record garbage, impossible value_len) raises so the
+    /// caller's reset-to-empty path fires.
+    fn loadFromFile(self: *Cache) !void {
+        const stat = try self.file.stat();
+        if (stat.size < HEADER_SIZE) return error.Truncated;
+
+        var pos: u64 = HEADER_SIZE;
+        while (pos < stat.size) {
+            if (pos + RECORD_HEADER_SIZE > stat.size) {
+                try self.file.setEndPos(pos);
+                return;
+            }
+            var hdr: [RECORD_HEADER_SIZE]u8 = undefined;
+            if ((try self.file.pread(&hdr, pos)) != RECORD_HEADER_SIZE) return error.Truncated;
+
+            const value_len = std.mem.readInt(u32, hdr[53..57], .little);
+            const record_end = pos + RECORD_HEADER_SIZE + value_len;
+            if (record_end > stat.size) {
+                try self.file.setEndPos(pos);
+                return;
+            }
+
+            const value = try self.allocator.alloc(u8, value_len);
+            errdefer self.allocator.free(value);
+            if ((try self.file.pread(value, pos + RECORD_HEADER_SIZE)) != value_len) return error.Truncated;
+
+            var key: [52]u8 = undefined;
+            @memcpy(key[0..20], hdr[0..20]);
+            @memcpy(key[20..52], hdr[20..52]);
+
+            const gop = try self.entries.getOrPut(self.allocator, key);
+            if (gop.found_existing) self.allocator.free(gop.value_ptr.bytes);
+            gop.value_ptr.* = .{ .status = hdr[52], .bytes = value };
+
+            pos = record_end;
+        }
+    }
+
+    fn clearEntries(self: *Cache) void {
+        var it = self.entries.valueIterator();
+        while (it.next()) |v| self.allocator.free(v.bytes);
+        self.entries.deinit(self.allocator);
+        self.entries = .{};
     }
 
     pub fn close(self: *Cache) void {
-        self.env.deinit() catch {};
+        self.clearEntries();
+        self.file.close();
     }
 
     /// Idempotent upsert. Status 1 records a revert so re-runs don't refetch.
     pub fn put(
         self: *Cache,
-        allocator: std.mem.Allocator,
         target: [20]u8,
         calldata: []const u8,
         status: u8,
         bytes: []const u8,
     ) !void {
-        const txn = try lmdbx.Transaction.init(self.env, .{});
-        errdefer txn.abort() catch {};
-        try self.writeInTxn(allocator, txn, target, calldata, status, bytes);
-        try txn.commit();
+        const key = cacheKey(target, calldata);
+
+        const total = RECORD_HEADER_SIZE + bytes.len;
+        const buf = try self.allocator.alloc(u8, total);
+        defer self.allocator.free(buf);
+        @memcpy(buf[0..20], &target);
+        @memcpy(buf[20..52], key[20..52]);
+        buf[52] = status;
+        std.mem.writeInt(u32, buf[53..57], @intCast(bytes.len), .little);
+        @memcpy(buf[57..], bytes);
+
+        const end = try self.file.getEndPos();
+        try self.file.pwriteAll(buf, end);
+        try self.file.sync();
+
+        const owned = try self.allocator.dupe(u8, bytes);
+        errdefer self.allocator.free(owned);
+        const gop = try self.entries.getOrPut(self.allocator, key);
+        if (gop.found_existing) self.allocator.free(gop.value_ptr.bytes);
+        gop.value_ptr.* = .{ .status = status, .bytes = owned };
     }
 
-    /// Most cached payloads are a single 32-byte ABI word; the +1 covers the
-    /// status prefix. Sized to cover the long tail of decimals/factory/bool
-    /// returns without an allocator round-trip.
-    const STACK_VALUE_BUF = 64;
-
-    fn writeInTxn(
-        self: *Cache,
-        allocator: std.mem.Allocator,
-        txn: lmdbx.Transaction,
-        target: [20]u8,
-        calldata: []const u8,
-        status: u8,
-        bytes: []const u8,
-    ) !void {
-        var stack_buf: [STACK_VALUE_BUF]u8 = undefined;
-        const need = 1 + bytes.len;
-        const value = if (need <= stack_buf.len) stack_buf[0..need] else try allocator.alloc(u8, need);
-        defer if (need > stack_buf.len) allocator.free(value);
-        value[0] = status;
-        @memcpy(value[1..], bytes);
-
-        const k = cacheKey(target, calldata);
-        const db = lmdbx.Database{ .txn = txn, .dbi = self.dbi };
-        try db.set(&k, value, .Upsert);
+    /// Borrow the cached entry for `(target, calldata)`. The returned slice
+    /// is valid until the next `put` for the same key, or `close`.
+    pub fn get(self: *const Cache, target: [20]u8, calldata: []const u8) ?CachedEntry {
+        const key = cacheKey(target, calldata);
+        if (self.entries.getPtr(key)) |e| {
+            return .{ .status = e.status, .bytes = e.bytes };
+        }
+        return null;
     }
 
-    /// `null` when absent. `bytes` is mmap-resident and outlives the call.
-    pub fn get(
-        self: *Cache,
-        target: [20]u8,
-        calldata: []const u8,
-    ) !?CachedEntry {
-        const txn = try lmdbx.Transaction.init(self.env, .{ .mode = .ReadOnly });
-        defer txn.abort() catch {};
-        return self.lookupInTxn(txn, target, calldata);
+    pub fn contains(self: *const Cache, target: [20]u8, calldata: []const u8) bool {
+        return self.entries.contains(cacheKey(target, calldata));
     }
 
-    /// Read a cached pair under a borrowed ro-txn; lets bulk callers (e.g.
-    /// `filterUncached`) share one txn instead of paying N opens.
-    pub fn lookupInTxn(
-        self: *Cache,
-        txn: lmdbx.Transaction,
-        target: [20]u8,
-        calldata: []const u8,
-    ) !?CachedEntry {
-        const k = cacheKey(target, calldata);
-        const db = lmdbx.Database{ .txn = txn, .dbi = self.dbi };
-        const raw = (try db.get(&k)) orelse return null;
-        if (raw.len < 1) return error.MalformedResult;
-        return .{ .status = raw[0], .bytes = raw[1..] };
-    }
-
-    /// Open a read-only transaction on the cache env. Caller aborts.
-    pub fn beginRead(self: *Cache) !lmdbx.Transaction {
-        return try lmdbx.Transaction.init(self.env, .{ .mode = .ReadOnly });
-    }
-
-    pub fn contains(self: *Cache, target: [20]u8, calldata: []const u8) !bool {
-        return (try self.get(target, calldata)) != null;
-    }
-
-    /// Chunk `calls` through Multicall3 (one HTTP RTT per `batch_size`),
-    /// write every result under a single MDBX write txn per batch — N+1
-    /// fsync-per-result is the classic regression to watch for here. On
-    /// network or decode failure: `error.MulticallFailed`, in-flight batch
-    /// rolls back, prior batches retain their writes.
+    /// Chunk `calls` through Multicall3, writing each result via `put`.
+    /// One HTTP RTT per `batch_size`. On network or decode failure the
+    /// in-flight batch is dropped; prior batches retain their writes.
     pub fn preload(
         self: *Cache,
         allocator: std.mem.Allocator,
@@ -204,42 +234,31 @@ pub const Cache = struct {
             defer eth.multicall.freeResults(allocator, results);
             if (results.len != batch.len) return error.MulticallFailed;
 
-            const txn = try lmdbx.Transaction.init(self.env, .{});
-            errdefer txn.abort() catch {};
             for (batch, results) |c, r| {
                 const status: u8 = if (r.success) 0 else 1;
-                try self.writeInTxn(allocator, txn, c.target, c.calldata, status, r.return_data);
+                try self.put(c.target, c.calldata, status, r.return_data);
             }
-            try txn.commit();
         }
     }
 };
 
 // ── Tests ────────────────────────────────────────────────────────────────
 
-fn openTestCache(tmp: *std.testing.TmpDir) !Cache {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp.dir.realpathZ(".", &path_buf);
-    var path_z: [std.fs.max_path_bytes:0]u8 = undefined;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-    return try Cache.open(@ptrCast(&path_z));
-}
+const testing = std.testing;
 
 test "cacheKey is deterministic and packs address+hash" {
     const TARGET = [_]u8{0xAB} ** 20;
-    const CALLDATA = [_]u8{ 0x31, 0x3c, 0xe5, 0x67 }; // decimals() selector
+    const CALLDATA = [_]u8{ 0x31, 0x3c, 0xe5, 0x67 };
     const k1 = cacheKey(TARGET, &CALLDATA);
     const k2 = cacheKey(TARGET, &CALLDATA);
-    try std.testing.expectEqualSlices(u8, &k1, &k2);
-    try std.testing.expectEqualSlices(u8, &TARGET, k1[0..20]);
-    // Hash bytes are non-zero (keccak of any non-empty input is non-zero w.h.p.).
+    try testing.expectEqualSlices(u8, &k1, &k2);
+    try testing.expectEqualSlices(u8, &TARGET, k1[0..20]);
     var any_nonzero = false;
     for (k1[20..52]) |b| if (b != 0) {
         any_nonzero = true;
         break;
     };
-    try std.testing.expect(any_nonzero);
+    try testing.expect(any_nonzero);
 }
 
 test "cacheKey differentiates target and calldata" {
@@ -247,58 +266,57 @@ test "cacheKey differentiates target and calldata" {
     const B = [_]u8{0xBB} ** 20;
     const CALL1 = [_]u8{ 0x31, 0x3c, 0xe5, 0x67 };
     const CALL2 = [_]u8{ 0x95, 0xd8, 0x9b, 0x41 };
-    try std.testing.expect(!std.mem.eql(u8, &cacheKey(A, &CALL1), &cacheKey(B, &CALL1)));
-    try std.testing.expect(!std.mem.eql(u8, &cacheKey(A, &CALL1), &cacheKey(A, &CALL2)));
+    try testing.expect(!std.mem.eql(u8, &cacheKey(A, &CALL1), &cacheKey(B, &CALL1)));
+    try testing.expect(!std.mem.eql(u8, &cacheKey(A, &CALL1), &cacheKey(A, &CALL2)));
 }
 
 test "put + get round-trips status and bytes" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var cache = try openTestCache(&tmp);
+    var cache = try Cache.open(testing.allocator, tmp.dir);
     defer cache.close();
 
     const TARGET = [_]u8{0xCC} ** 20;
     const CALLDATA = [_]u8{ 0x31, 0x3c, 0xe5, 0x67 };
-    // ABI-encoded u8 = 18 (right-aligned in 32-byte word).
     var payload: [32]u8 = std.mem.zeroes([32]u8);
     payload[31] = 18;
-    try cache.put(std.testing.allocator, TARGET, &CALLDATA, 0, &payload);
+    try cache.put(TARGET, &CALLDATA, 0, &payload);
 
-    const entry = (try cache.get(TARGET, &CALLDATA)) orelse return error.TestUnexpectedNull;
-    try std.testing.expectEqual(@as(u8, 0), entry.status);
-    try std.testing.expectEqualSlices(u8, &payload, entry.bytes);
+    const entry = cache.get(TARGET, &CALLDATA) orelse return error.TestUnexpectedNull;
+    try testing.expectEqual(@as(u8, 0), entry.status);
+    try testing.expectEqualSlices(u8, &payload, entry.bytes);
 }
 
 test "get returns null when the key is absent" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var cache = try openTestCache(&tmp);
+    var cache = try Cache.open(testing.allocator, tmp.dir);
     defer cache.close();
 
     const TARGET = [_]u8{0xDD} ** 20;
     const CALLDATA = [_]u8{ 0x31, 0x3c, 0xe5, 0x67 };
-    try std.testing.expectEqual(@as(?CachedEntry, null), try cache.get(TARGET, &CALLDATA));
+    try testing.expectEqual(@as(?CachedEntry, null), cache.get(TARGET, &CALLDATA));
 }
 
 test "put with status=1 round-trips an empty-payload revert" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var cache = try openTestCache(&tmp);
+    var cache = try Cache.open(testing.allocator, tmp.dir);
     defer cache.close();
 
     const TARGET = [_]u8{0xEE} ** 20;
     const CALLDATA = [_]u8{ 0x95, 0xd8, 0x9b, 0x41 };
-    try cache.put(std.testing.allocator, TARGET, &CALLDATA, 1, &.{});
+    try cache.put(TARGET, &CALLDATA, 1, &.{});
 
-    const entry = (try cache.get(TARGET, &CALLDATA)) orelse return error.TestUnexpectedNull;
-    try std.testing.expectEqual(@as(u8, 1), entry.status);
-    try std.testing.expectEqual(@as(usize, 0), entry.bytes.len);
+    const entry = cache.get(TARGET, &CALLDATA) orelse return error.TestUnexpectedNull;
+    try testing.expectEqual(@as(u8, 1), entry.status);
+    try testing.expectEqual(@as(usize, 0), entry.bytes.len);
 }
 
 test "put is idempotent (overwrite preserves last value)" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var cache = try openTestCache(&tmp);
+    var cache = try Cache.open(testing.allocator, tmp.dir);
     defer cache.close();
 
     const TARGET = [_]u8{0xFF} ** 20;
@@ -307,85 +325,83 @@ test "put is idempotent (overwrite preserves last value)" {
     first[31] = 6;
     var second: [32]u8 = std.mem.zeroes([32]u8);
     second[31] = 18;
-    try cache.put(std.testing.allocator, TARGET, &CALLDATA, 0, &first);
-    try cache.put(std.testing.allocator, TARGET, &CALLDATA, 0, &second);
+    try cache.put(TARGET, &CALLDATA, 0, &first);
+    try cache.put(TARGET, &CALLDATA, 0, &second);
 
-    const entry = (try cache.get(TARGET, &CALLDATA)) orelse return error.TestUnexpectedNull;
-    try std.testing.expectEqualSlices(u8, &second, entry.bytes);
+    const entry = cache.get(TARGET, &CALLDATA) orelse return error.TestUnexpectedNull;
+    try testing.expectEqualSlices(u8, &second, entry.bytes);
 }
 
-test "contains tracks presence without value-read cost (interface contract)" {
-    var tmp = std.testing.tmpDir(.{});
+test "contains tracks presence" {
+    var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var cache = try openTestCache(&tmp);
+    var cache = try Cache.open(testing.allocator, tmp.dir);
     defer cache.close();
 
     const TARGET = [_]u8{0x11} ** 20;
     const CALLDATA = [_]u8{ 0x31, 0x3c, 0xe5, 0x67 };
-    try std.testing.expect(!(try cache.contains(TARGET, &CALLDATA)));
+    try testing.expect(!cache.contains(TARGET, &CALLDATA));
 
     var payload: [32]u8 = std.mem.zeroes([32]u8);
     payload[31] = 8;
-    try cache.put(std.testing.allocator, TARGET, &CALLDATA, 0, &payload);
-    try std.testing.expect(try cache.contains(TARGET, &CALLDATA));
+    try cache.put(TARGET, &CALLDATA, 0, &payload);
+    try testing.expect(cache.contains(TARGET, &CALLDATA));
 }
 
 test "decodeAs reads u8 from the trailing byte of a 32-byte word" {
     var word: [32]u8 = std.mem.zeroes([32]u8);
     word[31] = 18;
-    try std.testing.expectEqual(@as(u8, 18), try decodeAs(u8, &word));
+    try testing.expectEqual(@as(u8, 18), try decodeAs(u8, &word));
 }
 
 test "decodeAs reads u256 from the full 32-byte word" {
     var word: [32]u8 = undefined;
     std.mem.writeInt(u256, &word, 0xdead_beef_cafe_babe, .big);
-    try std.testing.expectEqual(@as(u256, 0xdead_beef_cafe_babe), try decodeAs(u256, &word));
+    try testing.expectEqual(@as(u256, 0xdead_beef_cafe_babe), try decodeAs(u256, &word));
 }
 
 test "decodeAs reads u112 by truncating the u256 view" {
-    // Sync(uint112,uint112): low 112 bits of the word are the value.
     var word: [32]u8 = std.mem.zeroes([32]u8);
-    word[19] = 0xAB; // bit 152 (above u112 range, must be ignored if upper bits were set)
+    word[19] = 0xAB;
     std.mem.writeInt(u256, &word, 0x1234_5678, .big);
     const got = try decodeAs(u112, &word);
-    try std.testing.expectEqual(@as(u112, 0x1234_5678), got);
+    try testing.expectEqual(@as(u112, 0x1234_5678), got);
 }
 
 test "decodeAs reads a signed i32 with sign extension" {
     var word: [32]u8 = std.mem.zeroes([32]u8);
-    // -1 in i256 has all bits set.
     @memset(&word, 0xFF);
-    try std.testing.expectEqual(@as(i32, -1), try decodeAs(i32, &word));
+    try testing.expectEqual(@as(i32, -1), try decodeAs(i32, &word));
 }
 
 test "decodeAs reads bool from the LSB" {
     var word_true: [32]u8 = std.mem.zeroes([32]u8);
     word_true[31] = 1;
     var word_false: [32]u8 = std.mem.zeroes([32]u8);
-    try std.testing.expect(try decodeAs(bool, &word_true));
-    try std.testing.expect(!(try decodeAs(bool, &word_false)));
+    try testing.expect(try decodeAs(bool, &word_true));
+    try testing.expect(!(try decodeAs(bool, &word_false)));
 }
 
 test "decodeAs reads an EVM address from the trailing 20 bytes" {
     var word: [32]u8 = std.mem.zeroes([32]u8);
     const ADDR = [_]u8{0xAB} ** 20;
     @memcpy(word[12..32], &ADDR);
-    try std.testing.expectEqualSlices(u8, &ADDR, &(try decodeAs([20]u8, &word)));
+    try testing.expectEqualSlices(u8, &ADDR, &(try decodeAs([20]u8, &word)));
 }
 
 test "decodeAs reads bytes32-class from the left-aligned head" {
     var word: [32]u8 = std.mem.zeroes([32]u8);
     word[0..4].* = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xAA, 0xBB, 0xCC, 0xDD }, &(try decodeAs([4]u8, &word)));
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xAA, 0xBB, 0xCC, 0xDD }, &(try decodeAs([4]u8, &word)));
 }
 
 test "decodeAs returns MalformedResult for a short payload" {
     var short: [4]u8 = .{ 1, 2, 3, 4 };
-    try std.testing.expectError(error.MalformedResult, decodeAs(u8, &short));
+    try testing.expectError(error.MalformedResult, decodeAs(u8, &short));
 }
 
 test "cache survives close and re-open" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const TARGET = [_]u8{0x22} ** 20;
@@ -394,13 +410,71 @@ test "cache survives close and re-open" {
     payload[31] = 18;
 
     {
-        var cache = try openTestCache(&tmp);
-        try cache.put(std.testing.allocator, TARGET, &CALLDATA, 0, &payload);
+        var cache = try Cache.open(testing.allocator, tmp.dir);
+        try cache.put(TARGET, &CALLDATA, 0, &payload);
         cache.close();
     }
 
-    var cache = try openTestCache(&tmp);
+    var cache = try Cache.open(testing.allocator, tmp.dir);
     defer cache.close();
-    const entry = (try cache.get(TARGET, &CALLDATA)) orelse return error.TestUnexpectedNull;
-    try std.testing.expectEqualSlices(u8, &payload, entry.bytes);
+    const entry = cache.get(TARGET, &CALLDATA) orelse return error.TestUnexpectedNull;
+    try testing.expectEqualSlices(u8, &payload, entry.bytes);
+}
+
+test "truncated last record is dropped on open without raising" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const TARGET = [_]u8{0x33} ** 20;
+    const CALLDATA = [_]u8{ 0x31, 0x3c, 0xe5, 0x67 };
+    var payload: [32]u8 = std.mem.zeroes([32]u8);
+    payload[31] = 18;
+
+    {
+        var cache = try Cache.open(testing.allocator, tmp.dir);
+        try cache.put(TARGET, &CALLDATA, 0, &payload);
+        cache.close();
+    }
+
+    // Simulate a crashed append: tack on a partial record (missing payload bytes).
+    {
+        const f = try tmp.dir.openFile("ethcall.dat", .{ .mode = .read_write });
+        defer f.close();
+        const end = try f.getEndPos();
+        var partial: [RECORD_HEADER_SIZE]u8 = undefined;
+        @memset(&partial, 0xAA);
+        std.mem.writeInt(u32, partial[53..57], 100, .little); // claim 100 bytes that don't follow
+        try f.pwriteAll(&partial, end);
+    }
+
+    // Reopen: the partial record gets truncated; the good entry survives.
+    var cache = try Cache.open(testing.allocator, tmp.dir);
+    defer cache.close();
+    const entry = cache.get(TARGET, &CALLDATA) orelse return error.TestUnexpectedNull;
+    try testing.expectEqualSlices(u8, &payload, entry.bytes);
+}
+
+test "corrupted magic resets the cache to empty without raising" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("ethcall.dat", .{});
+        defer f.close();
+        try f.writeAll(&[_]u8{0xFF} ** 32);
+    }
+
+    var cache = try Cache.open(testing.allocator, tmp.dir);
+    defer cache.close();
+
+    // Cache is empty after corruption recovery.
+    try testing.expect(!cache.contains([_]u8{0} ** 20, &[_]u8{0}));
+
+    // Future puts work normally against the reset file.
+    const TARGET = [_]u8{0x44} ** 20;
+    const CALLDATA = [_]u8{ 0x31, 0x3c, 0xe5, 0x67 };
+    var payload: [32]u8 = std.mem.zeroes([32]u8);
+    payload[31] = 7;
+    try cache.put(TARGET, &CALLDATA, 0, &payload);
+    try testing.expect(cache.contains(TARGET, &CALLDATA));
 }
