@@ -128,6 +128,9 @@ pub fn MutableStore(comptime T: type) type {
 
         /// Upsert every overlay entry tagged with `block` into MDBX via the
         /// active txn, then drop them. Entries with other tags stay pending.
+        /// Cache mirrors the committed value as clean — without this, a
+        /// subsequent live load that misses the overlay would hit a stale
+        /// cached pre-overlay value instead of the just-committed bytes.
         pub fn commitBlock(self: *Self, block: u64) !void {
             if (self.pending.count() == 0) return;
             const db = lmdbx.Database{ .txn = self.active_txn.*, .dbi = self.dbi };
@@ -141,6 +144,7 @@ pub fn MutableStore(comptime T: type) type {
                 entity_serial.encodeKey(KeyField, entry.key_ptr.*, &key_buf);
                 entity_serial.serialize(T, entry.value_ptr.value, &val_buf);
                 try db.set(&key_buf, &val_buf, .Upsert);
+                try self.cache.put(entry.key_ptr.*, .{ .entity = entry.value_ptr.value, .dirty = false });
                 try to_remove.append(self.allocator, entry.key_ptr.*);
             }
             for (to_remove.items) |k| _ = self.pending.remove(k);
@@ -367,6 +371,46 @@ test "commitBlock flushes only the matching block's slice" {
     entity_serial.encodeKey(S.Key, bob, &key_buf);
     try std.testing.expect((try db.get(&key_buf)) == null);
     try std.testing.expectEqual(@as(u32, 1), store.pendingCount());
+
+    try current_txn.commit();
+}
+
+test "commitBlock refreshes cache so a later live load sees the committed value" {
+    const S = MutableStore(Account);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const env = try openTestEnv(&tmp);
+    defer env.deinit() catch {};
+
+    const alice = [_]u8{0xAA} ** 20;
+
+    // Seed MDBX with alice.balance = 100 and warm the cache via load.
+    {
+        var current_txn = try env.transaction(.{});
+        var store = try S.open(std.testing.allocator, &current_txn, "accounts");
+        defer store.deinit();
+        try store.save(.{ .id = alice, .balance = 100 });
+        try store.flush();
+        try current_txn.commit();
+    }
+
+    var current_txn = try env.transaction(.{});
+    var store = try S.open(std.testing.allocator, &current_txn, "accounts");
+    defer store.deinit();
+    store.live = true;
+
+    // Warm the cache at value=100 (the stale read).
+    _ = try store.load(alice);
+
+    // Block 200 writes balance=500 to the overlay, then commits.
+    store.live_block = 200;
+    try store.save(.{ .id = alice, .balance = 500 });
+    try store.commitBlock(200);
+
+    // Without the cache refresh, this would resolve to the stale cached
+    // value=100 instead of the freshly-committed value=500.
+    const got = (try store.load(alice)).?;
+    try std.testing.expectEqual(@as(u256, 500), got.balance);
 
     try current_txn.commit();
 }
