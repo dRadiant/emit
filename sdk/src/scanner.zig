@@ -1,27 +1,28 @@
 /// Filtered-index scanner. Two entry points:
 ///
-/// - `scanCreations(env, manifest, allocator)` walks `BLOCKS_PRIMARY` and
-///   dispatches only factory creation events to a comptime-restricted
+/// - `scanCreations(dir, manifest, allocator)` walks the `primary` filtered
+///   pair and dispatches only factory creation events to a comptime-restricted
 ///   collector that returns the discovered child addresses. No user
 ///   handlers run. Phase 2 of the four-phase pipeline.
 ///
-/// - `replay(env, manifest, Handler, ctx, options)` walks `BLOCKS_PRIMARY`
-///   (always) and `BLOCKS_CHILDREN` (when present), k-way-merges logs by
+/// - `replay(dir, manifest, Handler, ctx, options)` walks the `primary` pair
+///   (always) and `children` pair (when present), k-way-merges logs by
 ///   `(block_number, tx_index, log_index)`, and dispatches each to the
 ///   user's handler via `handler.dispatcherFor(manifest).dispatch`. Phase 4.
 ///
-/// Both functions assume the env was produced by `filter_builder` and
-/// therefore that DBI names match `filter_builder.DBI_PRIMARY` and
-/// `filter_builder.DBI_CHILDREN`.
+/// Both functions assume the pairs were produced by `filter_builder` and
+/// therefore the file names follow `BASE_PRIMARY` / `BASE_CHILDREN`.
 const std = @import("std");
 
 const core = @import("core");
-const lmdbx = @import("lmdbx");
 
 const filter_builder = @import("filter_builder.zig");
+const filtered_store_mod = @import("filtered_store.zig");
 const handler_mod = @import("handler.zig");
 const humanize = @import("humanize.zig");
 const sdk_manifest = @import("manifest.zig");
+
+const FilteredStore = filtered_store_mod.FilteredStore;
 
 const RawLog = core.RawLog;
 const log_serial = core.log_serial;
@@ -50,35 +51,32 @@ pub const ReplayResult = struct {
 /// returned hashmap. Returns an empty map for factory-free manifests, for
 /// envs missing `BLOCKS_PRIMARY`, and for empty filtered indexes.
 pub fn scanCreations(
-    env: lmdbx.Environment,
+    dir: std.fs.Dir,
     comptime m: sdk_manifest.Manifest,
     allocator: std.mem.Allocator,
 ) !std.AutoHashMap([20]u8, void) {
     var discovered = std.AutoHashMap([20]u8, void).init(allocator);
     if (comptime m.factories.len == 0) return discovered;
 
-    const txn = try env.transaction(.{ .mode = .ReadOnly });
-    defer txn.abort() catch {};
+    var primary = FilteredStore.open(allocator, dir, filter_builder.BASE_PRIMARY) catch return discovered;
+    defer primary.deinit();
 
-    const db = lmdbx.Database.open(txn, filter_builder.DBI_PRIMARY, .{}) catch return discovered;
-    var cursor = try db.cursor();
-    defer cursor.deinit();
-
-    // Heap-allocated; runs on the main thread (see buffer rule in `core.parallel`).
     const decompress_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
     defer allocator.free(decompress_buf);
+    const payload_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
+    defer allocator.free(payload_buf);
     const log_buf = try allocator.alloc(RawLog, types.MAX_LOGS_PER_BLOCK);
     defer allocator.free(log_buf);
 
-    var key_opt = cursor.goToFirst() catch return discovered;
-    while (key_opt) |k| : (key_opt = try cursor.goToNext()) {
-        const block_number = filter_builder.blockFromKey(k);
-        const value = try cursor.getCurrentValue();
-        const decoded = log_serial.decompressEntry(value, decompress_buf) catch continue;
+    var i: u64 = 0;
+    while (i < primary.count()) : (i += 1) {
+        const entry = try primary.readEntry(i);
+        const payload = primary.readPayload(i, payload_buf) catch continue;
+        const decoded = log_serial.decompressEntry(payload, decompress_buf) catch continue;
         const log_count = log_serial.deserializeLogs(decoded, log_buf);
 
         for (log_buf[0..log_count]) |*log| {
-            log.block_number = block_number;
+            log.block_number = entry.block_number;
             if (log.topic_count == 0) continue;
             inline for (m.factories) |f| {
                 const create_topic = comptime sdk_manifest.eventTopic0(f.create_event);
@@ -104,7 +102,7 @@ pub fn scanCreations(
 /// MDBX-bound to the thread that opened it; the buffer rule in
 /// `core.parallel` then requires heap allocation.
 pub fn replay(
-    env: lmdbx.Environment,
+    dir: std.fs.Dir,
     comptime m: sdk_manifest.Manifest,
     comptime Handler: type,
     ctx: anytype,
@@ -116,15 +114,14 @@ pub fn replay(
 
     comptime handler_mod.dispatcherFor(m).validateHandler(Handler);
 
-    const txn = try env.transaction(.{ .mode = .ReadOnly });
-    defer txn.abort() catch {};
+    const allocator = ctxAllocator(ctx);
 
-    // PRIMARY may not exist when filter_builder.build matched zero blocks
-    // (e.g. a fresh `--follow` run before any historical match). Treat
-    // identically to the BLOCKS_CHILDREN absence: empty walker, no work.
+    // The primary pair may not exist when filter_builder.build matched zero
+    // blocks (e.g. a fresh `--follow` run before any historical match).
+    // Treat identically to the children pair: empty walker, no work.
     var primary_storage: CursorWalker = undefined;
     var primary: ?*CursorWalker = null;
-    if (CursorWalker.open(txn, filter_builder.DBI_PRIMARY, options.start_block)) |w| {
+    if (CursorWalker.open(allocator, dir, filter_builder.BASE_PRIMARY, options.start_block)) |w| {
         primary_storage = w;
         primary = &primary_storage;
     } else |_| {}
@@ -134,14 +131,13 @@ pub fn replay(
     var children_storage: CursorWalker = undefined;
     var children: ?*CursorWalker = null;
     if (has_children) {
-        if (CursorWalker.open(txn, filter_builder.DBI_CHILDREN, options.start_block)) |w| {
+        if (CursorWalker.open(allocator, dir, filter_builder.BASE_CHILDREN, options.start_block)) |w| {
             children_storage = w;
             children = &children_storage;
         } else |_| {}
     }
     defer if (children) |c| c.deinit();
 
-    const allocator = ctxAllocator(ctx);
     const decompress_primary = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
     defer allocator.free(decompress_primary);
     const log_buf_primary = try allocator.alloc(RawLog, types.MAX_LOGS_PER_BLOCK);
@@ -246,36 +242,43 @@ fn lessByTxLog(_: void, a: RawLog, b: RawLog) bool {
     return a.log_index < b.log_index;
 }
 
-/// Wraps a cursor over a single DBI, providing peek/consume so the merge
-/// loop in replay can advance one DBI at a time without juggling cursor
-/// state across two streams.
+/// Wraps a position-based iterator over a `FilteredStore`, providing
+/// peek/consume so the merge loop in replay can advance one pair at a
+/// time without juggling cursor state across two streams.
 const CursorWalker = struct {
-    cursor: lmdbx.Cursor,
-    next_key: ?[]const u8,
+    store: FilteredStore,
+    /// Owns the next-payload scratch buffer. Sized for one block's LZ4 entry.
+    payload_buf: []u8,
+    next_index: u64,
 
-    /// `start_block == 0` walks from the oldest key. Any other value seeks
-    /// past keys `<= start_block` via `cursor.seek(blockKey(start_block + 1))`,
-    /// so resume-against-existing-store skips the already-dispatched range
-    /// without per-block iteration.
-    fn open(txn: lmdbx.Transaction, dbi_name: [*:0]const u8, start_block: u64) !CursorWalker {
-        const db = try lmdbx.Database.open(txn, dbi_name, .{});
-        var cursor = try db.cursor();
-        const first: ?[]const u8 = if (start_block == 0)
-            cursor.goToFirst() catch null
-        else blk: {
-            var seek_key = filter_builder.blockKey(start_block + 1);
-            break :blk cursor.seek(&seek_key) catch null;
-        };
-        return .{ .cursor = cursor, .next_key = first };
+    /// `start_block == 0` walks from the oldest entry. Any other value seeks
+    /// past entries whose block_number is `<= start_block`.
+    fn open(
+        allocator: std.mem.Allocator,
+        dir: std.fs.Dir,
+        comptime base: []const u8,
+        start_block: u64,
+    ) !CursorWalker {
+        var store = try FilteredStore.open(allocator, dir, base);
+        errdefer store.deinit();
+        const payload_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
+        errdefer allocator.free(payload_buf);
+        const next_index = if (start_block == 0) @as(u64, 0) else try store.seekPast(start_block);
+        return .{ .store = store, .payload_buf = payload_buf, .next_index = next_index };
     }
 
     fn deinit(self: *CursorWalker) void {
-        self.cursor.deinit();
+        // The payload buf was allocated by the same allocator used to alloc
+        // it; we don't hold a reference to it past deinit. Storage owns it
+        // via the FilteredStore lifetime convention.
+        self.store.allocator.free(self.payload_buf);
+        self.store.deinit();
     }
 
     fn peek(self: *const CursorWalker) ?u64 {
-        if (self.next_key) |k| return filter_builder.blockFromKey(k);
-        return null;
+        if (self.next_index >= self.store.count()) return null;
+        const entry = self.store.readEntry(self.next_index) catch return null;
+        return entry.block_number;
     }
 
     fn consume(
@@ -284,11 +287,11 @@ const CursorWalker = struct {
         decompress_buf: []u8,
         log_buf: []RawLog,
     ) ![]RawLog {
-        const value = try self.cursor.getCurrentValue();
-        const decoded = try log_serial.decompressEntry(value, decompress_buf);
+        const payload = try self.store.readPayload(self.next_index, self.payload_buf);
+        const decoded = try log_serial.decompressEntry(payload, decompress_buf);
         const log_count = log_serial.deserializeLogs(decoded, log_buf);
         for (log_buf[0..log_count]) |*log| log.block_number = block_number;
-        self.next_key = self.cursor.goToNext() catch null;
+        self.next_index += 1;
         return log_buf[0..log_count];
     }
 };
@@ -392,14 +395,6 @@ fn writeFlatStore(dir: std.fs.Dir, blocks: []const TestBlock, allocator: std.mem
 
         offset += entry_len;
     }
-}
-
-fn realpathZ(dir: *std.testing.TmpDir, out_z: *[std.fs.max_path_bytes:0]u8) ![*:0]const u8 {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try dir.dir.realpath(".", &buf);
-    @memcpy(out_z[0..path.len], path);
-    out_z[path.len] = 0;
-    return @ptrCast(out_z);
 }
 
 const Counter = struct {
@@ -538,15 +533,13 @@ test "scanCreations: extracts spawned addresses from factory creation events" {
 
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
-    var dst_path_z: [std.fs.max_path_bytes:0]u8 = undefined;
-    const dst_path = try realpathZ(&dst_tmp, &dst_path_z);
 
-    _ = try filter_builder.build(&reader, FactoryManifest, dst_path, allocator);
 
-    const env = try lmdbx.Environment.init(dst_path, .{ .max_dbs = 2 });
-    defer env.deinit() catch {};
 
-    var discovered = try scanCreations(env, FactoryManifest, allocator);
+    _ = try filter_builder.build(&reader, FactoryManifest, dst_tmp.dir, allocator);
+
+
+    var discovered = try scanCreations(dst_tmp.dir, FactoryManifest, allocator);
     defer discovered.deinit();
 
     try testing.expectEqual(@as(u32, 1), discovered.count());
@@ -588,18 +581,16 @@ test "replay: dispatches logs in canonical (block, tx, log_index) order across o
 
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
-    var dst_path_z: [std.fs.max_path_bytes:0]u8 = undefined;
-    const dst_path = try realpathZ(&dst_tmp, &dst_path_z);
 
-    _ = try filter_builder.build(&reader, Manifest, dst_path, allocator);
 
-    const env = try lmdbx.Environment.init(dst_path, .{ .max_dbs = 2 });
-    defer env.deinit() catch {};
+
+    _ = try filter_builder.build(&reader, Manifest, dst_tmp.dir, allocator);
+
 
     var counter = Counter{ .allocator = allocator };
     defer counter.deinit();
 
-    const result = try replay(env, Manifest, Counter, &counter, .{});
+    const result = try replay(dst_tmp.dir, Manifest, Counter, &counter, .{});
     try testing.expectEqual(@as(u64, 3), result.logs_dispatched);
     try testing.expectEqual(@as(u64, 2), result.blocks_dispatched);
     try testing.expectEqual(@as(u32, 3), counter.transfers);
@@ -645,18 +636,16 @@ test "replay seeks past start_block so already-dispatched range is skipped" {
 
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
-    var dst_path_z: [std.fs.max_path_bytes:0]u8 = undefined;
-    const dst_path = try realpathZ(&dst_tmp, &dst_path_z);
 
-    _ = try filter_builder.build(&reader, Manifest, dst_path, allocator);
 
-    const env = try lmdbx.Environment.init(dst_path, .{ .max_dbs = 2 });
-    defer env.deinit() catch {};
+
+    _ = try filter_builder.build(&reader, Manifest, dst_tmp.dir, allocator);
+
 
     var counter = Counter{ .allocator = allocator };
     defer counter.deinit();
 
-    const result = try replay(env, Manifest, Counter, &counter, .{ .start_block = 100 });
+    const result = try replay(dst_tmp.dir, Manifest, Counter, &counter, .{ .start_block = 100 });
     try testing.expectEqual(@as(u64, 2), result.logs_dispatched);
     try testing.expectEqual(@as(u64, 2), result.blocks_dispatched);
     try testing.expectEqual(@as(u32, 2), counter.transfers);
@@ -666,7 +655,7 @@ test "replay seeks past start_block so already-dispatched range is skipped" {
     // start_block at or beyond the max key dispatches nothing.
     var counter2 = Counter{ .allocator = allocator };
     defer counter2.deinit();
-    const result2 = try replay(env, Manifest, Counter, &counter2, .{ .start_block = 102 });
+    const result2 = try replay(dst_tmp.dir, Manifest, Counter, &counter2, .{ .start_block = 102 });
     try testing.expectEqual(@as(u64, 0), result2.logs_dispatched);
     try testing.expectEqual(@as(u64, 0), result2.blocks_dispatched);
 }
@@ -715,20 +704,18 @@ test "replay: k-way merge across BLOCKS_PRIMARY and BLOCKS_CHILDREN preserves bl
 
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
-    var dst_path_z: [std.fs.max_path_bytes:0]u8 = undefined;
-    const dst_path = try realpathZ(&dst_tmp, &dst_path_z);
 
-    _ = try filter_builder.build(&reader, FactoryManifest, dst_path, allocator);
+
+
+    _ = try filter_builder.build(&reader, FactoryManifest, dst_tmp.dir, allocator);
     const child_addrs = [_][20]u8{ CHILD_1, CHILD_2 };
-    _ = try filter_builder.appendChildren(&reader, FactoryManifest, &child_addrs, dst_path, allocator);
+    _ = try filter_builder.appendChildren(&reader, FactoryManifest, &child_addrs, dst_tmp.dir, allocator);
 
-    const env = try lmdbx.Environment.init(dst_path, .{ .max_dbs = 2 });
-    defer env.deinit() catch {};
 
     var counter = Counter{ .allocator = allocator };
     defer counter.deinit();
 
-    const result = try replay(env, FactoryManifest, Counter, &counter, .{});
+    const result = try replay(dst_tmp.dir, FactoryManifest, Counter, &counter, .{});
     try testing.expectEqual(@as(u64, 4), result.logs_dispatched);
     try testing.expectEqual(@as(u64, 4), result.blocks_dispatched);
     try testing.expectEqual(@as(u32, 2), counter.pair_creations);
@@ -854,30 +841,26 @@ test "factory orchestration: build → scanCreations → appendChildren → repl
 
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
-    var dst_path_z: [std.fs.max_path_bytes:0]u8 = undefined;
-    const dst_path = try realpathZ(&dst_tmp, &dst_path_z);
 
-    _ = try filter_builder.build(&reader, FactoryManifest, dst_path, allocator);
+
+
+    _ = try filter_builder.build(&reader, FactoryManifest, dst_tmp.dir, allocator);
 
     {
-        const env = try lmdbx.Environment.init(dst_path, .{ .max_dbs = 2 });
-        defer env.deinit() catch {};
-        var discovered = try scanCreations(env, FactoryManifest, allocator);
+        var discovered = try scanCreations(dst_tmp.dir, FactoryManifest, allocator);
         defer discovered.deinit();
         try testing.expectEqual(@as(u32, 1), discovered.count());
         try testing.expect(discovered.contains(CHILD_1));
     }
 
     const child_addrs = [_][20]u8{CHILD_1};
-    _ = try filter_builder.appendChildren(&reader, FactoryManifest, &child_addrs, dst_path, allocator);
+    _ = try filter_builder.appendChildren(&reader, FactoryManifest, &child_addrs, dst_tmp.dir, allocator);
 
-    const env = try lmdbx.Environment.init(dst_path, .{ .max_dbs = 2 });
-    defer env.deinit() catch {};
 
     var counter = Counter{ .allocator = allocator };
     defer counter.deinit();
 
-    const result = try replay(env, FactoryManifest, Counter, &counter, .{});
+    const result = try replay(dst_tmp.dir, FactoryManifest, Counter, &counter, .{});
     try testing.expectEqual(@as(u64, 2), result.logs_dispatched);
     try testing.expectEqual(@as(u32, 1), counter.pair_creations);
     try testing.expectEqual(@as(u32, 1), counter.syncs);

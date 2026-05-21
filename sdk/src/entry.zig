@@ -19,6 +19,7 @@ const lmdbx = @import("lmdbx");
 const eth = @import("eth");
 const ethcall = @import("ethcall.zig");
 const filter_builder = @import("filter_builder.zig");
+const filtered_store_mod = @import("filtered_store.zig");
 const live = @import("live.zig");
 const prefetch = @import("prefetch.zig");
 const root = @import("root.zig");
@@ -269,13 +270,16 @@ pub fn init(
     ctx._meta_dbi = try openMetaDbi(ctx._active_txn);
     ctx._last_dispatched_block = try readCursorIn(ctx._active_txn);
 
-    // Handler-only re-run gate: skip Phases 1-3 when the filter env has any
-    // prior `BLOCKS_PRIMARY` entries.
-    if (shouldSkipFilterBuild(filter_dir_z)) {
+    var filter_dh = try std.fs.cwd().openDir(filter_dir, .{});
+    defer filter_dh.close();
+
+    // Handler-only re-run gate: skip Phases 1-3 when the primary filtered
+    // pair has at least one entry (a prior build is on disk).
+    if (shouldSkipFilterBuild(filter_dh, allocator)) {
         ctx.stats.phases_skipped = true;
     } else {
         // Phase 1.
-        const primary_result = try filter_builder.build(&reader, m, filter_dir_z, allocator);
+        const primary_result = try filter_builder.build(&reader, m, filter_dh, allocator);
         try requireCompleteFilter("phase 1 (build)", primary_result);
         ctx.stats.filter_blocks_scanned = primary_result.blocks_scanned;
         ctx.stats.filter_blocks_matched = primary_result.blocks_matched;
@@ -284,12 +288,10 @@ pub fn init(
 
         // Phases 2 + 3 (factory-only).
         if (comptime m.factories.len > 0) {
-            const filter_env = try lmdbx.Environment.init(filter_dir_z, .{ .max_dbs = 2 });
             var phase23_timer = try std.time.Timer.start();
-            var discovered = try scanner.scanCreations(filter_env, m, allocator);
+            var discovered = try scanner.scanCreations(filter_dh, m, allocator);
             defer discovered.deinit();
             ctx.stats.scan_creations_ns = phase23_timer.read();
-            filter_env.deinit() catch {};
 
             ctx.stats.discovered_children = discovered.count();
 
@@ -304,7 +306,7 @@ pub fn init(
                     &reader,
                     m,
                     child_addrs,
-                    filter_dir_z,
+                    filter_dh,
                     allocator,
                 );
                 try requireCompleteFilter("phase 3 (appendChildren)", child_result);
@@ -323,43 +325,34 @@ pub fn init(
     errdefer cache.close();
     ctx._cache = cache;
 
-    // Phases 4 + 5 hold one filter env open. Block-scoped so it closes
-    // before the follow path's gap-fill or live loop reopens the same
-    // path — concurrent opens contend on the MDBX lock and surface as
-    // EAGAIN from fcntl(F_OFD_SETLK).
-    {
-        const filter_env = try lmdbx.Environment.init(filter_dir_z, .{ .max_dbs = 2 });
-        defer filter_env.deinit() catch {};
-
-        if (comptime (m.prefetch.len > 0 or m.static_prefetch.len > 0)) {
-            var phase4_timer = try std.time.Timer.start();
-            try runPhase4(m, options, ctx, filter_env);
-            ctx.stats.prefetch_ns = phase4_timer.read();
-        }
-
-        inline for (comptime resolveEntities(entities)) |T| {
-            const StoreT = root.storeFor(T);
-            const dbi_name = comptime entityFieldName(T);
-            @field(ctx.stores, dbi_name) = try StoreT.open(allocator, &ctx._active_txn, dbi_name);
-        }
-
-        const replay_result = try scanner.replay(
-            filter_env,
-            m,
-            Handler,
-            ctx,
-            .{
-                .commit_interval = options.commit_interval,
-                .start_block = ctx._last_dispatched_block,
-            },
-        );
-        ctx.stats.logs_dispatched = replay_result.logs_dispatched;
-        ctx.stats.blocks_dispatched = replay_result.blocks_dispatched;
-        ctx.stats.replay_ns = replay_result.elapsed_ns;
-
-        // Final commit so any logs since the last commit boundary land.
-        try ctx.commitCycle();
+    if (comptime (m.prefetch.len > 0 or m.static_prefetch.len > 0)) {
+        var phase4_timer = try std.time.Timer.start();
+        try runPhase4(m, options, ctx, filter_dh);
+        ctx.stats.prefetch_ns = phase4_timer.read();
     }
+
+    inline for (comptime resolveEntities(entities)) |T| {
+        const StoreT = root.storeFor(T);
+        const dbi_name = comptime entityFieldName(T);
+        @field(ctx.stores, dbi_name) = try StoreT.open(allocator, &ctx._active_txn, dbi_name);
+    }
+
+    const replay_result = try scanner.replay(
+        filter_dh,
+        m,
+        Handler,
+        ctx,
+        .{
+            .commit_interval = options.commit_interval,
+            .start_block = ctx._last_dispatched_block,
+        },
+    );
+    ctx.stats.logs_dispatched = replay_result.logs_dispatched;
+    ctx.stats.blocks_dispatched = replay_result.blocks_dispatched;
+    ctx.stats.replay_ns = replay_result.elapsed_ns;
+
+    // Final commit so any logs since the last commit boundary land.
+    try ctx.commitCycle();
     ctx.stats.elapsed_ns = timer.read();
 
     if (options.follow) {
@@ -376,13 +369,11 @@ pub fn init(
                 m,
                 ctx._last_dispatched_block + 1,
                 engine_last,
-                filter_dir_z,
+                filter_dh,
                 allocator,
             );
 
-            const gap_env = try lmdbx.Environment.init(filter_dir_z, .{ .max_dbs = 2 });
-            defer gap_env.deinit() catch {};
-            _ = try scanner.replay(gap_env, m, Handler, ctx, .{
+            _ = try scanner.replay(filter_dh, m, Handler, ctx, .{
                 .commit_interval = options.commit_interval,
                 .start_block = ctx._last_dispatched_block,
             });
@@ -417,7 +408,7 @@ fn runPhase4(
     comptime m: sdk_manifest.Manifest,
     options: Options,
     ctx: anytype,
-    filter_env: lmdbx.Environment,
+    filter_dh: std.fs.Dir,
 ) !void {
     const allocator = ctx._allocator;
     const cache = ctx._cache.?;
@@ -427,7 +418,7 @@ fn runPhase4(
     const arena = arena_state.allocator();
 
     const static_calls = try prefetch.gatherStatic(arena, m);
-    const dynamic_calls = try prefetch.gatherDynamic(arena, filter_env, m);
+    const dynamic_calls = try prefetch.gatherDynamic(arena, filter_dh, m);
 
     const merged = try arena.alloc(ethcall.Call, static_calls.len + dynamic_calls.len);
     @memcpy(merged[0..static_calls.len], static_calls);
@@ -452,21 +443,13 @@ fn runPhase4(
     ctx.stats.prefetch_calls_executed = missing.len;
 }
 
-/// True when `BLOCKS_PRIMARY` has at least one entry — a prior filter build
-/// exists. Cursor probe instead of `Database.stat()` because the lmdbx-zig
-/// wrapper's `stat()` is stale against the current libmdbx C ABI (4-arg
-/// `mdbx_dbi_stat` vs the wrapper's 3-arg binding). Any failure degrades
-/// to "don't skip" rather than blocking the run.
-fn shouldSkipFilterBuild(filter_dir_z: [*:0]const u8) bool {
-    const env = lmdbx.Environment.init(filter_dir_z, .{ .max_dbs = 2 }) catch return false;
-    defer env.deinit() catch {};
-    const txn = lmdbx.Transaction.init(env, .{ .mode = .ReadOnly }) catch return false;
-    defer txn.abort() catch {};
-    const db = lmdbx.Database.open(txn, filter_builder.DBI_PRIMARY, .{}) catch return false;
-    var cursor = db.cursor() catch return false;
-    defer cursor.deinit();
-    const first = cursor.goToFirst() catch return false;
-    return first != null;
+/// True when the primary filtered pair has at least one entry — a prior
+/// build is on disk. Any open failure degrades to "don't skip" so the
+/// caller rebuilds from scratch.
+fn shouldSkipFilterBuild(filter_dh: std.fs.Dir, allocator: std.mem.Allocator) bool {
+    var store = filtered_store_mod.FilteredStore.open(allocator, filter_dh, filter_builder.BASE_PRIMARY) catch return false;
+    defer store.deinit();
+    return store.count() > 0;
 }
 
 fn entitiesLen(comptime entities: anytype) u32 {

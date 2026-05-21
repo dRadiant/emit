@@ -1,11 +1,10 @@
 /// Filtered-index builder. Reads the engine's flat log store via `core`,
-/// keeps logs that match the manifest, and writes them into the
-/// `filtered_index.mdbx` env's BLOCKS_PRIMARY (and optional BLOCKS_CHILDREN)
-/// DBI keyed by block number (u64 BE). Per ADR-002.
+/// keeps logs that match the manifest, and writes them into a flat-file
+/// pair (`<base>.dat` + `<base>.idx`) via `sdk.filtered_store`. Per ADR-002.
 ///
 /// Two entry points:
-///   - `build`: phase 1, writes BLOCKS_PRIMARY for static + factory addresses.
-///   - `appendChildren`: phase 3, writes BLOCKS_CHILDREN for addresses
+///   - `build`: phase 1, writes the `primary` pair for static + factory addresses.
+///   - `appendChildren`: phase 3, writes the `children` pair for addresses
 ///     discovered by the scanner's factory pre-pass. No-op when the
 ///     discovered set is empty.
 ///
@@ -14,16 +13,17 @@
 ///       AND (topic0 ∈ filter.match_topics)
 ///       AND (address ∉ filter.exclude_addrs)
 /// Phase 1 sets exclude_addrs empty; phase 3 sets it to static∪factory so a
-/// static contract that's also a factory child does not appear in both DBIs.
+/// static contract that's also a factory child does not appear in both pairs.
 const std = @import("std");
 
 const builtin = @import("builtin");
 const core = @import("core");
-const lmdbx = @import("lmdbx");
 const lz4 = @import("lz4");
 
+const filtered_store_mod = @import("filtered_store.zig");
 const sdk_manifest = @import("manifest.zig");
 
+const FilteredStore = filtered_store_mod.FilteredStore;
 const RawLog = core.RawLog;
 const FlatStoreReader = core.FlatStoreReader;
 const log_serial = core.log_serial;
@@ -32,18 +32,13 @@ const parallel = core.parallel;
 const io_pipeline = core.io_pipeline;
 const types = core.types;
 
-pub const KEY_SIZE = 8;
 pub const WORKER_QUEUE_DEPTH = 16;
-/// Commit cadence during the MDBX write phase. Each commit fsyncs (~13 ms);
-/// Larger txn = larger crash-recovery window, but filtered_index.mdbx is
-/// rebuildable from the engine flat store so the trade is fine.
-pub const COMMIT_BLOCKS = 100_000;
 /// Min matching blocks before we spawn worker threads. Below this, the
 /// thread spin-up cost is larger than the parallel speedup.
 pub const PARALLEL_THRESHOLD = 1_000;
 
-pub const DBI_PRIMARY = "blocks_primary";
-pub const DBI_CHILDREN = "blocks_children";
+pub const BASE_PRIMARY: []const u8 = "primary";
+pub const BASE_CHILDREN: []const u8 = "children";
 
 pub const BuildResult = struct {
     blocks_scanned: u64 = 0,
@@ -55,16 +50,6 @@ pub const BuildResult = struct {
     elapsed_ns: u64 = 0,
 };
 
-pub fn blockKey(block_number: u64) [KEY_SIZE]u8 {
-    var buf: [KEY_SIZE]u8 = undefined;
-    std.mem.writeInt(u64, &buf, block_number, .big);
-    return buf;
-}
-
-pub fn blockFromKey(key: []const u8) u64 {
-    return std.mem.readInt(u64, key[0..KEY_SIZE], .big);
-}
-
 /// Per-log keep predicate. `match_addrs` and `match_topics` are positive
 /// match sets; `exclude_addrs` is a negative filter applied after positives
 /// pass. Used by both `build` (phase 1) and `appendChildren` (phase 3).
@@ -74,30 +59,30 @@ const Filter = struct {
     exclude_addrs: []const [20]u8,
 };
 
-/// Phase 1: build BLOCKS_PRIMARY at `dest_path` from the manifest's static
-/// and factory addresses. Caller owns `reader`. The destination directory
-/// must exist; if it already contains data the build will fail at
-/// `MDBX_APPEND` time.
+/// Phase 1: build the `primary` filtered-store pair under `dir` from the
+/// manifest's static and factory addresses. Caller owns `reader` and `dir`.
+/// Appending to a pre-existing pair extends it; block numbers must be
+/// strictly greater than the last recorded block.
 pub fn build(
     reader: *const FlatStoreReader,
     comptime m: sdk_manifest.Manifest,
-    dest_path: [*:0]const u8,
+    dir: std.fs.Dir,
     allocator: std.mem.Allocator,
 ) !BuildResult {
-    return appendBlocks(reader, m, m.start_block, m.end_block orelse std.math.maxInt(u64), dest_path, allocator);
+    return appendBlocks(reader, m, m.start_block, m.end_block orelse std.math.maxInt(u64), dir, allocator);
 }
 
-/// Extend the primary filter env over `from_block..=to_block`. `build` is
-/// a special case with `from_block = manifest.start_block`. Used by the
-/// follow-mode gap fill in `entry.init`: when the engine advances during
-/// backfill, the SDK re-scans the new range and appends matching blocks
-/// to the existing filter env without rebuilding from scratch.
+/// Extend the primary filtered-store pair over `from_block..=to_block`.
+/// `build` is a special case with `from_block = manifest.start_block`.
+/// Used by the follow-mode gap fill in `entry.init`: when the engine
+/// advances during backfill, the SDK re-scans the new range and appends
+/// matching blocks to the existing pair without rebuilding from scratch.
 pub fn appendBlocks(
     reader: *const FlatStoreReader,
     comptime m: sdk_manifest.Manifest,
     from_block: u64,
     to_block: u64,
-    dest_path: [*:0]const u8,
+    dir: std.fs.Dir,
     allocator: std.mem.Allocator,
 ) !BuildResult {
     const known_addresses = comptime collectKnownAddresses(m);
@@ -112,24 +97,23 @@ pub fn appendBlocks(
             .match_topics = all_topics,
             .exclude_addrs = &.{},
         },
-        dest_path,
-        DBI_PRIMARY,
+        dir,
+        BASE_PRIMARY,
         allocator,
     );
 }
 
 /// Phase 3: walk the engine's flat store filtered by the
 /// scanner-discovered child addresses, write matching child-event logs to
-/// `BLOCKS_CHILDREN` in the existing env at `dest_path`. Returns a zero
-/// BuildResult immediately when `child_addresses` is empty. The per-log
-/// filter excludes addresses already in `static∪factory` so a static
-/// contract that's also a factory child does not produce duplicate entries
-/// across DBIs.
+/// the `children` pair under `dir`. Returns a zero BuildResult immediately
+/// when `child_addresses` is empty. The per-log filter excludes addresses
+/// already in `static∪factory` so a static contract that's also a factory
+/// child does not produce duplicate entries across pairs.
 pub fn appendChildren(
     reader: *const FlatStoreReader,
     comptime m: sdk_manifest.Manifest,
     child_addresses: []const [20]u8,
-    dest_path: [*:0]const u8,
+    dir: std.fs.Dir,
     allocator: std.mem.Allocator,
 ) !BuildResult {
     if (child_addresses.len == 0) return .{};
@@ -148,24 +132,24 @@ pub fn appendChildren(
             .match_topics = child_topics,
             .exclude_addrs = known_addresses,
         },
-        dest_path,
-        DBI_CHILDREN,
+        dir,
+        BASE_CHILDREN,
         allocator,
     );
 }
 
 /// Shared phase runner. `bloom_addresses` is what we feed the bloom scan
 /// (block-level prefilter); `filter` is the per-log keep predicate
-/// (post-decompression precision filter). `dbi_name` is the DBI to write
-/// into; the env at `dest_path` is opened with `max_dbs = 2`.
+/// (post-decompression precision filter). `base` selects which flat-store
+/// pair under `dir` to append to (one of `BASE_PRIMARY` / `BASE_CHILDREN`).
 fn runPhase(
     reader: *const FlatStoreReader,
     bloom_addresses: []const [20]u8,
     start_block: u64,
     end_block: u64,
     filter: Filter,
-    dest_path: [*:0]const u8,
-    dbi_name: [*:0]const u8,
+    dir: std.fs.Dir,
+    comptime base: []const u8,
     allocator: std.mem.Allocator,
 ) !BuildResult {
     var result = BuildResult{};
@@ -228,30 +212,17 @@ fn runPhase(
     // Surface fatal pipeline errors before MDBX writes. Per-block drops accumulate below.
     for (0..num_workers) |i| if (worker_args[i].err) |e| return e;
 
-    const env = try lmdbx.Environment.init(dest_path, .{ .max_dbs = 2 });
-    defer env.deinit() catch {};
-
-    var txn = try env.transaction(.{});
-    var dbi = (try lmdbx.Database.open(txn, dbi_name, .{ .create = true })).dbi;
-    var writes_since_commit: u32 = 0;
+    var store = try FilteredStore.open(allocator, dir, base);
+    defer store.deinit();
 
     for (0..num_workers) |i| {
         for (worker_results[i].items) |fb| {
-            const key = blockKey(fb.block_number);
-            const db = lmdbx.Database{ .txn = txn, .dbi = dbi };
-            try db.set(&key, fb.entry, .Append);
+            try store.appendEntry(fb.block_number, fb.entry);
             result.blocks_matched += 1;
             result.total_logs += fb.log_count;
-            writes_since_commit += 1;
-            if (writes_since_commit >= COMMIT_BLOCKS) {
-                try txn.commit();
-                txn = try env.transaction(.{});
-                dbi = (try lmdbx.Database.open(txn, dbi_name, .{ .create = true })).dbi;
-                writes_since_commit = 0;
-            }
         }
     }
-    try txn.commit();
+    try store.syncAll();
 
     for (0..num_workers) |i| result.dropped_blocks += worker_args[i].dropped_blocks;
     result.elapsed_ns = timer.read();
@@ -597,12 +568,11 @@ const SmallManifest: sdk_manifest.Manifest = .{
     },
 };
 
-fn dumpDecodedBlocks(env: lmdbx.Environment, dbi_name: [*:0]const u8, allocator: std.mem.Allocator) !std.ArrayListUnmanaged(DecodedBlock) {
-    const txn = try env.transaction(.{ .mode = .ReadOnly });
-    defer txn.abort() catch {};
-    const db = try lmdbx.Database.open(txn, dbi_name, .{});
-    var cursor = try db.cursor();
-    defer cursor.deinit();
+fn dumpDecodedBlocks(dir: std.fs.Dir, comptime base: []const u8, allocator: std.mem.Allocator) !std.ArrayListUnmanaged(DecodedBlock) {
+    var store = FilteredStore.open(allocator, dir, base) catch {
+        return std.ArrayListUnmanaged(DecodedBlock){};
+    };
+    defer store.deinit();
 
     var out: std.ArrayListUnmanaged(DecodedBlock) = .{};
     errdefer {
@@ -610,22 +580,24 @@ fn dumpDecodedBlocks(env: lmdbx.Environment, dbi_name: [*:0]const u8, allocator:
         out.deinit(allocator);
     }
 
-    var key_opt = cursor.goToFirst() catch return out;
     const decompress_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
     defer allocator.free(decompress_buf);
+    const payload_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
+    defer allocator.free(payload_buf);
     const log_scratch = try allocator.alloc(RawLog, types.MAX_LOGS_PER_BLOCK);
     defer allocator.free(log_scratch);
-    while (key_opt) |k| {
-        const bn = blockFromKey(k);
-        const v = try cursor.getCurrentValue();
-        const decoded = try log_serial.decompressEntry(v, decompress_buf);
+
+    var i: u64 = 0;
+    while (i < store.count()) : (i += 1) {
+        const entry = try store.readEntry(i);
+        const payload = try store.readPayload(i, payload_buf);
+        const decoded = try log_serial.decompressEntry(payload, decompress_buf);
         const n = log_serial.deserializeLogs(decoded, log_scratch);
         const owned = try allocator.alloc(LogSummary, n);
-        for (log_scratch[0..n], 0..) |*l, i| {
-            owned[i] = .{ .address = l.address, .topic0 = l.topics[0] };
+        for (log_scratch[0..n], 0..) |*l, j| {
+            owned[j] = .{ .address = l.address, .topic0 = l.topics[0] };
         }
-        try out.append(allocator, .{ .block_number = bn, .logs = owned });
-        key_opt = try cursor.goToNext();
+        try out.append(allocator, .{ .block_number = entry.block_number, .logs = owned });
     }
     return out;
 }
@@ -692,20 +664,13 @@ test "build: filters multi-contract flat store, MDBX contains exactly the matche
 
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
-    var dst_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dst_path = try dst_tmp.dir.realpath(".", &dst_path_buf);
-    var dst_path_z: [std.fs.max_path_bytes:0]u8 = undefined;
-    @memcpy(dst_path_z[0..dst_path.len], dst_path);
-    dst_path_z[dst_path.len] = 0;
 
-    const result = try build(&reader, SmallManifest, @ptrCast(&dst_path_z), allocator);
+    const result = try build(&reader, SmallManifest, dst_tmp.dir, allocator);
     try testing.expectEqual(matching_count, result.blocks_matched);
     try testing.expectEqual(matching_log_total, result.total_logs);
     try testing.expectEqual(N, result.blocks_scanned);
 
-    const env = try lmdbx.Environment.init(@ptrCast(&dst_path_z), .{ .max_dbs = 2 });
-    defer env.deinit() catch {};
-    var decoded = try dumpDecodedBlocks(env, DBI_PRIMARY, allocator);
+    var decoded = try dumpDecodedBlocks(dst_tmp.dir, BASE_PRIMARY, allocator);
     defer freeDecoded(&decoded, allocator);
 
     try testing.expectEqual(matching_count, @as(u64, decoded.items.len));
@@ -780,18 +745,9 @@ fn buildIntoNewTmp(
     comptime m: sdk_manifest.Manifest,
     allocator: std.mem.Allocator,
 ) !RebuildOutput {
-    var tmp = testing.tmpDir(.{});
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp.dir.realpath(".", &path_buf);
-    var path_z: [std.fs.max_path_bytes:0]u8 = undefined;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-
-    _ = try build(reader, m, @ptrCast(&path_z), allocator);
-
-    const env = try lmdbx.Environment.init(@ptrCast(&path_z), .{ .max_dbs = 2 });
-    defer env.deinit() catch {};
-    const decoded = try dumpDecodedBlocks(env, DBI_PRIMARY, allocator);
+    const tmp = testing.tmpDir(.{});
+    _ = try build(reader, m, tmp.dir, allocator);
+    const decoded = try dumpDecodedBlocks(tmp.dir, BASE_PRIMARY, allocator);
     return .{ .tmp = tmp, .decoded = decoded };
 }
 
@@ -864,31 +820,23 @@ test "build + appendChildren: primary holds creations, children holds child even
 
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
-    var dst_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dst_path = try dst_tmp.dir.realpath(".", &dst_path_buf);
-    var dst_path_z: [std.fs.max_path_bytes:0]u8 = undefined;
-    @memcpy(dst_path_z[0..dst_path.len], dst_path);
-    dst_path_z[dst_path.len] = 0;
 
     // Phase 1: build primary. Only the factory creation event qualifies
     // because child addresses are not yet known.
-    const primary = try build(&reader, FactoryManifest, @ptrCast(&dst_path_z), allocator);
+    const primary = try build(&reader, FactoryManifest, dst_tmp.dir, allocator);
     try testing.expectEqual(@as(u64, 1), primary.blocks_matched);
     try testing.expectEqual(@as(u64, 1), primary.total_logs);
 
     // Phase 3: append children for the addresses the (would-be) pre-pass
     // discovered. Stand-in for `scanner.scanCreations` until Group 6 lands.
     const discovered = [_][20]u8{ ChildAddr1, ChildAddr2, ChildAddr3 };
-    const children = try appendChildren(&reader, FactoryManifest, &discovered, @ptrCast(&dst_path_z), allocator);
+    const children = try appendChildren(&reader, FactoryManifest, &discovered, dst_tmp.dir, allocator);
     try testing.expectEqual(@as(u64, 3), children.blocks_matched);
     try testing.expectEqual(@as(u64, 3), children.total_logs);
 
-    const env = try lmdbx.Environment.init(@ptrCast(&dst_path_z), .{ .max_dbs = 2 });
-    defer env.deinit() catch {};
-
-    var primary_blocks = try dumpDecodedBlocks(env, DBI_PRIMARY, allocator);
+    var primary_blocks = try dumpDecodedBlocks(dst_tmp.dir, BASE_PRIMARY, allocator);
     defer freeDecoded(&primary_blocks, allocator);
-    var child_blocks = try dumpDecodedBlocks(env, DBI_CHILDREN, allocator);
+    var child_blocks = try dumpDecodedBlocks(dst_tmp.dir, BASE_CHILDREN, allocator);
     defer freeDecoded(&child_blocks, allocator);
 
     try testing.expectEqual(@as(usize, 1), primary_blocks.items.len);
@@ -941,14 +889,9 @@ test "appendChildren: returns zero-result for empty discovered set" {
 
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
-    var dst_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dst_path = try dst_tmp.dir.realpath(".", &dst_path_buf);
-    var dst_path_z: [std.fs.max_path_bytes:0]u8 = undefined;
-    @memcpy(dst_path_z[0..dst_path.len], dst_path);
-    dst_path_z[dst_path.len] = 0;
 
-    _ = try build(&reader, FactoryManifest, @ptrCast(&dst_path_z), allocator);
-    const result = try appendChildren(&reader, FactoryManifest, &.{}, @ptrCast(&dst_path_z), allocator);
+    _ = try build(&reader, FactoryManifest, dst_tmp.dir, allocator);
+    const result = try appendChildren(&reader, FactoryManifest, &.{}, dst_tmp.dir, allocator);
     try testing.expectEqual(@as(u64, 0), result.blocks_scanned);
     try testing.expectEqual(@as(u64, 0), result.blocks_matched);
 }
@@ -989,20 +932,13 @@ test "build: end_block clamps the scan range to a fixed window" {
 
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
-    var dst_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dst_path = try dst_tmp.dir.realpath(".", &dst_path_buf);
-    var dst_path_z: [std.fs.max_path_bytes:0]u8 = undefined;
-    @memcpy(dst_path_z[0..dst_path.len], dst_path);
-    dst_path_z[dst_path.len] = 0;
 
-    const result = try build(&reader, ClampedManifest, @ptrCast(&dst_path_z), allocator);
+    const result = try build(&reader, ClampedManifest, dst_tmp.dir, allocator);
     try testing.expectEqual(@as(u64, 20), result.blocks_matched);
     try testing.expectEqual(@as(u64, 20), result.total_logs);
 
-    // Verify the MDBX contents: exactly blocks 100..=119, none past 119.
-    const env = try lmdbx.Environment.init(@ptrCast(&dst_path_z), .{ .max_dbs = 2 });
-    defer env.deinit() catch {};
-    var decoded = try dumpDecodedBlocks(env, DBI_PRIMARY, allocator);
+    // Verify the on-disk contents: exactly blocks 100..=119, none past 119.
+    var decoded = try dumpDecodedBlocks(dst_tmp.dir, BASE_PRIMARY, allocator);
     defer freeDecoded(&decoded, allocator);
     try testing.expectEqual(@as(usize, 20), decoded.items.len);
     try testing.expectEqual(@as(u64, 100), decoded.items[0].block_number);
@@ -1042,23 +978,16 @@ test "appendBlocks extends a primary filter env over the new range" {
 
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
-    var dst_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dst_path = try dst_tmp.dir.realpath(".", &dst_path_buf);
-    var dst_path_z: [std.fs.max_path_bytes:0]u8 = undefined;
-    @memcpy(dst_path_z[0..dst_path.len], dst_path);
-    dst_path_z[dst_path.len] = 0;
 
     // First pass: cover blocks 100..=104.
-    const first = try appendBlocks(&reader, M, 100, 104, @ptrCast(&dst_path_z), allocator);
+    const first = try appendBlocks(&reader, M, 100, 104, dst_tmp.dir, allocator);
     try testing.expectEqual(@as(u64, 5), first.blocks_matched);
 
-    // Second pass extends the env over 105..=109 — same DBI, appended.
-    const second = try appendBlocks(&reader, M, 105, 109, @ptrCast(&dst_path_z), allocator);
+    // Second pass extends the pair over 105..=109 — same files, appended.
+    const second = try appendBlocks(&reader, M, 105, 109, dst_tmp.dir, allocator);
     try testing.expectEqual(@as(u64, 5), second.blocks_matched);
 
-    const env = try lmdbx.Environment.init(@ptrCast(&dst_path_z), .{ .max_dbs = 2 });
-    defer env.deinit() catch {};
-    var decoded = try dumpDecodedBlocks(env, DBI_PRIMARY, allocator);
+    var decoded = try dumpDecodedBlocks(dst_tmp.dir, BASE_PRIMARY, allocator);
     defer freeDecoded(&decoded, allocator);
     try testing.expectEqual(@as(usize, 10), decoded.items.len);
     try testing.expectEqual(@as(u64, 100), decoded.items[0].block_number);
@@ -1092,11 +1021,3 @@ test "processBlockEntry: corrupt entry counts as dropped_block (fail-loud safety
     try testing.expectEqual(@as(usize, 0), results.items.len);
 }
 
-test "blockKey/blockFromKey roundtrip and ordering" {
-    const k = blockKey(18_600_002);
-    try testing.expectEqual(@as(u64, 18_600_002), blockFromKey(&k));
-
-    const k1 = blockKey(100);
-    const k2 = blockKey(200);
-    try testing.expect(std.mem.order(u8, &k1, &k2) == .lt);
-}

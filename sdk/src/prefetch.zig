@@ -3,7 +3,7 @@
 const std = @import("std");
 
 const core = @import("core");
-const lmdbx = @import("lmdbx");
+const filtered_store_mod = @import("filtered_store.zig");
 
 const ethcall = @import("ethcall.zig");
 const filter_builder = @import("filter_builder.zig");
@@ -77,31 +77,29 @@ fn matchAndAppend(
     }
 }
 
-/// Walk the filtered index (`BLOCKS_PRIMARY` + `BLOCKS_CHILDREN` when
-/// present) and emit one `Call` per `(matching log, declared PrefetchCall)`.
+/// Walk the filtered index (primary + children pairs when present) and
+/// emit one `Call` per `(matching log, declared PrefetchCall)`.
 pub fn gatherDynamic(
     arena: std.mem.Allocator,
-    env: lmdbx.Environment,
+    dir: std.fs.Dir,
     comptime m: sdk_manifest.Manifest,
 ) ![]ethcall.Call {
     if (comptime m.prefetch.len == 0) return &.{};
 
     var out: std.ArrayList(ethcall.Call) = .empty;
 
-    const txn = try env.transaction(.{ .mode = .ReadOnly });
-    defer txn.abort() catch {};
-
     const decompress_buf = try arena.alloc(u8, types.BLOCK_BUF_SIZE);
+    const payload_buf = try arena.alloc(u8, types.BLOCK_BUF_SIZE);
     const log_buf = try arena.alloc(RawLog, types.MAX_LOGS_PER_BLOCK);
 
-    inline for (.{ filter_builder.DBI_PRIMARY, filter_builder.DBI_CHILDREN }) |dbi_name| {
-        if (lmdbx.Database.open(txn, dbi_name, .{})) |db| {
-            var cursor = try db.cursor();
-            defer cursor.deinit();
-            var key_opt = cursor.goToFirst() catch null;
-            while (key_opt) |_| : (key_opt = cursor.goToNext() catch null) {
-                const value = try cursor.getCurrentValue();
-                const decoded = log_serial.decompressEntry(value, decompress_buf) catch continue;
+    inline for (.{ filter_builder.BASE_PRIMARY, filter_builder.BASE_CHILDREN }) |base| {
+        if (filtered_store_mod.FilteredStore.open(arena, dir, base)) |store_init| {
+            var store = store_init;
+            defer store.deinit();
+            var i: u64 = 0;
+            while (i < store.count()) : (i += 1) {
+                const payload = store.readPayload(i, payload_buf) catch continue;
+                const decoded = log_serial.decompressEntry(payload, decompress_buf) catch continue;
                 const log_count = log_serial.deserializeLogs(decoded, log_buf);
                 try matchAndAppend(arena, &out, log_buf[0..log_count], m);
             }
@@ -364,15 +362,8 @@ test "gatherDynamic returns empty for a manifest with no prefetch" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp.dir.realpathZ(".", &path_buf);
-    var path_z: [std.fs.max_path_bytes:0]u8 = undefined;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-    const env = try lmdbx.Environment.init(@ptrCast(&path_z), .{ .max_dbs = 2 });
-    defer env.deinit() catch {};
 
     const m: sdk_manifest.Manifest = .{ .name = "x", .chain_id = 1, .start_block = 0 };
-    const calls = try gatherDynamic(arena, env, m);
+    const calls = try gatherDynamic(arena, tmp.dir, m);
     try std.testing.expectEqual(@as(usize, 0), calls.len);
 }
