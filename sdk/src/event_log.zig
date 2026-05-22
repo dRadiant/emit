@@ -36,7 +36,7 @@ pub fn EventLog(comptime T: type) type {
         /// Open `<dir>/<name>` for append + random read. Creates the file
         /// with a fresh magic header on first use; a wrong magic surfaces
         /// `error.InvalidMagic` so the caller can fail loud.
-        pub fn openOrCreate(allocator: std.mem.Allocator, dir: std.fs.Dir, name: []const u8) !Self {
+        pub fn open(allocator: std.mem.Allocator, dir: std.fs.Dir, name: []const u8) !Self {
             const file = try core.flat_format.openOrCreateWithMagic(dir, name, MAGIC);
             return Self{ .allocator = allocator, .file = file };
         }
@@ -131,12 +131,12 @@ fn keyAt(block: u64, log_index: u64) [16]u8 {
     return k;
 }
 
-test "openOrCreate on a fresh dir writes the magic header" {
+test "open on a fresh dir creates the file with the magic header" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
     {
-        var log = try EventLog(TransferEvent).openOrCreate(testing.allocator, tmp.dir, "transfer.events.dat");
+        var log = try EventLog(TransferEvent).open(testing.allocator, tmp.dir, "transfer.events.dat");
         defer log.deinit();
     }
 
@@ -152,7 +152,7 @@ test "append then read round-trips records" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var log = try EventLog(TransferEvent).openOrCreate(testing.allocator, tmp.dir, "transfer.events.dat");
+    var log = try EventLog(TransferEvent).open(testing.allocator, tmp.dir, "transfer.events.dat");
     defer log.deinit();
 
     const recs = [_]TransferEvent{
@@ -174,7 +174,7 @@ test "binarySearch finds present keys and returns null for absent" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var log = try EventLog(TransferEvent).openOrCreate(testing.allocator, tmp.dir, "transfer.events.dat");
+    var log = try EventLog(TransferEvent).open(testing.allocator, tmp.dir, "transfer.events.dat");
     defer log.deinit();
 
     const recs = [_]TransferEvent{
@@ -195,7 +195,7 @@ test "orphan trailing bytes past count are invisible and overwritten by next app
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var log = try EventLog(TransferEvent).openOrCreate(testing.allocator, tmp.dir, "transfer.events.dat");
+    var log = try EventLog(TransferEvent).open(testing.allocator, tmp.dir, "transfer.events.dat");
     defer log.deinit();
 
     const good = [_]TransferEvent{
@@ -226,7 +226,7 @@ test "orphan trailing bytes past count are invisible and overwritten by next app
     try testing.expectEqual(@as(u256, 50), back.value);
 }
 
-test "openOrCreate against an existing file validates the magic" {
+test "open against an existing file validates the magic" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -236,7 +236,7 @@ test "openOrCreate against an existing file validates the magic" {
         try f.writeAll(&[_]u8{0xFF} ** 8);
     }
 
-    try testing.expectError(error.InvalidMagic, EventLog(TransferEvent).openOrCreate(
+    try testing.expectError(error.InvalidMagic, EventLog(TransferEvent).open(
         testing.allocator,
         tmp.dir,
         "bad.events.dat",

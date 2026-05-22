@@ -26,9 +26,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "eth", .module = eth },
         },
     });
-    if (b.lazyDependency("lmdbx", .{ .target = target, .optimize = optimize })) |dep| {
-        sdk.addImport("lmdbx", dep.module("lmdbx"));
-    }
 
     const engine_imports: []const std.Build.Module.Import = &.{
         .{ .name = "core", .module = core },

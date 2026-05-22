@@ -709,11 +709,9 @@ test "tick dispatches a pending block ingested by FakeEngine" {
     try testing.expectEqual(@as(u64, 100), runner.block_number);
 }
 
-test "tick routes saves through the per-block overlay, not MDBX" {
-    const lmdbx = @import("lmdbx");
+test "tick routes saves through the per-block overlay, not the slab" {
     const root = @import("root.zig");
     const mutable_store = @import("mutable_store.zig");
-    const entity_serial = @import("entity_serial.zig");
 
     const Account = struct {
         pub const storage: root.StorageMode = .mutable;
@@ -741,8 +739,6 @@ test "tick routes saves through the per-block overlay, not MDBX" {
     const TestStores = struct { accounts: mutable_store.MutableStore(Account) };
     const TestCtx = struct {
         _allocator: std.mem.Allocator,
-        _env: lmdbx.Environment,
-        _active_txn: lmdbx.Transaction,
         block_number: u64 = 0,
         timestamp: u64 = 0,
         stores: TestStores,
@@ -757,28 +753,14 @@ test "tick routes saves through the per-block overlay, not MDBX" {
     var engine_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const engine_path = try engine_tmp.dir.realpath(".", &engine_path_buf);
 
-    var entity_tmp = testing.tmpDir(.{});
-    defer entity_tmp.cleanup();
-    var entity_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const entity_path = try entity_tmp.dir.realpathZ(".", &entity_path_buf);
-    var entity_path_z: [std.fs.max_path_bytes:0]u8 = undefined;
-    @memcpy(entity_path_z[0..entity_path.len], entity_path);
-    entity_path_z[entity_path.len] = 0;
-
-    const env = try lmdbx.Environment.init(@ptrCast(&entity_path_z), .{ .max_dbs = 4 });
-    defer env.deinit() catch {};
-
     const ctx = try testing.allocator.create(TestCtx);
     defer testing.allocator.destroy(ctx);
     ctx.* = .{
         ._allocator = testing.allocator,
-        ._env = env,
-        ._active_txn = try env.transaction(.{}),
         .stores = undefined,
     };
-    ctx.stores.accounts = try mutable_store.MutableStore(Account).open(testing.allocator, &ctx._active_txn, "accounts");
+    ctx.stores.accounts = mutable_store.MutableStore(Account).open(testing.allocator, &.{});
     defer ctx.stores.accounts.deinit();
-    defer ctx._active_txn.abort() catch {};
 
     enter(ctx);
 
@@ -811,15 +793,10 @@ test "tick routes saves through the per-block overlay, not MDBX" {
     try testing.expectEqual(@as(u64, 102), carl_entry.block);
     try testing.expectEqual(@as(u64, 300), carl_entry.value.balance);
 
-    // MDBX is empty for every key — nothing was committed.
-    const db = lmdbx.Database{ .txn = ctx._active_txn, .dbi = ctx.stores.accounts.dbi };
-    inline for (.{ ALICE, BOB, CARL }) |addr| {
-        var key_buf: [20]u8 = undefined;
-        entity_serial.encodeKey([20]u8, addr, &key_buf);
-        try testing.expect((try db.get(&key_buf)) == null);
-    }
+    // Nothing committed to disk — the slab is empty, only the overlay holds the data.
+    try testing.expectEqual(@as(u32, 0), ctx.stores.accounts.count());
 
-    // `load` returns the overlay value (not MDBX).
+    // `load` returns the overlay value (not the slab).
     const loaded = (try ctx.stores.accounts.load(ALICE)).?;
     try testing.expectEqual(@as(u64, 100), loaded.balance);
 }
@@ -905,7 +882,7 @@ test "live prefetch hits warm cache, issues no Multicall" {
     defer cache_tmp.cleanup();
 
     var cache = try ethcall.Cache.open(testing.allocator, cache_tmp.dir);
-    defer cache.close();
+    defer cache.deinit();
 
     const PairCreated = struct {
         pub const signature = "PairCreated(address indexed token0, address indexed token1, address pair, uint256 allPairsLength)";
@@ -977,8 +954,7 @@ test "live prefetch hits warm cache, issues no Multicall" {
     try testing.expectEqual(@as(u32, 1), runner.creates);
 }
 
-test "finalized blocks promote to MDBX and advance the cursor" {
-    const lmdbx = @import("lmdbx");
+test "finalized blocks commit to state.snap and advance the cursor" {
     const root = @import("root.zig");
     const mutable_store = @import("mutable_store.zig");
     const entity_serial = @import("entity_serial.zig");
@@ -1006,27 +982,22 @@ test "finalized blocks promote to MDBX and advance the cursor" {
         .contracts = &.{.{ .name = "T", .address = TEST_CONTRACT, .events = &.{TestTransfer} }},
     };
 
+    const state_snap = @import("state_snap.zig");
+    const Snap = state_snap.StateSnap(1, 0);
     const TestStores = struct { accounts: mutable_store.MutableStore(Account) };
     const TestCtx = struct {
         _allocator: std.mem.Allocator,
-        _env: lmdbx.Environment,
-        _active_txn: lmdbx.Transaction,
-        _meta_dbi: lmdbx.Database.DBI = 0,
+        _state_snap: *Snap,
         block_number: u64 = 0,
         timestamp: u64 = 0,
         stores: TestStores,
         _last_dispatched_block: u64 = 0,
 
-        // Minimal stand-in for entry.Context.commitCycle: flush stores +
-        // write cursor + commit + open new txn. Mirrors the real flow so
-        // promoteFinalized's call hits the same atomic path.
         pub fn commitCycle(self: *@This()) !void {
-            inline for (std.meta.fields(TestStores)) |f| {
-                try @field(self.stores, f.name).flush();
-            }
-            try @import("entry.zig").writeCursorIn(self._active_txn, self._meta_dbi, self._last_dispatched_block);
-            try self._active_txn.commit();
-            self._active_txn = try self._env.transaction(.{});
+            const buf = try self.stores.accounts.materialize(self._allocator);
+            defer self._allocator.free(buf);
+            try self._state_snap.commit(self._last_dispatched_block, &.{buf}, &.{});
+            self.stores.accounts.refreshSlab(self._state_snap.mutableSlab(0));
         }
     };
 
@@ -1039,27 +1010,19 @@ test "finalized blocks promote to MDBX and advance the cursor" {
 
     var entity_tmp = testing.tmpDir(.{});
     defer entity_tmp.cleanup();
-    var entity_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const entity_path = try entity_tmp.dir.realpathZ(".", &entity_path_buf);
-    var entity_path_z: [std.fs.max_path_bytes:0]u8 = undefined;
-    @memcpy(entity_path_z[0..entity_path.len], entity_path);
-    entity_path_z[entity_path.len] = 0;
 
-    const env = try lmdbx.Environment.init(@ptrCast(&entity_path_z), .{ .max_dbs = 4 });
-    defer env.deinit() catch {};
+    var snap = try Snap.open(testing.allocator, entity_tmp.dir);
+    defer snap.deinit();
 
     const ctx = try testing.allocator.create(TestCtx);
     defer testing.allocator.destroy(ctx);
     ctx.* = .{
         ._allocator = testing.allocator,
-        ._env = env,
-        ._active_txn = try env.transaction(.{}),
+        ._state_snap = &snap,
         .stores = undefined,
     };
-    ctx._meta_dbi = (try lmdbx.Database.open(ctx._active_txn, "_meta", .{ .create = true })).dbi;
-    ctx.stores.accounts = try mutable_store.MutableStore(Account).open(testing.allocator, &ctx._active_txn, "accounts");
+    ctx.stores.accounts = mutable_store.MutableStore(Account).open(testing.allocator, snap.mutableSlab(0));
     defer ctx.stores.accounts.deinit();
-    defer ctx._active_txn.abort() catch {};
 
     enter(ctx);
 
@@ -1076,32 +1039,28 @@ test "finalized blocks promote to MDBX and advance the cursor" {
     try testing.expectEqual(@as(u32, 2), ctx.stores.accounts.pendingCount());
 
     // Finalize block 100 on the engine side. Next tick's classifyChanges
-    // sees block 100 disappeared with last_finalized=100 → promote to MDBX.
+    // sees block 100 disappeared with last_finalized=100 → commitCycle.
     try fake.finalize(100);
     try session.tick(Manifest, OverlayHandler, ctx, 200);
 
-    // Block 100's slice is in MDBX; block 101 still pending.
+    // Block 100's entry made it to the cache (dirty=false after refresh);
+    // block 101 still pending.
     try testing.expectEqual(@as(u32, 1), ctx.stores.accounts.pendingCount());
     try testing.expectEqual(@as(u64, 100), ctx._last_dispatched_block);
 
-    const Store = mutable_store.MutableStore(Account);
-    const db = lmdbx.Database{ .txn = ctx._active_txn, .dbi = ctx.stores.accounts.dbi };
-    var alice_key: [20]u8 = undefined;
-    entity_serial.encodeKey([20]u8, ALICE, &alice_key);
-    const alice_bytes = (try db.get(&alice_key)) orelse return error.MissingAlice;
-    const alice_acct = entity_serial.deserialize(Account, alice_bytes[0..Store.value_size]);
-    try testing.expectEqual(@as(u64, 100), alice_acct.balance);
+    // Reopen state.snap and verify alice's balance is durable.
+    {
+        var reopened = try Snap.open(testing.allocator, entity_tmp.dir);
+        defer reopened.deinit();
+        try testing.expectEqual(@as(u64, 100), reopened.cursor);
 
-    var bob_key: [20]u8 = undefined;
-    entity_serial.encodeKey([20]u8, BOB, &bob_key);
-    try testing.expect((try db.get(&bob_key)) == null);
-
-    // Cursor in `_meta.cursor` reflects the just-promoted block.
-    var cursor_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &cursor_buf, 0, .big);
-    const meta_db = lmdbx.Database{ .txn = ctx._active_txn, .dbi = ctx._meta_dbi };
-    const cursor_bytes = (try meta_db.get("cursor")) orelse return error.MissingCursor;
-    try testing.expectEqual(@as(u64, 100), std.mem.readInt(u64, cursor_bytes[0..8], .big));
+        const Store = mutable_store.MutableStore(Account);
+        const slab = reopened.mutableSlab(0);
+        try testing.expectEqual(@as(usize, Store.value_size), slab.len);
+        const alice_acct = entity_serial.deserialize(Account, slab[0..Store.value_size]);
+        try testing.expectEqualSlices(u8, &ALICE, &alice_acct.id);
+        try testing.expectEqual(@as(u64, 100), alice_acct.balance);
+    }
 }
 
 

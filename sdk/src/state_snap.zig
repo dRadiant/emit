@@ -6,11 +6,11 @@
 ///   magic              [8]u8       "EMITSTAT"
 ///   version            u32 LE
 ///   cursor             u64 LE      last fully-dispatched block
-///   mutable_bytes      [N]u64 LE   slab byte length per MutableStore slot
-///   immutable_counts   [M]u64 LE   authoritative record count per ImmutableStore slot
-///   [body: N MutableStore slabs concatenated in slot order]
+///   mutable_bytes      [mutable_count]u64 LE   slab byte length per MutableStore slot
+///   immutable_counts   [immutable_count]u64 LE   authoritative record count per ImmutableStore slot
+///   [body: `mutable_count` MutableStore slabs concatenated in slot order]
 ///
-/// The schema is comptime-known via the `N` / `M` parameters; no per-slot
+/// The schema is comptime-known via the type parameters; no per-slot
 /// descriptors live on disk. Cross-language readers consult the spec.
 const std = @import("std");
 
@@ -26,24 +26,24 @@ pub const Error = error{
     SizeMismatch,
 } || std.mem.Allocator.Error || std.fs.File.OpenError || std.fs.File.WriteError || std.fs.File.ReadError || std.fs.Dir.DeleteFileError;
 
-/// `N` = number of MutableStore slots in the indexer's entities tuple.
-/// `M` = number of ImmutableStore slots. Both are zero-permitted; the
-/// no-store case yields a 20-byte header file.
-pub fn StateSnap(comptime N: usize, comptime M: usize) type {
-    const HEADER_SIZE: usize = 8 + 4 + 8 + N * 8 + M * 8;
+/// `mutables` = number of MutableStore slots in the indexer's entities tuple.
+/// `immutables` = number of ImmutableStore slots. Both are zero-permitted;
+/// the no-store case yields a 20-byte header file.
+pub fn StateSnap(comptime mutables: usize, comptime immutables: usize) type {
+    const HEADER_SIZE: usize = 8 + 4 + 8 + mutables * 8 + immutables * 8;
 
     return struct {
         const Self = @This();
 
         pub const header_size = HEADER_SIZE;
-        pub const mutable_count = N;
-        pub const immutable_count = M;
+        pub const mutable_count = mutables;
+        pub const immutable_count = immutables;
 
         allocator: std.mem.Allocator,
         dir: std.fs.Dir,
         cursor: u64,
-        mutable_bytes: [N]u64,
-        immutable_counts: [M]u64,
+        mutable_bytes: [mutables]u64,
+        immutable_counts: [immutables]u64,
         /// Concatenated MutableStore slabs in slot order. Owned by `allocator`.
         body: []u8,
 
@@ -62,8 +62,8 @@ pub fn StateSnap(comptime N: usize, comptime M: usize) type {
                     .allocator = allocator,
                     .dir = dir,
                     .cursor = 0,
-                    .mutable_bytes = [_]u64{0} ** N,
-                    .immutable_counts = [_]u64{0} ** M,
+                    .mutable_bytes = [_]u64{0} ** mutables,
+                    .immutable_counts = [_]u64{0} ** immutables,
                     .body = &.{},
                 },
                 else => return err,
@@ -121,7 +121,7 @@ pub fn StateSnap(comptime N: usize, comptime M: usize) type {
         /// slice points into `self.body` and is valid until the next `commit`
         /// or `deinit`.
         pub fn mutableSlab(self: *const Self, i: usize) []const u8 {
-            std.debug.assert(i < N);
+            std.debug.assert(i < mutables);
             var offset: usize = 0;
             for (self.mutable_bytes[0..i]) |b| offset += @intCast(b);
             const len: usize = @intCast(self.mutable_bytes[i]);
@@ -129,7 +129,7 @@ pub fn StateSnap(comptime N: usize, comptime M: usize) type {
         }
 
         pub fn immutableCount(self: *const Self, i: usize) u64 {
-            std.debug.assert(i < M);
+            std.debug.assert(i < immutables);
             return self.immutable_counts[i];
         }
 
@@ -141,8 +141,8 @@ pub fn StateSnap(comptime N: usize, comptime M: usize) type {
         pub fn commit(
             self: *Self,
             new_cursor: u64,
-            new_slabs: *const [N][]const u8,
-            new_counts: *const [M]u64,
+            new_slabs: *const [mutables][]const u8,
+            new_counts: *const [immutables]u64,
         ) !void {
             var total: usize = 0;
             for (new_slabs) |slab| total += slab.len;

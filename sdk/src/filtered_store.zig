@@ -34,6 +34,8 @@ pub const IndexEntry = struct {
 };
 
 pub const FilteredStore = struct {
+    const Self = @This();
+
     allocator: std.mem.Allocator,
     dat_file: std.fs.File,
     idx_file: std.fs.File,
@@ -50,7 +52,7 @@ pub const FilteredStore = struct {
         allocator: std.mem.Allocator,
         dir: std.fs.Dir,
         comptime base: []const u8,
-    ) !FilteredStore {
+    ) !Self {
         const dat_name = base ++ ".dat";
         const idx_name = base ++ ".idx";
 
@@ -93,7 +95,7 @@ pub const FilteredStore = struct {
         };
     }
 
-    pub fn deinit(self: *FilteredStore) void {
+    pub fn deinit(self: *Self) void {
         self.dat_file.close();
         self.idx_file.close();
     }
@@ -101,7 +103,7 @@ pub const FilteredStore = struct {
     /// Append `(block_number, lz4_entry)`. Block numbers MUST be strictly
     /// increasing (mirrors the engine's flat-store monotonic invariant).
     pub fn appendEntry(
-        self: *FilteredStore,
+        self: *Self,
         block_number: u64,
         lz4_entry: []const u8,
     ) !void {
@@ -123,22 +125,22 @@ pub const FilteredStore = struct {
         self.entry_count += 1;
     }
 
-    pub fn syncAll(self: *FilteredStore) !void {
+    pub fn syncAll(self: *Self) !void {
         try self.dat_file.sync();
         try self.idx_file.sync();
     }
 
-    pub fn count(self: *const FilteredStore) u64 {
+    pub fn count(self: *const Self) u64 {
         return self.entry_count;
     }
 
     /// Read the i-th index entry. O(1).
-    pub fn readEntry(self: *const FilteredStore, i: u64) !IndexEntry {
+    pub fn readEntry(self: *const Self, i: u64) !IndexEntry {
         return readEntryAt(self.idx_file, i);
     }
 
     /// Read the i-th entry's dat payload into `buf`. Returns the filled slice.
-    pub fn readPayload(self: *const FilteredStore, i: u64, buf: []u8) ![]const u8 {
+    pub fn readPayload(self: *const Self, i: u64, buf: []u8) ![]const u8 {
         const e = try self.readEntry(i);
         if (buf.len < e.length) return error.BufferTooSmall;
         if ((try self.dat_file.pread(buf[0..e.length], e.offset)) != e.length) return error.Truncated;
@@ -147,7 +149,7 @@ pub const FilteredStore = struct {
 
     /// Find the smallest index `i` with `entry(i).block_number > start_block`.
     /// `start_block == 0` returns 0 (scan from the oldest entry).
-    pub fn seekPast(self: *const FilteredStore, start_block: u64) !u64 {
+    pub fn seekPast(self: *const Self, start_block: u64) !u64 {
         if (self.entry_count == 0 or start_block == 0) return 0;
         var lo: u64 = 0;
         var hi: u64 = self.entry_count;

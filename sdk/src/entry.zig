@@ -14,17 +14,20 @@
 const std = @import("std");
 
 const core = @import("core");
-const lmdbx = @import("lmdbx");
 
 const eth = @import("eth");
 const ethcall = @import("ethcall.zig");
+const event_log_mod = @import("event_log.zig");
 const filter_builder = @import("filter_builder.zig");
 const filtered_store_mod = @import("filtered_store.zig");
+const immutable_store_mod = @import("immutable_store.zig");
 const live = @import("live.zig");
+const mutable_store_mod = @import("mutable_store.zig");
 const prefetch = @import("prefetch.zig");
 const root = @import("root.zig");
 const scanner = @import("scanner.zig");
 const sdk_manifest = @import("manifest.zig");
+const state_snap_mod = @import("state_snap.zig");
 
 pub const Options = struct {
     /// Directory containing the engine's flat store
@@ -55,31 +58,6 @@ pub const CANONICAL_MULTICALL3: [20]u8 = .{
     0x02, 0x88, 0x62, 0xbe, 0x2a, 0x17, 0x39, 0x76, 0xca, 0x11,
 };
 
-/// Reserved DBI for SDK-internal bookkeeping. The `_` prefix can't
-/// collide with `entityFieldName`-derived names (which start lowercase).
-const META_DBI: [*:0]const u8 = "_meta";
-const CURSOR_KEY: []const u8 = "cursor";
-
-fn openMetaDbi(txn: lmdbx.Transaction) !lmdbx.Database.DBI {
-    const db = try lmdbx.Database.open(txn, META_DBI, .{ .create = true });
-    return db.dbi;
-}
-
-/// Returns 0 when the DBI doesn't exist (fresh env), the key is absent,
-/// or the payload is malformed. Works in a read-only txn.
-fn readCursorIn(txn: lmdbx.Transaction) !u64 {
-    const db = lmdbx.Database.open(txn, META_DBI, .{}) catch return 0;
-    const data = (try db.get(CURSOR_KEY)) orelse return 0;
-    if (data.len != 8) return 0;
-    return std.mem.readInt(u64, data[0..8], .big);
-}
-
-pub fn writeCursorIn(txn: lmdbx.Transaction, dbi: lmdbx.Database.DBI, block: u64) !void {
-    var buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &buf, block, .big);
-    const db = lmdbx.Database{ .txn = txn, .dbi = dbi };
-    try db.set(CURSOR_KEY, &buf, .Upsert);
-}
 
 /// Result of a backfill run; returned from `run` and embedded in `Context`.
 /// `elapsed_ns - (filter_build_ns + scan_creations_ns + append_children_ns +
@@ -110,24 +88,20 @@ pub const RunStats = struct {
 /// tuple of entity types; each entity declares
 /// `pub const storage: sdk.StorageMode = .mutable | .immutable;`.
 ///
-/// Heap-allocated by `init` so each store can hold a stable
-/// `*const lmdbx.Transaction` pointer into `self._active_txn`. When
-/// `commitCycle` reassigns `_active_txn`, every store's pointer-deref
-/// transparently sees the new transaction without re-binding.
+/// Heap-allocated by `init` so each `MutableStore`'s borrowed slab and
+/// each `ImmutableStore`'s `*EventLog` stay valid across the Context's
+/// lifetime. `commitCycle` reassigns the slabs via `refreshSlab` after
+/// every `state_snap.commit` — pointer addresses don't move.
 ///
 /// Underscore-prefixed fields are SDK internals — handlers should not read
 /// or mutate them. Public surface for handlers is `block_number`,
 /// `timestamp`, `stores`, `stats`, and `ethCall`.
-/// `entities` may be either a tuple of entity types — `.{ Account, … }` —
-/// or the entities module itself, e.g. `@import("entities.zig")`. The
-/// module form scans `pub` decls for any struct declaring
-/// `pub const storage: sdk.StorageMode` and uses those, in source-
-/// declaration order. Both forms produce identical Context types when
-/// the entity sets match.
 pub fn Context(comptime entities: anytype) type {
     const Stores = StoresStruct(entities);
+    const EventLogs = EventLogsStruct(entities);
     return struct {
         const Self = @This();
+        pub const Snap = state_snap_mod.StateSnap(mutableCount(entities), immutableCount(entities));
 
         block_number: u64 = 0,
         timestamp: u64 = 0,
@@ -135,52 +109,113 @@ pub fn Context(comptime entities: anytype) type {
         stats: RunStats = .{},
 
         _allocator: std.mem.Allocator,
-        _env: lmdbx.Environment,
-        _active_txn: lmdbx.Transaction,
+        _entity_dir: std.fs.Dir,
+        _state_snap: Snap,
+        _event_logs: EventLogs,
         /// Heap-allocated ethcall cache, owned by Context. Null when init
         /// runs without prefetch declared — every `ethCall` then returns
         /// `error.NotPrefetched`, matching the strict-mode semantics.
         _cache: ?*ethcall.Cache = null,
-        _meta_dbi: lmdbx.Database.DBI = 0,
         /// Highest fully-dispatched block. Updated at block boundaries.
-        /// `commitCycle` writes it into `_meta.cursor` inside the same
-        /// txn as the entity flush so cursor and state are byte-atomic.
+        /// `commitCycle` writes it into `state.snap.cursor` inside the same
+        /// rename as the entity-slab flush so cursor and state are byte-atomic.
         _last_dispatched_block: u64 = 0,
 
-        /// Tear down: abort the open txn, deinit every entity store, close
-        /// the entity env, close + free the heap-allocated ethcall cache
-        /// (when present), free the heap-allocated Context itself.
         pub fn deinit(self: *Self) void {
-            self._active_txn.abort() catch {};
             inline for (std.meta.fields(Stores)) |f| {
                 var s = &@field(self.stores, f.name);
                 s.deinit();
             }
+            inline for (std.meta.fields(EventLogs)) |f| {
+                var log = &@field(self._event_logs, f.name);
+                log.deinit();
+            }
+            self._state_snap.deinit();
+            self._entity_dir.close();
             if (self._cache) |c| {
-                c.close();
+                c.deinit();
                 self._allocator.destroy(c);
             }
-            self._env.deinit() catch {};
             self._allocator.destroy(self);
         }
 
-        /// Flush stores, write the cursor, commit, open a fresh write txn.
-        /// Cursor and entity state ride the same commit — a crash inside
-        /// rolls both back together.
+        /// Flush every store, advance the cursor, and rename `state.snap`
+        /// atomically. Cursor + every MutableStore slab + every ImmutableStore
+        /// count are all published together; a crash inside leaves the prior
+        /// `state.snap` intact.
         pub fn commitCycle(self: *Self) !void {
-            inline for (std.meta.fields(Stores)) |f| {
-                var s = &@field(self.stores, f.name);
-                try s.flush();
+            // Flush ImmutableStore appends to events.dat first; their new
+            // record counts feed the next state.snap.
+            inline for (comptime resolveEntities(entities)) |T| {
+                if (comptime T.storage == .immutable) {
+                    const field_name = comptime entityFieldName(T);
+                    var store = &@field(self.stores, field_name);
+                    try store.flushAppends();
+                }
             }
-            try writeCursorIn(self._active_txn, self._meta_dbi, self._last_dispatched_block);
-            try self._active_txn.commit();
-            self._active_txn = try self._env.transaction(.{});
+            inline for (comptime resolveEntities(entities)) |T| {
+                if (comptime T.storage == .immutable) {
+                    const field_name = comptime entityFieldName(T);
+                    var log = &@field(self._event_logs, field_name);
+                    try log.sync();
+                }
+            }
+
+            // Materialize every MutableStore slab. Buffers freed after rename.
+            var slabs: [Snap.mutable_count][]const u8 = undefined;
+            var slab_bufs: [Snap.mutable_count][]u8 = undefined;
+            comptime var slab_idx_init: usize = 0;
+            inline for (comptime resolveEntities(entities)) |T| {
+                if (comptime T.storage == .mutable) {
+                    const field_name = comptime entityFieldName(T);
+                    var store = &@field(self.stores, field_name);
+                    const buf = try store.materialize(self._allocator);
+                    slab_bufs[slab_idx_init] = buf;
+                    slabs[slab_idx_init] = buf;
+                    slab_idx_init += 1;
+                }
+            }
+            defer for (slab_bufs) |b| self._allocator.free(b);
+
+            // Collect new immutable record counts.
+            var counts: [Snap.immutable_count]u64 = undefined;
+            comptime var count_idx_init: usize = 0;
+            inline for (comptime resolveEntities(entities)) |T| {
+                if (comptime T.storage == .immutable) {
+                    const field_name = comptime entityFieldName(T);
+                    const store = &@field(self.stores, field_name);
+                    counts[count_idx_init] = store.nextCommittedCount();
+                    count_idx_init += 1;
+                }
+            }
+
+            try self._state_snap.commit(self._last_dispatched_block, &slabs, &counts);
+
+            // Rebind each MutableStore's slab to the new state.snap body.
+            comptime var refresh_idx: usize = 0;
+            inline for (comptime resolveEntities(entities)) |T| {
+                if (comptime T.storage == .mutable) {
+                    const field_name = comptime entityFieldName(T);
+                    var store = &@field(self.stores, field_name);
+                    store.refreshSlab(self._state_snap.mutableSlab(refresh_idx));
+                    refresh_idx += 1;
+                }
+            }
+
+            // Advance each ImmutableStore's committed count.
+            inline for (comptime resolveEntities(entities)) |T| {
+                if (comptime T.storage == .immutable) {
+                    const field_name = comptime entityFieldName(T);
+                    var store = &@field(self.stores, field_name);
+                    store.markCommitted();
+                }
+            }
+
             self.stats.commits_performed += 1;
         }
 
         /// Strict cache read — never issues HTTP. Returns `error.NotPrefetched`
         /// for undeclared pairs, `error.CallReverted` for status=1 entries.
-        /// See `ethcall.decodeAs` for the supported `T` set.
         pub fn ethCall(
             self: *Self,
             comptime T: type,
@@ -193,8 +228,51 @@ pub fn Context(comptime entities: anytype) type {
             if (entry.status != 0) return error.CallReverted;
             return ethcall.decodeAs(T, entry.bytes);
         }
-
     };
+}
+
+fn mutableCount(comptime entities: anytype) usize {
+    comptime {
+        var n: usize = 0;
+        for (resolveEntities(entities)) |T| if (T.storage == .mutable) {
+            n += 1;
+        };
+        return n;
+    }
+}
+
+fn immutableCount(comptime entities: anytype) usize {
+    comptime {
+        var n: usize = 0;
+        for (resolveEntities(entities)) |T| if (T.storage == .immutable) {
+            n += 1;
+        };
+        return n;
+    }
+}
+
+fn EventLogsStruct(comptime entities: anytype) type {
+    const list = resolveEntities(entities);
+    var fields: []const std.builtin.Type.StructField = &.{};
+    for (list) |T| {
+        if (T.storage == .immutable) {
+            const name = entityFieldName(T);
+            const Log = event_log_mod.EventLog(T);
+            fields = fields ++ &[_]std.builtin.Type.StructField{.{
+                .name = name,
+                .type = Log,
+                .default_value_ptr = null,
+                .is_comptime = false,
+                .alignment = @alignOf(Log),
+            }};
+        }
+    }
+    return @Type(.{ .@"struct" = .{
+        .layout = .auto,
+        .fields = fields,
+        .decls = &.{},
+        .is_tuple = false,
+    } });
 }
 
 /// Backfill to completion and tear down. The entity stores are committed
@@ -215,8 +293,8 @@ pub fn run(
 
 /// Backfill to completion and return the live `Context`. Caller owns the
 /// pointer and must call `deinit` when done reading. Heap-allocated so
-/// that the entity stores' `*const lmdbx.Transaction` pointers (into the
-/// Context's `active_txn` field) stay valid after `init` returns.
+/// each `MutableStore`'s borrowed slab pointer and each `ImmutableStore`'s
+/// `*EventLog` stay valid across the Context's lifetime.
 pub fn init(
     comptime m: sdk_manifest.Manifest,
     comptime Handler: type,
@@ -236,39 +314,43 @@ pub fn init(
     try std.fs.cwd().makePath(entity_dir);
     try std.fs.cwd().makePath(filter_dir);
     try std.fs.cwd().makePath(ethcall_dir);
-    const entity_dir_z = try allocator.dupeZ(u8, entity_dir);
-    defer allocator.free(entity_dir_z);
-    const filter_dir_z = try allocator.dupeZ(u8, filter_dir);
-    defer allocator.free(filter_dir_z);
-    const ethcall_dir_z = try allocator.dupeZ(u8, ethcall_dir);
-    defer allocator.free(ethcall_dir_z);
 
     var reader = try core.FlatStoreReader.open(options.engine_data_dir);
     defer reader.close();
 
-    // Heap-allocate Context up front so its `_active_txn` field has a
-    // stable address before stores take pointers to it. Stats are
-    // populated in place across phases.
     const C = Context(entities);
     const ctx = try allocator.create(C);
     errdefer allocator.destroy(ctx);
 
-    // +1 reserves a slot for the SDK-internal `_meta` DBI alongside the
-    // user's entity DBIs. The cursor key lives there.
-    const max_dbs = comptime entitiesLen(entities) + 1;
-    const env = try lmdbx.Environment.init(entity_dir_z, .{ .max_dbs = max_dbs });
-    errdefer env.deinit() catch {};
+    var entity_dh = try std.fs.cwd().openDir(entity_dir, .{});
+    errdefer entity_dh.close();
 
     ctx.* = .{
         ._allocator = allocator,
-        ._env = env,
-        ._active_txn = try env.transaction(.{}),
+        ._entity_dir = entity_dh,
+        ._state_snap = try C.Snap.open(allocator, entity_dh),
+        ._event_logs = undefined,
+        ._last_dispatched_block = 0,
         .stores = undefined,
     };
-    errdefer ctx._active_txn.abort() catch {};
+    errdefer ctx._state_snap.deinit();
+    ctx._last_dispatched_block = ctx._state_snap.cursor;
 
-    ctx._meta_dbi = try openMetaDbi(ctx._active_txn);
-    ctx._last_dispatched_block = try readCursorIn(ctx._active_txn);
+    // Open every ImmutableStore's events.dat. Logs live on the Context so
+    // each ImmutableStore can hold a stable pointer into the field.
+    inline for (comptime resolveEntities(entities)) |T| {
+        if (comptime T.storage == .immutable) {
+            const field_name = comptime entityFieldName(T);
+            const log_file_name = comptime field_name ++ ".events.dat";
+            @field(ctx._event_logs, field_name) = try event_log_mod.EventLog(T).openOrCreate(allocator, entity_dh, log_file_name);
+        }
+    }
+    errdefer inline for (comptime resolveEntities(entities)) |T| {
+        if (comptime T.storage == .immutable) {
+            const field_name = comptime entityFieldName(T);
+            @field(ctx._event_logs, field_name).deinit();
+        }
+    };
 
     var filter_dh = try std.fs.cwd().openDir(filter_dir, .{});
     defer filter_dh.close();
@@ -322,7 +404,7 @@ pub fn init(
     const cache = try allocator.create(ethcall.Cache);
     errdefer allocator.destroy(cache);
     cache.* = try ethcall.Cache.open(allocator, ethcall_dh);
-    errdefer cache.close();
+    errdefer cache.deinit();
     ctx._cache = cache;
 
     if (comptime (m.prefetch.len > 0 or m.static_prefetch.len > 0)) {
@@ -331,10 +413,31 @@ pub fn init(
         ctx.stats.prefetch_ns = phase4_timer.read();
     }
 
-    inline for (comptime resolveEntities(entities)) |T| {
-        const StoreT = root.storeFor(T);
-        const dbi_name = comptime entityFieldName(T);
-        @field(ctx.stores, dbi_name) = try StoreT.open(allocator, &ctx._active_txn, dbi_name);
+    // Open every entity store. MutableStores borrow a slab from state_snap;
+    // ImmutableStores wrap their owning EventLog with the authoritative count
+    // from state_snap.immutable_counts. Slot indices are comptime-tracked in
+    // entities-tuple order.
+    {
+        comptime var mut_slot: usize = 0;
+        comptime var imm_slot: usize = 0;
+        inline for (comptime resolveEntities(entities)) |T| {
+            const field_name = comptime entityFieldName(T);
+            if (comptime T.storage == .mutable) {
+                @field(ctx.stores, field_name) = mutable_store_mod.MutableStore(T).open(
+                    allocator,
+                    ctx._state_snap.mutableSlab(mut_slot),
+                );
+                mut_slot += 1;
+            } else {
+                const log_ptr = &@field(ctx._event_logs, field_name);
+                @field(ctx.stores, field_name) = try immutable_store_mod.ImmutableStore(T).open(
+                    allocator,
+                    log_ptr,
+                    ctx._state_snap.immutableCount(imm_slot),
+                );
+                imm_slot += 1;
+            }
+        }
     }
 
     const replay_result = try scanner.replay(
@@ -503,13 +606,13 @@ fn StoresStruct(comptime entities: anytype) type {
 
     var struct_fields: [list.len]std.builtin.Type.StructField = undefined;
     inline for (list, 0..) |T, i| {
-        const StoreT = root.storeFor(T);
+        const Store = root.storeFor(T);
         struct_fields[i] = .{
             .name = derived[i],
-            .type = StoreT,
+            .type = Store,
             .default_value_ptr = null,
             .is_comptime = false,
-            .alignment = @alignOf(StoreT),
+            .alignment = @alignOf(Store),
         };
     }
 
@@ -608,35 +711,6 @@ const LBTCBalance = struct {
 
 const ADDR_TOKEN: [20]u8 = [_]u8{0xAE} ** 20;
 
-test "cursor round-trips across env close + reopen via _meta DBI" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp.dir.realpathZ(".", &path_buf);
-    var path_z: [std.fs.max_path_bytes:0]u8 = undefined;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-
-    {
-        const env = try lmdbx.Environment.init(@ptrCast(&path_z), .{ .max_dbs = 2 });
-        defer env.deinit() catch {};
-        const txn = try env.transaction(.{});
-        // Fresh env: DBI doesn't exist yet → 0.
-        try testing.expectEqual(@as(u64, 0), try readCursorIn(txn));
-        const dbi = try openMetaDbi(txn);
-        try writeCursorIn(txn, dbi, 12345);
-        try txn.commit();
-    }
-
-    {
-        const env = try lmdbx.Environment.init(@ptrCast(&path_z), .{ .max_dbs = 2 });
-        defer env.deinit() catch {};
-        const txn = try env.transaction(.{ .mode = .ReadOnly });
-        defer txn.abort() catch {};
-        try testing.expectEqual(@as(u64, 12345), try readCursorIn(txn));
-    }
-}
-
 test "commit boundary lands at block end, not mid-block" {
     // commit_interval = 1 with a 3-log single-block fixture: the old
     // mid-block commit would have produced 3 in-replay commits + 1 final.
@@ -725,11 +799,13 @@ test "Context accepts a module type and produces the same Context as the tuple f
 
     const FromModule = Context(FixtureModule);
     const FromTuple = Context(.{ FixtureModule.A, FixtureModule.B });
-    try testing.expectEqual(FromTuple, FromModule);
 
-    const Stores = std.meta.fieldInfo(FromModule, .stores).type;
-    try testing.expect(@hasField(Stores, "as"));
-    try testing.expect(@hasField(Stores, "bs"));
+    // Both forms yield identical Stores layouts (the user-observable contract).
+    const stores_from_module = std.meta.fieldInfo(FromModule, .stores).type;
+    const stores_from_tuple = std.meta.fieldInfo(FromTuple, .stores).type;
+    try testing.expectEqual(stores_from_module, stores_from_tuple);
+    try testing.expect(@hasField(stores_from_module, "as"));
+    try testing.expect(@hasField(stores_from_module, "bs"));
 }
 
 const TransferHandler = struct {
@@ -997,8 +1073,9 @@ fn ethCallTestContext(cache: *ethcall.Cache) Context(.{}) {
     return .{
         .stores = .{},
         ._allocator = testing.allocator,
-        ._env = undefined,
-        ._active_txn = undefined,
+        ._entity_dir = undefined,
+        ._state_snap = undefined,
+        ._event_logs = .{},
         ._cache = cache,
     };
 }
@@ -1011,7 +1088,7 @@ test "ethCall returns the cached u8 for a prefetched decimals() pair" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var cache = try openTestCache(&tmp);
-    defer cache.close();
+    defer cache.deinit();
 
     const USDC = [_]u8{0xA0} ** 20;
     const SEL = ethcall.selectorOf("decimals()");
@@ -1027,7 +1104,7 @@ test "ethCall returns NotPrefetched when the cache lacks the pair" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var cache = try openTestCache(&tmp);
-    defer cache.close();
+    defer cache.deinit();
 
     const UNKNOWN = [_]u8{0xDE} ** 20;
     var ctx = ethCallTestContext(&cache);
@@ -1038,8 +1115,9 @@ test "ethCall returns NotPrefetched when the cache is null" {
     var ctx: Context(.{}) = .{
         .stores = .{},
         ._allocator = testing.allocator,
-        ._env = undefined,
-        ._active_txn = undefined,
+        ._entity_dir = undefined,
+        ._state_snap = undefined,
+        ._event_logs = .{},
         ._cache = null,
     };
     const ANY = [_]u8{0xAA} ** 20;
@@ -1050,7 +1128,7 @@ test "ethCall returns CallReverted for a status=1 cached entry" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var cache = try openTestCache(&tmp);
-    defer cache.close();
+    defer cache.deinit();
 
     const MKR = [_]u8{0x9F} ** 20;
     const SEL = ethcall.selectorOf("decimals()");
@@ -1064,7 +1142,7 @@ test "ethCall decodes [20]u8 from the trailing word bytes" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var cache = try openTestCache(&tmp);
-    defer cache.close();
+    defer cache.deinit();
 
     const ROUTER = [_]u8{0x7A} ** 20;
     const FACTORY = [_]u8{0x5C} ** 20;
@@ -1082,7 +1160,7 @@ test "ethCall decodes u256 from the full word" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var cache = try openTestCache(&tmp);
-    defer cache.close();
+    defer cache.deinit();
 
     const TOKEN = [_]u8{0xBB} ** 20;
     const SEL = ethcall.selectorOf("totalSupply()");

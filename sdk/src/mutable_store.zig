@@ -1,15 +1,19 @@
-/// MutableStore(T): MDBX-backed mutable entities with an in-memory HashMap
-/// cache. `flush` writes dirty entries; the cache survives commits.
+/// MutableStore(T): mutable entity store with an in-memory HashMap cache
+/// fronting a sorted slab inside `state.snap`. Cold loads fall through to
+/// a binary search on the slab; saves update the cache only.
+///
+/// `materialize` produces the sorted slab bytes for the next `state.snap`
+/// commit; `refreshSlab` rebinds the borrowed slab pointer after the
+/// commit succeeds and clears dirty flags. Disk I/O happens via
+/// `state_snap`, not this module.
 ///
 /// In live mode, saves route through a per-block overlay tagged with the
 /// block that produced them. `commitBlock` drains a block's slice into
-/// the active txn; `discardAll` drops the overlay on reorg recovery.
-/// Backfill keeps the overlay's backing storage unallocated.
+/// the regular dirty cache so the next `state.snap` commit picks it up.
+/// `discardAll` drops the overlay on reorg recovery.
 ///
 /// Not thread-safe.
 const std = @import("std");
-
-const lmdbx = @import("lmdbx");
 
 const entity_serial = @import("entity_serial.zig");
 
@@ -31,31 +35,25 @@ pub fn MutableStore(comptime T: type) type {
 
         const CacheEntry = struct { entity: T, dirty: bool };
         const PendingEntry = struct { block: u64, value: T };
+        const KeyBytes = [KEY_SIZE]u8;
 
-        dbi: lmdbx.Database.DBI,
-        cache: std.AutoHashMap(KeyField, CacheEntry),
-        /// Borrow into the owning Context's `_active_txn` field. The
-        /// Context replaces its own `_active_txn` value on every commit
-        /// boundary, so reading through this pointer always sees the
-        /// transaction that's currently active. Stores never own or
-        /// rebind the txn themselves.
-        active_txn: *const lmdbx.Transaction,
-
-        // Live-mode state. `pending` is zero-init so backfill never
-        // allocates. The caller sets `live_block` before each block's
-        // dispatch and `live = true` once at loop entry.
         allocator: std.mem.Allocator,
+        cache: std.AutoHashMap(KeyField, CacheEntry),
+        /// Borrowed sorted-by-primary-key slab from `state.snap`.
+        slab: []const u8,
+
         live: bool = false,
         live_block: u64 = 0,
         pending: std.AutoHashMapUnmanaged(KeyField, PendingEntry) = .{},
 
-        pub fn open(allocator: std.mem.Allocator, txn_ref: *const lmdbx.Transaction, name: [*:0]const u8) !Self {
-            const db = try lmdbx.Database.open(txn_ref.*, name, .{ .create = true });
+        /// `slab` is borrowed from the owning `StateSnap`. Caller must
+        /// call `refreshSlab` after every `state_snap.commit` so this
+        /// pointer doesn't dangle.
+        pub fn open(allocator: std.mem.Allocator, slab: []const u8) Self {
             return .{
-                .dbi = db.dbi,
-                .cache = std.AutoHashMap(KeyField, CacheEntry).init(allocator),
-                .active_txn = txn_ref,
                 .allocator = allocator,
+                .cache = std.AutoHashMap(KeyField, CacheEntry).init(allocator),
+                .slab = slab,
             };
         }
 
@@ -70,24 +68,16 @@ pub fn MutableStore(comptime T: type) type {
             }
             if (self.cache.get(key)) |entry| return entry.entity;
 
-            var key_buf: [KEY_SIZE]u8 = undefined;
-            entity_serial.encodeKey(KeyField, key, &key_buf);
-            const db = lmdbx.Database{ .txn = self.active_txn.*, .dbi = self.dbi };
-            const data = (try db.get(&key_buf)) orelse return null;
-            if (data.len != VALUE_SIZE) return error.MalformedEntity;
-            const entity = entity_serial.deserialize(T, data[0..VALUE_SIZE]);
+            const idx = self.slabIndexOf(key) orelse return null;
+            const record = self.slab[idx * VALUE_SIZE ..][0..VALUE_SIZE];
+            const entity = entity_serial.deserialize(T, record);
             try self.cache.put(key, .{ .entity = entity, .dirty = false });
             return entity;
         }
 
         /// Load `key`, or initialize a fresh entity with all fields zeroed
         /// and the primary-key field set to `key`. The fresh entity is
-        /// inserted dirty so it persists at the next flush.
-        ///
-        /// Use this for the common "credit/debit a counter" pattern where
-        /// the per-field starting value is zero (balances, counters, etc.).
-        /// For richer defaults, fall back to `(try load(k)) orelse build(k)`
-        /// and explicit `save`.
+        /// inserted dirty so it persists at the next commit.
         pub fn loadOrInit(self: *Self, key: KeyField) !T {
             if (try self.load(key)) |existing| return existing;
             var entity = std.mem.zeroes(T);
@@ -100,9 +90,7 @@ pub fn MutableStore(comptime T: type) type {
             return entity;
         }
 
-        /// Save derives the primary key from `entity`'s first field. Single-arg
-        /// save matches `ImmutableStore.save(entity)` so the two store types
-        /// feel uniform from a handler's perspective.
+        /// Single-arg save derives the primary key from `entity`'s first field.
         pub fn save(self: *Self, entity: T) !void {
             const key = @field(entity, key_field_name);
             if (self.live) {
@@ -112,48 +100,24 @@ pub fn MutableStore(comptime T: type) type {
             try self.cache.put(key, .{ .entity = entity, .dirty = true });
         }
 
-        pub fn flush(self: *Self) !void {
-            const db = lmdbx.Database{ .txn = self.active_txn.*, .dbi = self.dbi };
-            var it = self.cache.iterator();
-            while (it.next()) |entry| {
-                if (!entry.value_ptr.dirty) continue;
-                var key_buf: [KEY_SIZE]u8 = undefined;
-                var val_buf: [VALUE_SIZE]u8 = undefined;
-                entity_serial.encodeKey(KeyField, entry.key_ptr.*, &key_buf);
-                entity_serial.serialize(T, entry.value_ptr.entity, &val_buf);
-                try db.set(&key_buf, &val_buf, .Upsert);
-                entry.value_ptr.dirty = false;
-            }
-        }
-
-        /// Upsert every overlay entry tagged with `block` into MDBX via the
-        /// active txn, then drop them. Entries with other tags stay pending.
-        /// Cache mirrors the committed value as clean — without this, a
-        /// subsequent live load that misses the overlay would hit a stale
-        /// cached pre-overlay value instead of the just-committed bytes.
+        /// Move every overlay entry tagged with `block` into the regular
+        /// cache (marked dirty). The disk write happens later via
+        /// `materialize` + `state_snap.commit`.
         pub fn commitBlock(self: *Self, block: u64) !void {
             if (self.pending.count() == 0) return;
-            const db = lmdbx.Database{ .txn = self.active_txn.*, .dbi = self.dbi };
             var to_remove: std.ArrayListUnmanaged(KeyField) = .{};
             defer to_remove.deinit(self.allocator);
             var it = self.pending.iterator();
             while (it.next()) |entry| {
                 if (entry.value_ptr.block != block) continue;
-                var key_buf: [KEY_SIZE]u8 = undefined;
-                var val_buf: [VALUE_SIZE]u8 = undefined;
-                entity_serial.encodeKey(KeyField, entry.key_ptr.*, &key_buf);
-                entity_serial.serialize(T, entry.value_ptr.value, &val_buf);
-                try db.set(&key_buf, &val_buf, .Upsert);
-                try self.cache.put(entry.key_ptr.*, .{ .entity = entry.value_ptr.value, .dirty = false });
+                try self.cache.put(entry.key_ptr.*, .{ .entity = entry.value_ptr.value, .dirty = true });
                 try to_remove.append(self.allocator, entry.key_ptr.*);
             }
             for (to_remove.items) |k| _ = self.pending.remove(k);
         }
 
         /// Drop the entire overlay. Used on reorg — the caller re-dispatches
-        /// every block in the fresh pending file. Partial discard is not
-        /// exposed because the single-value-per-key overlay loses pre-fork
-        /// state for keys written across multiple pending blocks.
+        /// every block in the fresh pending file.
         pub fn discardAll(self: *Self) void {
             self.pending.clearRetainingCapacity();
         }
@@ -165,131 +129,177 @@ pub fn MutableStore(comptime T: type) type {
         pub fn pendingCount(self: *const Self) u32 {
             return self.pending.count();
         }
+
+        /// Produce the sorted slab bytes for the next `state.snap` commit.
+        /// Caller owns the returned buffer (frees via `allocator`). Slab is
+        /// the union of (current slab) and (cache), with cache overwriting.
+        pub fn materialize(self: *Self, allocator: std.mem.Allocator) ![]u8 {
+            var union_map = std.AutoHashMapUnmanaged(KeyBytes, T){};
+            defer union_map.deinit(allocator);
+
+            const num_in_slab = self.slab.len / VALUE_SIZE;
+            var i: usize = 0;
+            while (i < num_in_slab) : (i += 1) {
+                const rec = self.slab[i * VALUE_SIZE ..][0..VALUE_SIZE];
+                const entity = entity_serial.deserialize(T, rec);
+                const key_be: KeyBytes = rec[0..KEY_SIZE].*;
+                try union_map.put(allocator, key_be, entity);
+            }
+
+            var it = self.cache.iterator();
+            while (it.next()) |e| {
+                var key_be: KeyBytes = undefined;
+                entity_serial.encodeKey(KeyField, e.key_ptr.*, &key_be);
+                try union_map.put(allocator, key_be, e.value_ptr.entity);
+            }
+
+            const total_count = union_map.count();
+            const sorted_keys = try allocator.alloc(KeyBytes, total_count);
+            defer allocator.free(sorted_keys);
+            var k_it = union_map.keyIterator();
+            var idx: usize = 0;
+            while (k_it.next()) |k| : (idx += 1) sorted_keys[idx] = k.*;
+            std.sort.pdq(KeyBytes, sorted_keys, {}, keyLessThan);
+
+            const out = try allocator.alloc(u8, @as(usize, total_count) * VALUE_SIZE);
+            errdefer allocator.free(out);
+            for (sorted_keys, 0..) |k, j| {
+                const entity = union_map.get(k).?;
+                entity_serial.serialize(T, entity, out[j * VALUE_SIZE ..][0..VALUE_SIZE]);
+            }
+            return out;
+        }
+
+        /// Rebind the borrowed slab pointer after `state_snap.commit`
+        /// succeeds. Clears dirty flags on cache entries.
+        pub fn refreshSlab(self: *Self, new_slab: []const u8) void {
+            self.slab = new_slab;
+            var it = self.cache.valueIterator();
+            while (it.next()) |v| v.dirty = false;
+        }
+
+        fn slabIndexOf(self: *const Self, key: KeyField) ?usize {
+            const num_records = self.slab.len / VALUE_SIZE;
+            if (num_records == 0) return null;
+            var target: KeyBytes = undefined;
+            entity_serial.encodeKey(KeyField, key, &target);
+            var lo: usize = 0;
+            var hi: usize = num_records;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const record_key = self.slab[mid * VALUE_SIZE ..][0..KEY_SIZE];
+                switch (std.mem.order(u8, record_key, &target)) {
+                    .eq => return mid,
+                    .lt => lo = mid + 1,
+                    .gt => hi = mid,
+                }
+            }
+            return null;
+        }
+
+        fn keyLessThan(_: void, a: KeyBytes, b: KeyBytes) bool {
+            return std.mem.order(u8, &a, &b) == .lt;
+        }
     };
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
 
 const Account = struct {
     id: [20]u8,
     balance: u256,
 };
 
-fn openTestEnv(tmp: *std.testing.TmpDir) !lmdbx.Environment {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try tmp.dir.realpathZ(".", &path_buf);
-    var path_z: [std.fs.max_path_bytes:0]u8 = undefined;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-    return try lmdbx.Environment.init(@ptrCast(&path_z), .{ .max_dbs = 4 });
+fn serializeOne(comptime T: type, entity: T) [@sizeOf(u8) * entity_serial.entitySize(T)]u8 {
+    var buf: [entity_serial.entitySize(T)]u8 = undefined;
+    entity_serial.serialize(T, entity, &buf);
+    return buf;
 }
 
-test "load after save returns cached value without touching MDBX" {
+test "load on empty slab returns null" {
     const S = MutableStore(Account);
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const env = try openTestEnv(&tmp);
-    defer env.deinit() catch {};
+    var store = S.open(testing.allocator, &.{});
+    defer store.deinit();
+    try testing.expectEqual(@as(?Account, null), try store.load([_]u8{0xAA} ** 20));
+}
 
-    var current_txn = try env.transaction(.{});
-    var store = try S.open(std.testing.allocator, &current_txn, "accounts");
+test "load after save returns cached value; no slab read needed" {
+    const S = MutableStore(Account);
+    var store = S.open(testing.allocator, &.{});
     defer store.deinit();
 
     const alice = [_]u8{0xAA} ** 20;
     try store.save(.{ .id = alice, .balance = 100 });
-    // Nothing flushed yet, so MDBX is empty. If load went to MDBX it would
-    // miss. The cache hit is the only path that returns a value.
     const got = (try store.load(alice)).?;
-    try std.testing.expectEqual(@as(u256, 100), got.balance);
-
-    try current_txn.abort();
+    try testing.expectEqual(@as(u256, 100), got.balance);
 }
 
-test "flush writes only dirty entries" {
+test "load falls through to slab binary search" {
     const S = MutableStore(Account);
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const env = try openTestEnv(&tmp);
-    defer env.deinit() catch {};
-
     const alice = [_]u8{0xAA} ** 20;
     const bob = [_]u8{0xBB} ** 20;
+    var slab_buf: [2 * S.value_size]u8 = undefined;
+    entity_serial.serialize(Account, .{ .id = alice, .balance = 100 }, slab_buf[0..S.value_size]);
+    entity_serial.serialize(Account, .{ .id = bob, .balance = 200 }, slab_buf[S.value_size..]);
 
-    {
-        var current_txn = try env.transaction(.{});
-        var store = try S.open(std.testing.allocator, &current_txn, "accounts");
-        defer store.deinit();
-
-        try store.save(.{ .id = alice, .balance = 100 });
-        try store.flush();
-        try current_txn.commit();
-    }
-
-    // Re-open: load alice (clean, dirty=false), save bob (dirty), flush.
-    // Both keys must be present in MDBX after flush, and alice's bytes must
-    // be unchanged from the first commit.
-    {
-        var current_txn = try env.transaction(.{});
-        var store = try S.open(std.testing.allocator, &current_txn, "accounts");
-        defer store.deinit();
-
-        const alice_loaded = (try store.load(alice)).?;
-        try std.testing.expectEqual(@as(u256, 100), alice_loaded.balance);
-
-        try store.save(.{ .id = bob, .balance = 200 });
-        try store.flush();
-
-        // Read both keys directly from MDBX (bypassing the cache) to verify
-        // the flush actually wrote them. Avoids lmdbx-zig's `dbi_stat`
-        // wrapper bug (CLAUDE.md "lmdbx-zig has wrapper bugs").
-        const db = lmdbx.Database{ .txn = current_txn, .dbi = store.dbi };
-        var key_buf: [S.key_size]u8 = undefined;
-        entity_serial.encodeKey(S.Key, alice, &key_buf);
-        try std.testing.expect((try db.get(&key_buf)) != null);
-        entity_serial.encodeKey(S.Key, bob, &key_buf);
-        try std.testing.expect((try db.get(&key_buf)) != null);
-
-        try current_txn.commit();
-    }
-}
-
-test "cache survives flush, commit, and a new transaction" {
-    const S = MutableStore(Account);
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const env = try openTestEnv(&tmp);
-    defer env.deinit() catch {};
-
-    const alice = [_]u8{0xAA} ** 20;
-    var current_txn = try env.transaction(.{});
-    var store = try S.open(std.testing.allocator, &current_txn, "accounts");
+    var store = S.open(testing.allocator, &slab_buf);
     defer store.deinit();
 
-    try store.save(.{ .id = alice, .balance = 100 });
-    try std.testing.expectEqual(@as(u32, 1), store.count());
-    try store.flush();
-    try current_txn.commit();
-
-    // Cache survives the commit; only dirty flags reset.
-    try std.testing.expectEqual(@as(u32, 1), store.count());
-
-    // Reassign current_txn to a fresh read txn; the store sees it through
-    // its `active_txn` pointer without re-opening.
-    current_txn = try env.transaction(.{});
-    const got = (try store.load(alice)).?;
-    try std.testing.expectEqual(@as(u256, 100), got.balance);
-    try current_txn.abort();
+    try testing.expectEqual(@as(u256, 100), (try store.load(alice)).?.balance);
+    try testing.expectEqual(@as(u256, 200), (try store.load(bob)).?.balance);
+    try testing.expectEqual(@as(?Account, null), try store.load([_]u8{0xCC} ** 20));
 }
 
-test "live save buffers to overlay, not cache or MDBX" {
+test "materialize merges slab and cache, overwriting on key match" {
     const S = MutableStore(Account);
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const env = try openTestEnv(&tmp);
-    defer env.deinit() catch {};
+    const alice = [_]u8{0xAA} ** 20;
+    const bob = [_]u8{0xBB} ** 20;
+    var slab_buf: [2 * S.value_size]u8 = undefined;
+    entity_serial.serialize(Account, .{ .id = alice, .balance = 100 }, slab_buf[0..S.value_size]);
+    entity_serial.serialize(Account, .{ .id = bob, .balance = 200 }, slab_buf[S.value_size..]);
 
-    var current_txn = try env.transaction(.{});
-    var store = try S.open(std.testing.allocator, &current_txn, "accounts");
+    var store = S.open(testing.allocator, &slab_buf);
+    defer store.deinit();
+
+    // Overwrite alice's balance; add a new key.
+    try store.save(.{ .id = alice, .balance = 999 });
+    const carl = [_]u8{0xCC} ** 20;
+    try store.save(.{ .id = carl, .balance = 50 });
+
+    const new_slab = try store.materialize(testing.allocator);
+    defer testing.allocator.free(new_slab);
+
+    try testing.expectEqual(@as(usize, 3 * S.value_size), new_slab.len);
+
+    // Verify by re-binding the slab and reading back.
+    store.refreshSlab(new_slab);
+    store.cache.clearRetainingCapacity();
+    try testing.expectEqual(@as(u256, 999), (try store.load(alice)).?.balance);
+    try testing.expectEqual(@as(u256, 200), (try store.load(bob)).?.balance);
+    try testing.expectEqual(@as(u256, 50), (try store.load(carl)).?.balance);
+}
+
+test "refreshSlab clears dirty flags" {
+    const S = MutableStore(Account);
+    var store = S.open(testing.allocator, &.{});
+    defer store.deinit();
+
+    const alice = [_]u8{0xAA} ** 20;
+    try store.save(.{ .id = alice, .balance = 1 });
+
+    const buf = try store.materialize(testing.allocator);
+    defer testing.allocator.free(buf);
+    store.refreshSlab(buf);
+
+    const e = store.cache.get(alice).?;
+    try testing.expectEqual(false, e.dirty);
+}
+
+test "live save buffers to overlay, not cache or slab" {
+    const S = MutableStore(Account);
+    var store = S.open(testing.allocator, &.{});
     defer store.deinit();
     store.live = true;
     store.live_block = 100;
@@ -297,59 +307,28 @@ test "live save buffers to overlay, not cache or MDBX" {
     const alice = [_]u8{0xAA} ** 20;
     try store.save(.{ .id = alice, .balance = 100 });
 
-    // Overlay holds the live write; cache and MDBX are untouched.
-    try std.testing.expectEqual(@as(u32, 1), store.pendingCount());
-    try std.testing.expectEqual(@as(u32, 0), store.count());
-    const db = lmdbx.Database{ .txn = current_txn, .dbi = store.dbi };
-    var key_buf: [S.key_size]u8 = undefined;
-    entity_serial.encodeKey(S.Key, alice, &key_buf);
-    try std.testing.expect((try db.get(&key_buf)) == null);
-
-    try current_txn.abort();
+    try testing.expectEqual(@as(u32, 1), store.pendingCount());
+    try testing.expectEqual(@as(u32, 0), store.count());
 }
 
-test "live load merges overlay over base" {
+test "live load merges overlay over slab" {
     const S = MutableStore(Account);
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const env = try openTestEnv(&tmp);
-    defer env.deinit() catch {};
-
     const alice = [_]u8{0xAA} ** 20;
+    var slab_buf: [S.value_size]u8 = undefined;
+    entity_serial.serialize(Account, .{ .id = alice, .balance = 100 }, &slab_buf);
 
-    // Seed MDBX with alice.balance = 100 via the backfill path.
-    {
-        var current_txn = try env.transaction(.{});
-        var store = try S.open(std.testing.allocator, &current_txn, "accounts");
-        defer store.deinit();
-        try store.save(.{ .id = alice, .balance = 100 });
-        try store.flush();
-        try current_txn.commit();
-    }
-
-    // Open in live mode; overlay holds a fresher value for the same key.
-    var current_txn = try env.transaction(.{});
-    var store = try S.open(std.testing.allocator, &current_txn, "accounts");
+    var store = S.open(testing.allocator, &slab_buf);
     defer store.deinit();
     store.live = true;
     store.live_block = 200;
     try store.save(.{ .id = alice, .balance = 500 });
 
-    const got = (try store.load(alice)).?;
-    try std.testing.expectEqual(@as(u256, 500), got.balance);
-
-    try current_txn.abort();
+    try testing.expectEqual(@as(u256, 500), (try store.load(alice)).?.balance);
 }
 
-test "commitBlock flushes only the matching block's slice" {
+test "commitBlock moves overlay entries to cache, marked dirty" {
     const S = MutableStore(Account);
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const env = try openTestEnv(&tmp);
-    defer env.deinit() catch {};
-
-    var current_txn = try env.transaction(.{});
-    var store = try S.open(std.testing.allocator, &current_txn, "accounts");
+    var store = S.open(testing.allocator, &.{});
     defer store.deinit();
     store.live = true;
 
@@ -361,69 +340,17 @@ test "commitBlock flushes only the matching block's slice" {
     try store.save(.{ .id = bob, .balance = 200 });
 
     try store.commitBlock(100);
+    try testing.expectEqual(@as(u32, 1), store.pendingCount());
+    try testing.expectEqual(@as(u32, 1), store.count());
 
-    // Block 100's slice landed in MDBX; alice is gone from overlay.
-    const db = lmdbx.Database{ .txn = current_txn, .dbi = store.dbi };
-    var key_buf: [S.key_size]u8 = undefined;
-    entity_serial.encodeKey(S.Key, alice, &key_buf);
-    try std.testing.expect((try db.get(&key_buf)) != null);
-    // Block 101's slice (bob) is still pending — no MDBX entry yet.
-    entity_serial.encodeKey(S.Key, bob, &key_buf);
-    try std.testing.expect((try db.get(&key_buf)) == null);
-    try std.testing.expectEqual(@as(u32, 1), store.pendingCount());
-
-    try current_txn.commit();
+    const alice_cached = store.cache.get(alice).?;
+    try testing.expectEqual(@as(u256, 100), alice_cached.entity.balance);
+    try testing.expectEqual(true, alice_cached.dirty);
 }
 
-test "commitBlock refreshes cache so a later live load sees the committed value" {
+test "discardAll drops the overlay" {
     const S = MutableStore(Account);
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const env = try openTestEnv(&tmp);
-    defer env.deinit() catch {};
-
-    const alice = [_]u8{0xAA} ** 20;
-
-    // Seed MDBX with alice.balance = 100 and warm the cache via load.
-    {
-        var current_txn = try env.transaction(.{});
-        var store = try S.open(std.testing.allocator, &current_txn, "accounts");
-        defer store.deinit();
-        try store.save(.{ .id = alice, .balance = 100 });
-        try store.flush();
-        try current_txn.commit();
-    }
-
-    var current_txn = try env.transaction(.{});
-    var store = try S.open(std.testing.allocator, &current_txn, "accounts");
-    defer store.deinit();
-    store.live = true;
-
-    // Warm the cache at value=100 (the stale read).
-    _ = try store.load(alice);
-
-    // Block 200 writes balance=500 to the overlay, then commits.
-    store.live_block = 200;
-    try store.save(.{ .id = alice, .balance = 500 });
-    try store.commitBlock(200);
-
-    // Without the cache refresh, this would resolve to the stale cached
-    // value=100 instead of the freshly-committed value=500.
-    const got = (try store.load(alice)).?;
-    try std.testing.expectEqual(@as(u256, 500), got.balance);
-
-    try current_txn.commit();
-}
-
-test "discardAll drops the entire overlay" {
-    const S = MutableStore(Account);
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const env = try openTestEnv(&tmp);
-    defer env.deinit() catch {};
-
-    var current_txn = try env.transaction(.{});
-    var store = try S.open(std.testing.allocator, &current_txn, "accounts");
+    var store = S.open(testing.allocator, &.{});
     defer store.deinit();
     store.live = true;
     store.live_block = 100;
@@ -431,61 +358,49 @@ test "discardAll drops the entire overlay" {
     try store.save(.{ .id = [_]u8{0xAA} ** 20, .balance = 100 });
     store.live_block = 101;
     try store.save(.{ .id = [_]u8{0xBB} ** 20, .balance = 200 });
-    try std.testing.expectEqual(@as(u32, 2), store.pendingCount());
+    try testing.expectEqual(@as(u32, 2), store.pendingCount());
 
     store.discardAll();
-    try std.testing.expectEqual(@as(u32, 0), store.pendingCount());
-
-    try current_txn.abort();
+    try testing.expectEqual(@as(u32, 0), store.pendingCount());
 }
 
-test "backfill leaves the overlay empty" {
+test "loadOrInit returns existing or fresh zero-init entity" {
     const S = MutableStore(Account);
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const env = try openTestEnv(&tmp);
-    defer env.deinit() catch {};
-
-    var current_txn = try env.transaction(.{});
-    var store = try S.open(std.testing.allocator, &current_txn, "accounts");
-    defer store.deinit();
-
-    // live defaults to false; save takes the M2 cache path.
-    try store.save(.{ .id = [_]u8{0xAA} ** 20, .balance = 100 });
-    try store.save(.{ .id = [_]u8{0xBB} ** 20, .balance = 200 });
-    try std.testing.expectEqual(@as(u32, 0), store.pendingCount());
-    try std.testing.expectEqual(@as(u32, 2), store.count());
-
-    try current_txn.abort();
-}
-
-test "loadOrInit returns existing entity, else zeroed entity with key set" {
-    const S = MutableStore(Account);
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const env = try openTestEnv(&tmp);
-    defer env.deinit() catch {};
-
-    var current_txn = try env.transaction(.{});
-    var store = try S.open(std.testing.allocator, &current_txn, "accounts");
-    defer store.deinit();
-
     const alice = [_]u8{0xAA} ** 20;
-    const bob = [_]u8{0xBB} ** 20;
+    var slab_buf: [S.value_size]u8 = undefined;
+    entity_serial.serialize(Account, .{ .id = alice, .balance = 100 }, &slab_buf);
 
-    try store.save(.{ .id = alice, .balance = 100 });
+    var store = S.open(testing.allocator, &slab_buf);
+    defer store.deinit();
 
-    // Existing key returns existing entity unchanged.
     const got_alice = try store.loadOrInit(alice);
-    try std.testing.expectEqual(@as(u256, 100), got_alice.balance);
+    try testing.expectEqual(@as(u256, 100), got_alice.balance);
 
-    // Missing key returns a zeroed entity with the primary key field set,
-    // and inserts it dirty so a subsequent load finds it.
+    const bob = [_]u8{0xBB} ** 20;
     const got_bob = try store.loadOrInit(bob);
-    try std.testing.expectEqualSlices(u8, &bob, &got_bob.id);
-    try std.testing.expectEqual(@as(u256, 0), got_bob.balance);
-    const reload = (try store.load(bob)).?;
-    try std.testing.expectEqualSlices(u8, &bob, &reload.id);
+    try testing.expectEqualSlices(u8, &bob, &got_bob.id);
+    try testing.expectEqual(@as(u256, 0), got_bob.balance);
+    try testing.expectEqual(@as(u256, 0), (try store.load(bob)).?.balance);
+}
 
-    try current_txn.abort();
+test "materialize produces records sorted by primary key" {
+    const S = MutableStore(Account);
+    var store = S.open(testing.allocator, &.{});
+    defer store.deinit();
+
+    // Save in reverse order to verify sorting in materialize, not insertion.
+    try store.save(.{ .id = [_]u8{0xCC} ** 20, .balance = 3 });
+    try store.save(.{ .id = [_]u8{0xAA} ** 20, .balance = 1 });
+    try store.save(.{ .id = [_]u8{0xBB} ** 20, .balance = 2 });
+
+    const slab = try store.materialize(testing.allocator);
+    defer testing.allocator.free(slab);
+    try testing.expectEqual(@as(usize, 3 * S.value_size), slab.len);
+
+    // Records are BE-sorted by key (the first field's bytes).
+    const k0 = slab[0..S.key_size];
+    const k1 = slab[S.value_size .. S.value_size + S.key_size];
+    const k2 = slab[2 * S.value_size .. 2 * S.value_size + S.key_size];
+    try testing.expect(std.mem.order(u8, k0, k1) == .lt);
+    try testing.expect(std.mem.order(u8, k1, k2) == .lt);
 }

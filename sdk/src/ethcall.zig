@@ -164,7 +164,7 @@ pub const Cache = struct {
         self.entries = .{};
     }
 
-    pub fn close(self: *Cache) void {
+    pub fn deinit(self: *Cache) void {
         self.clearEntries();
         self.file.close();
     }
@@ -274,7 +274,7 @@ test "put + get round-trips status and bytes" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var cache = try Cache.open(testing.allocator, tmp.dir);
-    defer cache.close();
+    defer cache.deinit();
 
     const TARGET = [_]u8{0xCC} ** 20;
     const CALLDATA = [_]u8{ 0x31, 0x3c, 0xe5, 0x67 };
@@ -291,7 +291,7 @@ test "get returns null when the key is absent" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var cache = try Cache.open(testing.allocator, tmp.dir);
-    defer cache.close();
+    defer cache.deinit();
 
     const TARGET = [_]u8{0xDD} ** 20;
     const CALLDATA = [_]u8{ 0x31, 0x3c, 0xe5, 0x67 };
@@ -302,7 +302,7 @@ test "put with status=1 round-trips an empty-payload revert" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var cache = try Cache.open(testing.allocator, tmp.dir);
-    defer cache.close();
+    defer cache.deinit();
 
     const TARGET = [_]u8{0xEE} ** 20;
     const CALLDATA = [_]u8{ 0x95, 0xd8, 0x9b, 0x41 };
@@ -317,7 +317,7 @@ test "put is idempotent (overwrite preserves last value)" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var cache = try Cache.open(testing.allocator, tmp.dir);
-    defer cache.close();
+    defer cache.deinit();
 
     const TARGET = [_]u8{0xFF} ** 20;
     const CALLDATA = [_]u8{ 0x06, 0xfd, 0xde, 0x03 };
@@ -336,7 +336,7 @@ test "contains tracks presence" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var cache = try Cache.open(testing.allocator, tmp.dir);
-    defer cache.close();
+    defer cache.deinit();
 
     const TARGET = [_]u8{0x11} ** 20;
     const CALLDATA = [_]u8{ 0x31, 0x3c, 0xe5, 0x67 };
@@ -412,11 +412,11 @@ test "cache survives close and re-open" {
     {
         var cache = try Cache.open(testing.allocator, tmp.dir);
         try cache.put(TARGET, &CALLDATA, 0, &payload);
-        cache.close();
+        cache.deinit();
     }
 
     var cache = try Cache.open(testing.allocator, tmp.dir);
-    defer cache.close();
+    defer cache.deinit();
     const entry = cache.get(TARGET, &CALLDATA) orelse return error.TestUnexpectedNull;
     try testing.expectEqualSlices(u8, &payload, entry.bytes);
 }
@@ -433,7 +433,7 @@ test "truncated last record is dropped on open without raising" {
     {
         var cache = try Cache.open(testing.allocator, tmp.dir);
         try cache.put(TARGET, &CALLDATA, 0, &payload);
-        cache.close();
+        cache.deinit();
     }
 
     // Simulate a crashed append: tack on a partial record (missing payload bytes).
@@ -449,7 +449,7 @@ test "truncated last record is dropped on open without raising" {
 
     // Reopen: the partial record gets truncated; the good entry survives.
     var cache = try Cache.open(testing.allocator, tmp.dir);
-    defer cache.close();
+    defer cache.deinit();
     const entry = cache.get(TARGET, &CALLDATA) orelse return error.TestUnexpectedNull;
     try testing.expectEqualSlices(u8, &payload, entry.bytes);
 }
@@ -465,7 +465,7 @@ test "corrupted magic resets the cache to empty without raising" {
     }
 
     var cache = try Cache.open(testing.allocator, tmp.dir);
-    defer cache.close();
+    defer cache.deinit();
 
     // Cache is empty after corruption recovery.
     try testing.expect(!cache.contains([_]u8{0} ** 20, &[_]u8{0}));

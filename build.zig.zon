@@ -8,11 +8,6 @@
             .url = "git+https://github.com/jedisct1/zig-lz4.git#bfbb5036b978de2947aacd8d4f0d059787f5fad2",
             .hash = "lz4-0.1.3-fUqx0UlsAwAVTrVdHoSECQhP5PFnj6NvmU4cITdhEdig",
         },
-        .lmdbx = .{
-            .url = "https://github.com/theseyan/lmdbx-zig/archive/refs/tags/v0.3.0.tar.gz",
-            .hash = "lmdbx-0.2.3-WlIvzisyAwDtttPeNZHvRRtpwr86kbfuBPV4HGpcQgoD",
-            .lazy = true,
-        },
         .rocksdb = .{
             .url = "git+https://github.com/Syndica/rocksdb-zig#baceb67dc9c66e8ba40a83da3de3fd959b889e57",
             .hash = "rocksdb-9.7.4-z_CUTg_HAABgQurZzAhpJL5Erij8ZnppTmy3g1LIM8br",

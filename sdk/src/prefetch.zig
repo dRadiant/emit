@@ -249,7 +249,7 @@ test "filterUncached drops entries already present in the cache" {
     defer tmp.cleanup();
 
     var cache = try ethcall.Cache.open(std.testing.allocator, tmp.dir);
-    defer cache.close();
+    defer cache.deinit();
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
