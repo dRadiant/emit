@@ -342,7 +342,7 @@ pub fn init(
         if (comptime T.storage == .immutable) {
             const field_name = comptime entityFieldName(T);
             const log_file_name = comptime field_name ++ ".events.dat";
-            @field(ctx._event_logs, field_name) = try event_log_mod.EventLog(T).openOrCreate(allocator, entity_dh, log_file_name);
+            @field(ctx._event_logs, field_name) = try event_log_mod.EventLog(T).open(allocator, entity_dh, log_file_name);
         }
     }
     errdefer inline for (comptime resolveEntities(entities)) |T| {
@@ -667,6 +667,7 @@ fn resolveEntities(comptime entities: anytype) []const type {
 
 fn entityFieldName(comptime T: type) [:0]const u8 {
     return comptime blk: {
+        @setEvalBranchQuota(20_000);
         if (@hasDecl(T, "store_name")) {
             const override: []const u8 = T.store_name;
             if (override.len == 0) @compileError(

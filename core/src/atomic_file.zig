@@ -1,7 +1,12 @@
-/// `tmp + fsync + rename + dir fsync` snapshot writer. Any reader of
-/// `final_name` sees either the previous content or the new — never torn.
-/// The directory fsync persists the rename itself, so the new content
-/// survives power loss, not just process death.
+/// `tmp + fsync + rename` snapshot writer. Any reader of `final_name`
+/// sees either the previous content or the new — never torn.
+///
+/// No directory fsync. A power loss between the rename landing in the
+/// inode cache and the directory metadata reaching disk could roll the
+/// rename back; in that case the reader sees the prior file content,
+/// which is still consistent. Recovery is whatever the caller's normal
+/// "open and resume" path does (e.g. cursor pointed at an earlier block
+/// → replay).
 const std = @import("std");
 
 pub fn write(
@@ -17,7 +22,6 @@ pub fn write(
         try tmp.sync();
     }
     try dir.rename(tmp_name, final_name);
-    try std.posix.fsync(dir.fd);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
