@@ -50,7 +50,7 @@ pub const StaticCall = manifest.StaticCall;
 /// Storage mode declared per-entity via `pub const storage: sdk.StorageMode`.
 /// `mutable` → MutableStore (HashMap-fronted, dirty-flag flush, supports
 /// `load` / `loadOrInit` / `save`). `immutable` → ImmutableStore
-/// (`MDBX_APPEND`, monotonic key invariant, `load` is a `@compileError`).
+/// (append-only events.dat, monotonic key invariant, `load` is a `@compileError`).
 ///
 /// Each entity must declare its mode explicitly — there is no default.
 /// The choice is a real design decision per entity (mutable counter vs.

@@ -34,10 +34,9 @@ pub const Options = struct {
     /// (blocks.dat / blocks.idx / blooms.bin / meta.bin). Read-only.
     engine_data_dir: []const u8,
     /// SDK-managed data root. The SDK creates `<data_dir>/entity/` for the
-    /// entity MDBX env, `<data_dir>/filter/` for the filtered-index env,
-    /// and `<data_dir>/ethcall/` for the eth_call cache on first run; all
-    /// three are mkdir'd if missing. Users only need to allocate this
-    /// single directory.
+    /// state.snap + per-entity events.dat files, `<data_dir>/filter/` for
+    /// the filtered-index pair, and `<data_dir>/ethcall/` for the eth_call
+    /// cache on first run; all three are mkdir'd if missing.
     data_dir: []const u8,
     /// Flush + commit cadence during handler replay, in dispatched logs.
     commit_interval: u32 = 100_000,
@@ -223,8 +222,8 @@ pub fn Context(comptime entities: anytype) type {
             comptime method: []const u8,
         ) !T {
             const cache = self._cache orelse return error.NotPrefetched;
-            const selector = comptime ethcall.selectorOf(method);
-            const entry = cache.get(to, &selector) orelse return error.NotPrefetched;
+            const calldata_hash = comptime ethcall.calldataHashOf(method);
+            const entry = cache.getByHash(to, calldata_hash) orelse return error.NotPrefetched;
             if (entry.status != 0) return error.CallReverted;
             return ethcall.decodeAs(T, entry.bytes);
         }
@@ -276,8 +275,8 @@ fn EventLogsStruct(comptime entities: anytype) type {
 }
 
 /// Backfill to completion and tear down. The entity stores are committed
-/// and closed; the entity MDBX env is closed. To keep the stores readable
-/// after backfill, use `init` instead.
+/// via `state.snap`; every handle in the Context is closed. To keep the
+/// stores readable after backfill, use `init` instead.
 pub fn run(
     comptime m: sdk_manifest.Manifest,
     comptime Handler: type,
@@ -399,8 +398,10 @@ pub fn init(
         }
     }
 
-    // Phase 4: prefetch.
-    const ethcall_dh = try std.fs.cwd().openDir(ethcall_dir, .{});
+    // Phase 4: prefetch. The dir handle is only needed to open the cache;
+    // Cache holds its own file handle and doesn't need the dir to persist.
+    var ethcall_dh = try std.fs.cwd().openDir(ethcall_dir, .{});
+    defer ethcall_dh.close();
     const cache = try allocator.create(ethcall.Cache);
     errdefer allocator.destroy(cache);
     cache.* = try ethcall.Cache.open(allocator, ethcall_dh);
@@ -1067,9 +1068,10 @@ test "init + replay commit batching: ctx.commitCycle fires per commit_interval" 
 
 // ── ethCall (BlockContext typed cache read) ──────────────────────────────
 
-/// Build a minimal Context whose only used field is `_cache`. `_env` and
-/// `_active_txn` are left `undefined` because `ethCall` never touches them;
-/// the caller must NOT invoke `deinit` (which would dereference them).
+/// Build a minimal Context whose only used field is `_cache`.
+/// `_entity_dir` and `_state_snap` are left `undefined` because `ethCall`
+/// never touches them; the caller must NOT invoke `deinit` (which would
+/// dereference them).
 fn ethCallTestContext(cache: *ethcall.Cache) Context(.{}) {
     return .{
         .stores = .{},
@@ -1261,10 +1263,10 @@ test "phase 4 runs zero work for a manifest with no prefetch" {
 }
 
 test "handler-only re-run skips phases 1-3 and the cursor blocks re-dispatch" {
-    // cursor: the first init writes `_meta.cursor` reflecting the last
-    // dispatched block. The second init reads it, seeds `start_block`, and
-    // `scanner.replay` seeks past the already-covered range. The single
-    // planted block (number 100) is therefore *not* re-dispatched
+    // cursor: the first init writes `state.snap.cursor` reflecting the
+    // last dispatched block. The second init reads it, seeds `start_block`,
+    // and `scanner.replay` seeks past the already-covered range. The
+    // single planted block (number 100) is therefore *not* re-dispatched
     const allocator = testing.allocator;
 
     var src_tmp = testing.tmpDir(.{});

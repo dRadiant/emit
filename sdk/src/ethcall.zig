@@ -49,6 +49,18 @@ pub fn selectorOf(comptime method: []const u8) [4]u8 {
     };
 }
 
+/// Comptime-precomputed `keccak256(selector_of(method))`. This is the
+/// 32-byte tail of the cache key for a no-arg method call. Hoisting it
+/// to comptime saves a keccak per `ctx.ethCall` invocation — meaningful
+/// when handlers fire on every block.
+pub fn calldataHashOf(comptime method: []const u8) [32]u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(400_000);
+        const selector = selectorOf(method);
+        break :blk eth.keccak.hash(&selector);
+    };
+}
+
 pub fn decodeAs(comptime T: type, bytes: []const u8) !T {
     if (bytes.len < 32) return error.MalformedResult;
     const word = bytes[0..32];
@@ -77,10 +89,13 @@ pub fn decodeAs(comptime T: type, bytes: []const u8) !T {
 }
 
 pub fn cacheKey(target: [20]u8, calldata: []const u8) [52]u8 {
+    return cacheKeyFromHash(target, eth.keccak.hash(calldata));
+}
+
+pub fn cacheKeyFromHash(target: [20]u8, calldata_hash: [32]u8) [52]u8 {
     var k: [52]u8 = undefined;
     @memcpy(k[0..20], &target);
-    const h = eth.keccak.hash(calldata);
-    @memcpy(k[20..52], &h);
+    @memcpy(k[20..52], &calldata_hash);
     return k;
 }
 
@@ -190,7 +205,6 @@ pub const Cache = struct {
 
         const end = try self.file.getEndPos();
         try self.file.pwriteAll(buf, end);
-        try self.file.sync();
 
         const owned = try self.allocator.dupe(u8, bytes);
         errdefer self.allocator.free(owned);
@@ -202,7 +216,14 @@ pub const Cache = struct {
     /// Borrow the cached entry for `(target, calldata)`. The returned slice
     /// is valid until the next `put` for the same key, or `close`.
     pub fn get(self: *const Cache, target: [20]u8, calldata: []const u8) ?CachedEntry {
-        const key = cacheKey(target, calldata);
+        return self.getByHash(target, eth.keccak.hash(calldata));
+    }
+
+    /// Borrow the cached entry for `(target, keccak(calldata))`. Use this
+    /// when the calldata hash is already known (e.g. precomputed at
+    /// comptime via `calldataHashOf`) to skip the per-call keccak.
+    pub fn getByHash(self: *const Cache, target: [20]u8, calldata_hash: [32]u8) ?CachedEntry {
+        const key = cacheKeyFromHash(target, calldata_hash);
         if (self.entries.getPtr(key)) |e| {
             return .{ .status = e.status, .bytes = e.bytes };
         }
@@ -238,6 +259,11 @@ pub const Cache = struct {
                 const status: u8 = if (r.success) 0 else 1;
                 try self.put(c.target, c.calldata, status, r.return_data);
             }
+            // One fsync per batch instead of per record: 500 individual
+            // fsyncs (~13 ms each) would dominate a cold prefetch. The
+            // batched calls share a single Multicall3 RTT and a single
+            // durability boundary.
+            try self.file.sync();
         }
     }
 };

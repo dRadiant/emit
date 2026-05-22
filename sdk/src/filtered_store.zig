@@ -141,10 +141,15 @@ pub const FilteredStore = struct {
 
     /// Read the i-th entry's dat payload into `buf`. Returns the filled slice.
     pub fn readPayload(self: *const Self, i: u64, buf: []u8) ![]const u8 {
-        const e = try self.readEntry(i);
-        if (buf.len < e.length) return error.BufferTooSmall;
-        if ((try self.dat_file.pread(buf[0..e.length], e.offset)) != e.length) return error.Truncated;
-        return buf[0..e.length];
+        return self.readPayloadFor(try self.readEntry(i), buf);
+    }
+
+    /// Read the payload for an already-known index entry. Skips the
+    /// idx-file lookup; use when peek + consume share the same entry.
+    pub fn readPayloadFor(self: *const Self, entry: IndexEntry, buf: []u8) ![]const u8 {
+        if (buf.len < entry.length) return error.BufferTooSmall;
+        if ((try self.dat_file.pread(buf[0..entry.length], entry.offset)) != entry.length) return error.Truncated;
+        return buf[0..entry.length];
     }
 
     /// Find the smallest index `i` with `entry(i).block_number > start_block`.

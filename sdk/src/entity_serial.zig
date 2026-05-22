@@ -1,8 +1,8 @@
 /// Comptime serialization helpers shared by MutableStore and ImmutableStore.
 ///
 /// Entities are pure data structs whose fields are integers or fixed-size
-/// `[N]u8` arrays. Keys (the first field) are big-endian so MDBX byte order
-/// matches numeric order. Values are little-endian for native reads.
+/// `[N]u8` arrays. Keys (the first field) are big-endian so a sorted-by-bytes
+/// slab matches key-numeric order. Values are little-endian for native reads.
 const std = @import("std");
 
 /// Byte size of a fixed-size entity field. `ctx` is a "Type.field" string
@@ -72,7 +72,7 @@ pub fn deserialize(comptime T: type, in: []const u8) T {
 }
 
 /// Pack only the primary key (the first field) into `out`. Big-endian for
-/// integer keys so MDBX byte order matches numeric order.
+/// integer keys so a sorted-by-bytes layout matches numeric order.
 pub fn serializeKey(comptime T: type, entity: T, out: []u8) void {
     const fields = @typeInfo(T).@"struct".fields;
     const KeyField = fields[0].type;

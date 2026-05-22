@@ -177,8 +177,8 @@ fn runPhase(
     // blooms.bin can hold duplicate entries for the same block_number when the
     // importer's RocksDB key parsing collapses multi-byte discriminators (reorg
     // entries) onto the same u64. The list is already sorted, so adjacent dedup
-    // suffices. Without this, MDBX_APPEND silently no-ops the second write and
-    // BuildResult.{blocks_matched,total_logs} drift ahead of MDBX.
+    // suffices. Without this, FilteredStore.appendEntry raises OutOfOrder on
+    // the second write and the build fails.
     var write_idx: usize = 1;
     for (1..matching.items.len) |read_idx| {
         if (matching.items[read_idx] == matching.items[read_idx - 1]) continue;
@@ -209,7 +209,7 @@ fn runPhase(
 
     try parallel.run(FilterWorkerArgs, worker_args[0..num_workers], num_workers, filterWorker);
 
-    // Surface fatal pipeline errors before MDBX writes. Per-block drops accumulate below.
+    // Surface fatal pipeline errors before opening the writer. Per-block drops accumulate below.
     for (0..num_workers) |i| if (worker_args[i].err) |e| return e;
 
     var store = try FilteredStore.open(allocator, dir, base);
@@ -365,9 +365,9 @@ fn filterWorker(args: *FilterWorkerArgs) void {
                 completed += 1;
             }
         }
-        // io_uring completes in NVMe order, not submission order. Sort so the
-        // writer can iterate worker outputs in ascending block order for
-        // MDBX_APPEND.
+        // io_uring completes in NVMe order, not submission order. Sort so
+        // the writer iterates worker outputs in ascending block order,
+        // satisfying FilteredStore.appendEntry's monotonic invariant.
         std.mem.sort(FilteredBlock, args.results.items, {}, blockNumberLessThan);
         return;
     }
@@ -617,7 +617,7 @@ fn freeDecoded(decoded: *std.ArrayListUnmanaged(DecodedBlock), allocator: std.me
     decoded.deinit(allocator);
 }
 
-test "build: filters multi-contract flat store, MDBX contains exactly the matches" {
+test "build: filters multi-contract flat store, primary contains exactly the matches" {
     const allocator = testing.allocator;
 
     // Plant 1000 blocks. Even-numbered → contract A and B logs (matching).

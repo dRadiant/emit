@@ -31,10 +31,10 @@ const types = core.types;
 
 pub const ReplayOptions = struct {
     commit_interval: u32 = 100_000,
-    /// Skip every filter env block whose number is at or below `start_block`.
-    /// `entry.init` seeds this from the entity env's `_meta.cursor`, so
-    /// replay against an existing entity store re-dispatches only the
-    /// uncovered range. The default 0 starts from the oldest filter env key.
+    /// Skip every filtered-index block whose number is at or below `start_block`.
+    /// `entry.init` seeds this from `state.snap.cursor`, so replay against
+    /// an existing entity store re-dispatches only the uncovered range.
+    /// The default 0 starts from the oldest entry.
     start_block: u64 = 0,
 };
 
@@ -97,10 +97,8 @@ pub fn scanCreations(
 /// with no matching event in the manifest (bloom false positives that
 /// slipped through) are silently skipped by the dispatcher, not by us.
 ///
-/// Working buffers are heap-allocated and pulled from the ctx's allocator.
-/// The body must run on the caller's thread because `ctx._active_txn` is
-/// MDBX-bound to the thread that opened it; the buffer rule in
-/// `core.parallel` then requires heap allocation.
+/// Working buffers are heap-allocated and pulled from the ctx's allocator
+/// (the buffer rule in `core.parallel`: main-thread paths get the heap).
 pub fn replay(
     dir: std.fs.Dir,
     comptime m: sdk_manifest.Manifest,
@@ -250,6 +248,10 @@ const CursorWalker = struct {
     /// Owns the next-payload scratch buffer. Sized for one block's LZ4 entry.
     payload_buf: []u8,
     next_index: u64,
+    /// The IndexEntry at `next_index`, cached by `peek` and reused by
+    /// `consume`. Without this every iteration would read the same entry
+    /// twice (once for block_number, once for offset+length).
+    peeked: ?filtered_store_mod.IndexEntry = null,
 
     /// `start_block == 0` walks from the oldest entry. Any other value seeks
     /// past entries whose block_number is `<= start_block`.
@@ -268,17 +270,16 @@ const CursorWalker = struct {
     }
 
     fn deinit(self: *CursorWalker) void {
-        // The payload buf was allocated by the same allocator used to alloc
-        // it; we don't hold a reference to it past deinit. Storage owns it
-        // via the FilteredStore lifetime convention.
         self.store.allocator.free(self.payload_buf);
         self.store.deinit();
     }
 
-    fn peek(self: *const CursorWalker) ?u64 {
+    fn peek(self: *CursorWalker) ?u64 {
         if (self.next_index >= self.store.count()) return null;
-        const entry = self.store.readEntry(self.next_index) catch return null;
-        return entry.block_number;
+        if (self.peeked == null) {
+            self.peeked = self.store.readEntry(self.next_index) catch return null;
+        }
+        return self.peeked.?.block_number;
     }
 
     fn consume(
@@ -287,11 +288,13 @@ const CursorWalker = struct {
         decompress_buf: []u8,
         log_buf: []RawLog,
     ) ![]RawLog {
-        const payload = try self.store.readPayload(self.next_index, self.payload_buf);
+        const entry = self.peeked orelse try self.store.readEntry(self.next_index);
+        const payload = try self.store.readPayloadFor(entry, self.payload_buf);
         const decoded = try log_serial.decompressEntry(payload, decompress_buf);
         const log_count = log_serial.deserializeLogs(decoded, log_buf);
         for (log_buf[0..log_count]) |*log| log.block_number = block_number;
         self.next_index += 1;
+        self.peeked = null;
         return log_buf[0..log_count];
     }
 };

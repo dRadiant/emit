@@ -1,7 +1,7 @@
 /// SDK head-following loop: reads the engine's pending ring on each
 /// inotify wakeup, classifies the diff against the prior tick, dispatches
-/// new blocks through the per-block overlay, promotes finalized blocks
-/// to MDBX, and recovers from reorgs.
+/// new blocks through the per-block overlay, commits finalized blocks
+/// via state.snap, and recovers from reorgs.
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -247,8 +247,9 @@ const LiveSession = struct {
         );
         defer classification.deinit(self.allocator);
 
-        // Promote first so a finalized block's overlay slice lands in
-        // MDBX before this tick's dispatches could overwrite its tag.
+        // Promote first so a finalized block's overlay slice is committed
+        // through state.snap before this tick's dispatches could overwrite
+        // its tag.
         try promoteFinalized(ctx, classification.finalized);
 
         if (classification.reorg_from != null or classification.reorged_out.len > 0) {
@@ -329,9 +330,10 @@ const LiveSession = struct {
 };
 
 /// For each finalized block: drain that block's overlay slice from every
-/// store into MDBX, advance `_last_dispatched_block`, commit. The cursor
-/// write rides the same txn as the entity flush — a crash mid-promotion
-/// rolls both back. Counter-shaped tests without a `stores` field skip.
+/// store into the dirty cache / pending-append queue, advance
+/// `_last_dispatched_block`, then `commitCycle` so the cursor + every
+/// store flushes via one `state.snap` rename. A crash mid-promotion rolls
+/// the whole batch back. Counter-shaped tests without `stores` skip.
 fn promoteFinalized(ctx: anytype, finalized: []const u64) !void {
     if (finalized.len == 0) return;
     const T = std.meta.Child(@TypeOf(ctx));
@@ -372,9 +374,10 @@ pub fn run(
 }
 
 /// Flip `live = true` on every entity store. Saves from this point go
-/// to the per-block overlay instead of MDBX; `commitBlock` is the only
-/// path that promotes overlay state to durable storage. Counter-shaped
-/// test contexts without a `stores` field are skipped.
+/// to the per-block overlay instead of the dirty cache; `commitBlock` is
+/// the only path that drains overlay state into the cache/append queue
+/// for the next `state.snap` commit. Counter-shaped test contexts without
+/// a `stores` field are skipped.
 fn enter(ctx: anytype) void {
     const T = std.meta.Child(@TypeOf(ctx));
     if (comptime !@hasField(T, "stores")) return;
