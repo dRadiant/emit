@@ -72,7 +72,7 @@ pub const AddressSource = union(enum) {
 
 /// One declared eth_call. The target address resolves per-log via `address`;
 /// `method` is the no-argument Solidity signature whose first four keccak
-/// bytes form the call selector. Methods with parameters are not supported yet.
+/// bytes form the call selector.
 pub const PrefetchCall = struct {
     address: AddressSource,
     method: []const u8,
@@ -87,8 +87,7 @@ pub const PrefetchDef = struct {
 /// The `method` string is the no-argument Solidity signature; the SDK
 /// keccaks the first four bytes as the selector. The same string appears
 /// at the handler call site (`ctx.ethCall(T, address, "method()")`) so the
-/// cache key derivation is unambiguous and consistent. Methods with
-/// parameters are planned for a future release.
+/// cache key derivation is unambiguous and consistent.
 pub const StaticCall = struct {
     address: [20]u8,
     method: []const u8,

@@ -8,14 +8,16 @@
             .url = "git+https://github.com/jedisct1/zig-lz4.git#bfbb5036b978de2947aacd8d4f0d059787f5fad2",
             .hash = "lz4-0.1.3-fUqx0UlsAwAVTrVdHoSECQhP5PFnj6NvmU4cITdhEdig",
         },
+        .eth_zig = .{
+            .url = "git+https://github.com/StrobeLabs/eth.zig.git?ref=v0.3.0#757ac11ee5e6bf489aa82ff5db05f4b1fca09a21",
+            .hash = "eth_zig-0.3.0-efEm-i65QgC_yawMMg1E1xrc3E8yTZsAlfhj0wJjPyMe",
+        },
+
+        // Lazy Dependencies
         .rocksdb = .{
             .url = "git+https://github.com/Syndica/rocksdb-zig#baceb67dc9c66e8ba40a83da3de3fd959b889e57",
             .hash = "rocksdb-9.7.4-z_CUTg_HAABgQurZzAhpJL5Erij8ZnppTmy3g1LIM8br",
             .lazy = true,
-        },
-        .eth_zig = .{
-            .url = "git+https://github.com/StrobeLabs/eth.zig.git?ref=v0.3.0#757ac11ee5e6bf489aa82ff5db05f4b1fca09a21",
-            .hash = "eth_zig-0.3.0-efEm-i65QgC_yawMMg1E1xrc3E8yTZsAlfhj0wJjPyMe",
         },
     },
     .paths = .{
