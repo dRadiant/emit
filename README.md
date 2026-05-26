@@ -21,7 +21,7 @@ EMIT Indexers then read that store and produce whatever entities your applicatio
 - **Self-hosted.** No API keys, no rate limits, own your data. Single static binary plus a Zig library.
 - **Fast.** According to our benchmarks, EMIT is currently the fastest EVM indexer, and by a wide margin. It also has the smallest footprint.
 - **Events-first.** All time-varying state derives from events. No archive node, no historical `eth_call`. Balances, prices, positions all reconstruct from logs. The lack of historical `eth_call` is intentional as it constrains the developer into following indexer [best practices](https://thegraph.com/docs/en/subgraphs/best-practices/avoid-eth-calls/) while also making the system lighter.
-- **Feedback Loop.** Build a filtered index over the engine's flat store once (~10s for rETH), then iterate handlers against the filtered index (<1s per re-run). Most development cycles become instant and changes are visible in seconds, not hours.
+- **Iterate quickly.** Build a filtered index over the engine's flat store once (~10s for rETH), then iterate handlers against the filtered index (<1s per re-run). Most development cycles become instant and changes are visible in seconds, not hours.
 - **Node-agnostic.** Anything that serves `eth_subscribe(newHeads)` and `eth_getLogs` works. Nethermind is recommended for the RocksDB direct-import path; Geth, Reth, and Erigon work via RPC.
 - **Multi-chain by composition.** One engine per chain, one indexer binary per chain. Cross-chain joins are application-level.
 - **You own the API.** EMIT fills entity stores. Whether you serve them via REST, GraphQL, WebSocket, or raw memory map — is your choice.
@@ -30,7 +30,9 @@ Currently requires the Execution Client, Engine, and Indexer to be collocated on
 
 ## Quickstart
 
-Prerequisites: a synced Nethermind execution client with bodies + receipts (see [engine/README.md](engine/README.md) for required flags), plus Zig 0.15.2. It is also recommended to host EMIT on Linux for optimal performance (io_uring, fadvise, inotify).
+Prerequisites: a synced Nethermind execution client with bodies + receipts (see [engine/README.md](engine/README.md) for required flags), plus Zig 0.15.2. 
+
+It is also recommended to host EMIT on Linux for optimal performance (io_uring, fadvise, inotify).
 
 ```sh
 # 1. Clone and build the engine.
@@ -62,6 +64,8 @@ Expected output from step 4: a per-cycle line like `scan: 124,500 blocks / filte
 ## Benchmarks
 
 A major deciding factor of choosing your infrastructure tooling is performance. Which is why EMIT was designed for efficiency. The goal is maximal performance, with the smallest footprint possible.
+
+EMIT is designed to be ran on modest hardware. The minimum hardware requirements are 2 TB of SSD (preferably NVMe) and 32 GB of DDR4 RAM, and a processor with at least 12 threads. Since EMIT is efficient, it operates closely to hardware limitations, and as such, benefits from better hardware (Gen 4/5 NVMe, DDR5, etc.)
 
 Below is listed the measured benchmarks from EMIT deployed on varying Hetzner dedicated server configurations.
 
@@ -118,7 +122,7 @@ Four independent processes connected only via the filesystem:
 
 ```
 Nethermind + Lighthouse (Execution + Consensus Clients)  →  EMIT-engine  →  Indexer A, Indexer B, ...
-                              (flat log store + pending ring)
+                                                  (flat log store + pending ring)
 ```
 
 The execution client owns receipts. The engine owns the flat log store (immutable post-finality). Each indexer owns its entity store. Any one can be stopped, replaced, or scaled without touching the others. Read-only API replicas spawn by opening the entity store at a path; concurrent readers are native.

@@ -2,11 +2,11 @@
 
 **Status**: Accepted
 **Date**: 2026-05-11
-**Context**: M3 fills the M2-stubbed `BlockContext.ethCall`. The decision is whether handlers may issue ad-hoc network calls (lazy mode) or only read pre-declared prefetched results (strict mode).
+**Context**: `BlockContext.ethCall` had been declared as a stub returning `error.NotYetImplemented`. The decision is whether handlers may issue ad-hoc network calls (lazy mode) or only read pre-declared prefetched results (strict mode).
 
 ## Problem
 
-M2 shipped `BlockContext.ethCall(to, calldata) ![]const u8` returning `error.NotYetImplemented`. M3 implements it backed by a Multicall3-batched MDBX cache populated in a Phase 4 prefetch step between filter build and handler replay.
+The earlier scaffold shipped `BlockContext.ethCall(to, calldata) ![]const u8` returning `error.NotYetImplemented`. This ADR resolves the implementation: a Multicall3-batched cache populated in a prefetch phase between filter build and handler replay.
 
 The semantic decision is not how the cache works, but what `ethCall` does on a cache miss.
 
@@ -29,8 +29,8 @@ Both are implementable. The choice shapes user ergonomics, replay determinism, t
 
 **Cons**
 - First handler invocation that hits an uncached call stalls on HTTP. Tail latency depends on RPC provider behavior. Spec §9 commits to ≥2M events/s replay; one cache miss in the wrong block tanks per-block throughput by four orders of magnitude.
-- Defeats Multicall3 batching. A miss is one RTT per call, not 500 calls per RTT. The whole architectural premise of M3 collapses if handlers can bypass the batch.
-- Breaks spec §M3 exit criterion ("zero RPC calls on re-backfill"). Any newly added handler with an undeclared call leaks RPC on every run.
+- Defeats Multicall3 batching. A miss is one RTT per call, not 500 calls per RTT. The whole architectural premise of the prefetch design collapses if handlers can bypass the batch.
+- Breaks the "zero RPC calls on re-backfill" exit criterion. Any newly added handler with an undeclared call leaks RPC on every run.
 - Handlers become impure functions of `(log, cache, entity-state, network)`. Replay is no longer deterministic over durable inputs. Reorg replays, forensic replays, and CI replays diverge from production.
 - Errors are silent and late: a typo'd selector or wrong address gets cached as a reverted call and continues to "work" without telling the user.
 
@@ -42,7 +42,7 @@ Both are implementable. The choice shapes user ergonomics, replay determinism, t
 - Replay is a pure function over the filtered index plus the ethcall cache. Both are durable. Both are reproducible.
 - Throughput is deterministic. Replay does zero network I/O, period.
 - Multicall3 batching is the only fetch path, so the architectural win is preserved.
-- Spec §M3's zero-RPC re-backfill exit criterion becomes a structural property, not a hope.
+- The zero-RPC re-backfill exit criterion becomes a structural property, not a hope.
 - Missing prefetch declarations fail loudly on the first handler invocation that needs them. Address + 4-byte selector show up in the error path. Triage is immediate.
 - The full set of network calls the indexer ever makes is enumerable at comptime from the manifest. Useful for audits, ops budgets, and regulated deployments.
 - Operationalizes the events-first thesis from spec §"Events-first design": all relevant `eth_call`s are for immutable metadata, all immutable metadata is knowable from the manifest.
@@ -61,7 +61,7 @@ Default `ethCall` is strict. Expose a second method `ethCallLazy(addr, calldata)
 - The opt-in nature makes the semantic break visible at the call site.
 
 **Cons**
-- Two methods is one more concept than necessary in M3. No real use case in the spec or examples needs lazy mode today.
+- Two methods is one more concept than necessary right now. No real use case in the spec or examples needs lazy mode today.
 - The escape hatch can be added later in ~20 LOC (a `Cache.warm(provider, addr, calldata)` plus a `BlockContext.ethCallLazy` thin wrapper) without breaking strict callers. Reversible. There is no reason to ship it pre-emptively.
 
 ## Considerations
@@ -82,14 +82,14 @@ Default `ethCall` is strict. Expose a second method `ethCallLazy(addr, calldata)
 
 Rationale:
 
-- Replay determinism and throughput are the load-bearing M3 properties. Lazy mode trades both away for a small ergonomic gain on a use case the events-first thesis says should not exist.
+- Replay determinism and throughput are the load-bearing properties of the ethCall design. Lazy mode trades both away for a small ergonomic gain on a use case the events-first thesis says should not exist.
 - The ergonomic cost of strict mode is mostly absorbed by `known_tokens` and `.log` prefetch sources, which together cover the common case of "fetch metadata for everything that ever emits an event I care about."
 - Failure mode is the right shape: missing prefetch declarations are surfaced immediately at the first handler call, with the address and selector in the error. Lazy mode buries the same mistake as a quiet RPC bill or a slow first run.
 - Reversibility is preserved. If a future use case forces lazy mode, it lands as an additive method with no impact on existing strict callers.
 
 ## Consequences
 
-**Spec.** `BlockContext.ethCall` signature is unchanged from M2 (`![]const u8`). Error union gains `error.NotPrefetched` and `error.CallReverted`. Spec scenarios pin the strict semantics.
+**Spec.** `BlockContext.ethCall` keeps its `![]const u8` signature; the error union gains `error.NotPrefetched` and `error.CallReverted`. Spec scenarios pin the strict semantics.
 
 **Examples.** `examples/uniswap-v2/` demonstrates `known_tokens` for canonical WETH/USDC and `prefetch` with `.log` source for opportunistic token metadata. The pattern is the recommended idiom in user docs.
 
