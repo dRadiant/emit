@@ -42,7 +42,7 @@ zig build -Doptimize=ReleaseFast
 
 # 2. Import historical logs from a local Nethermind RocksDB (~13 min full chain).
 ./zig-out/bin/emit-engine import \
-  --rocksdb /var/lib/nethermind/mainnet/receipts \
+  --rocksdb /var/lib/nethermind/nethermind_db/mainnet/receipts \
   --data-dir /var/lib/emit-engine
 
 # 3. Follow the chain head into the same store.
@@ -60,6 +60,8 @@ zig build run -Doptimize=ReleaseFast -- \
 ```
 
 Expected output from step 4: a per-cycle line like `scan: 124,500 blocks / filtered: 8,213 / handler: 1,082,996 events`, then once caught up, a steady tick as new blocks arrive. See [examples/erc20/README.md](examples/erc20/README.md) for the entity layout and [examples/uniswap-v2/README.md](examples/uniswap-v2/README.md) for the factory-contract walkthrough.
+
+If you prefer Docker, see [engine/README.md](engine/README.md#container-deployment) for the `compose.node.yml` + `compose.emit.yml` operator flow.
 
 ## Benchmarks
 

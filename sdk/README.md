@@ -32,7 +32,7 @@ Module index:
 ## Usage
 
 ```zig
-const sdk = @import("emit-sdk");
+const sdk = @import("sdk");
 const e = @import("entities.zig");
 
 pub fn main() !void {
@@ -63,6 +63,44 @@ Re-exported from `root.zig`:
 - **Constants:** `DEFAULT_BATCH_SIZE`
 
 See [examples/erc20/](../examples/erc20/) for a working four-file indexer and [examples/uniswap-v2/](../examples/uniswap-v2/) for the factory pre-pass pattern.
+
+## Using emit from your own project
+
+Add emit as a dependency:
+
+```sh
+zig fetch --save git+https://github.com/dradiant/emit
+```
+
+This populates the `.emit` entry in your `build.zig.zon` with the resolved URL and hash. Then wire the `sdk` and `core` modules in your `build.zig`:
+
+```zig
+const emit = b.dependency("emit", .{ .target = target, .optimize = optimize });
+const sdk = emit.module("sdk");
+const core = emit.module("core");
+
+const exe = b.addExecutable(.{
+    .name = "my-indexer",
+    .root_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "sdk", .module = sdk },
+            .{ .name = "core", .module = core },
+        },
+    }),
+});
+```
+
+Your source code then imports both modules by their declared names:
+
+```zig
+const sdk = @import("sdk");
+const core = @import("core");
+```
+
+For monorepo embedders (forks or vendored copies), pin a `.path = "../emit"` form in `build.zig.zon` instead of running `zig fetch`.
 
 ## What sdk does NOT do
 

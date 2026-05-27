@@ -57,6 +57,38 @@ Bodies are required because receipts depend on them. Receipts are required for l
 
 For `follow`, any execution client serving `eth_subscribe(newHeads)` + `eth_getLogs` works — Geth, Reth, Erigon, Nethermind. Pair with any consensus client (Lighthouse recommended at ~200 GB storage).
 
+## Container deployment
+
+A multi-stage `Dockerfile` at the repo root builds a static `emit-engine` binary (musl, scratch runtime, ~11 MB image). Two compose files split the lifecycles:
+
+| File | Role |
+|---|---|
+| [`compose.node.yml`](../compose.node.yml) | Nethermind + Lighthouse, always-on. Mirrors the production Hetzner setup. |
+| [`compose.emit.yml`](../compose.emit.yml) | One-shot `emit-engine-import` (gated by the `import` profile) plus long-running `emit-engine` follower. |
+
+Operator flow:
+
+```sh
+# 1. Start the node stack. Wait for Nethermind to fully sync before continuing.
+docker compose -f compose.node.yml up -d
+curl -s -X POST -H "Content-Type: application/json" \
+  --data '{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}' \
+  http://localhost:8545
+# repeat until result is `false`
+
+# 2. One-time historical import (~13 min on the reference Hetzner box).
+docker compose -f compose.emit.yml --profile import up emit-engine-import
+
+# 3. Start the long-running follower.
+docker compose -f compose.emit.yml up -d emit-engine
+```
+
+Environment overrides:
+
+- `NETHERMIND_DATA_DIR` (default `./data/nethermind`) — host path mounted into Nethermind at `/data` and into the importer at `/nethermind-data:ro`.
+- `LIGHTHOUSE_DATA_DIR` (default `./data/lighthouse`) — host path mounted into Lighthouse at `/root/.lighthouse`.
+- `EMIT_DATA_DIR` (default `./data/emit-engine`) — host path mounted into the engine at `/var/lib/emit-engine`. SDK indexers on the host read this same path.
+
 ## Output layout
 
 Five files written to `--data-dir`:
