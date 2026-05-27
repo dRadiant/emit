@@ -212,12 +212,6 @@ const Account = struct {
     balance: u256,
 };
 
-fn serializeOne(comptime T: type, entity: T) [@sizeOf(u8) * entity_serial.entitySize(T)]u8 {
-    var buf: [entity_serial.entitySize(T)]u8 = undefined;
-    entity_serial.serialize(T, entity, &buf);
-    return buf;
-}
-
 test "load on empty slab returns null" {
     const S = MutableStore(Account);
     var store = S.open(testing.allocator, &.{});

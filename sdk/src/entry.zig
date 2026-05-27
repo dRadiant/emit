@@ -556,10 +556,6 @@ fn shouldSkipFilterBuild(filter_dh: std.fs.Dir, allocator: std.mem.Allocator) bo
     return store.count() > 0;
 }
 
-fn entitiesLen(comptime entities: anytype) u32 {
-    return @intCast(comptime resolveEntities(entities).len);
-}
-
 /// Hard-fail when a filter phase dropped blocks. Better than shipping a partial index.
 fn requireCompleteFilter(phase: []const u8, r: filter_builder.BuildResult) !void {
     if (r.dropped_blocks == 0) return;

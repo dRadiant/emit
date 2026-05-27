@@ -14,7 +14,6 @@ pub const supported = builtin.target.os.tag == .linux;
 pub const Completion = struct {
     block_number: u64,
     buf_slot: u16,
-    buf_len: u32,
     result: i32 = 0,
 };
 
@@ -63,7 +62,6 @@ pub fn ReadPipeline(comptime QUEUE_DEPTH: u32) type {
             self.completions[slot] = .{
                 .block_number = block_number,
                 .buf_slot = slot,
-                .buf_len = length,
             };
             sqe.user_data = @intFromPtr(&self.completions[slot]);
             self.in_flight += 1;

@@ -21,10 +21,6 @@ pub fn BloomFilter(comptime SIZE: comptime_int) type {
             return .{ .bits = std.mem.zeroes([SIZE]u8) };
         }
 
-        pub fn initFromBytes(bytes: *const [SIZE]u8) Self {
-            return .{ .bits = bytes.* };
-        }
-
         pub fn insert(self: *Self, key: [32]u8) void {
             inline for (0..NUM_HASHES) |i| {
                 const pos = bitPosition(key, i);
