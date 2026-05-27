@@ -519,7 +519,7 @@ test "scanCreations: extracts spawned addresses from factory creation events" {
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
     var reader = try FlatStoreReader.open(src_path);
-    defer reader.close();
+    defer reader.deinit();
 
     const FactoryManifest: sdk_manifest.Manifest = .{
         .name = "factory",
@@ -573,7 +573,7 @@ test "replay: dispatches logs in canonical (block, tx, log_index) order across o
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
     var reader = try FlatStoreReader.open(src_path);
-    defer reader.close();
+    defer reader.deinit();
 
     const Manifest: sdk_manifest.Manifest = .{
         .name = "test",
@@ -628,7 +628,7 @@ test "replay seeks past start_block so already-dispatched range is skipped" {
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
     var reader = try FlatStoreReader.open(src_path);
-    defer reader.close();
+    defer reader.deinit();
 
     const Manifest: sdk_manifest.Manifest = .{
         .name = "test",
@@ -690,7 +690,7 @@ test "replay: k-way merge across BLOCKS_PRIMARY and BLOCKS_CHILDREN preserves bl
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
     var reader = try FlatStoreReader.open(src_path);
-    defer reader.close();
+    defer reader.deinit();
 
     const FactoryManifest: sdk_manifest.Manifest = .{
         .name = "factory",
@@ -827,7 +827,7 @@ test "factory orchestration: build → scanCreations → appendChildren → repl
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
     var reader = try FlatStoreReader.open(src_path);
-    defer reader.close();
+    defer reader.deinit();
 
     const FactoryManifest: sdk_manifest.Manifest = .{
         .name = "factory",

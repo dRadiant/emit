@@ -275,7 +275,7 @@ test "backfill leaves the overlay empty" {
 
     try store.save(.{ .id = idKey(1, 0), .value = 1 });
     try store.save(.{ .id = idKey(1, 1), .value = 2 });
-    // pendingCount includes the append queue under M5; the block_pending overlay alone is empty.
+    // pendingCount includes the append queue; the block_pending overlay alone is empty.
     try testing.expectEqual(@as(usize, 0), store.block_pending.count());
 }
 

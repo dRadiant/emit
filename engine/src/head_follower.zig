@@ -170,8 +170,9 @@ fn followPoll(
 
 /// Fetch block hash + logs from node, serialize, compress, insert into pending ring.
 /// On reorg detection, truncate divergent entries and re-ingest the canonical
-/// chain from the fork point up to `block_number`. WS mode previously dropped
-/// these blocks because the next subscription push delivers block_number+1.
+/// chain from the fork point up to `block_number`. The replay is required
+/// because WS newHeads will only push `block_number + 1` next, never re-emitting
+/// the fork-point span.
 fn ingestBlock(
     block_number: u64,
     provider: *eth.provider.Provider,

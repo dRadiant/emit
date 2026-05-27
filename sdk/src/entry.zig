@@ -315,7 +315,7 @@ pub fn init(
     try std.fs.cwd().makePath(ethcall_dir);
 
     var reader = try core.FlatStoreReader.open(options.engine_data_dir);
-    defer reader.close();
+    defer reader.deinit();
 
     const C = Context(entities);
     const ctx = try allocator.create(C);
@@ -466,7 +466,7 @@ pub fn init(
         const engine_last = try live.readMeta(options.engine_data_dir);
         if (engine_last > ctx._last_dispatched_block) {
             var gap_reader = try core.FlatStoreReader.open(options.engine_data_dir);
-            defer gap_reader.close();
+            defer gap_reader.deinit();
 
             _ = try filter_builder.appendBlocks(
                 &gap_reader,

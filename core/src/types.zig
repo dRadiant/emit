@@ -15,9 +15,9 @@ pub const MAX_LOGS_PER_BLOCK: usize = 65_536;
 
 /// Serialize/compress/decompress buffer size. Must fit the largest block's
 /// serialized log data (~1.5 MB typical, 3+ MB worst case). Also used as the
-/// io_uring per-slot read buffer — undersizing it (we previously had a
-/// separate IO_BUF_SIZE = 256 KB) silently truncates large compressed
-/// entries; LZ4 then errors and the whole block is dropped from the index.
+/// io_uring per-slot read buffer — undersizing it silently truncates large
+/// compressed entries; LZ4 then errors and the whole block is dropped from
+/// the index.
 pub const BLOCK_BUF_SIZE: usize = 4 * 1024 * 1024;
 
 /// Blocks between meta commits during import. Each commit fsyncs (~1ms).

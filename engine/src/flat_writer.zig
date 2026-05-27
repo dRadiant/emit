@@ -168,7 +168,7 @@ pub const FlatStoreWriter = struct {
         try self.commitMeta();
     }
 
-    pub fn close(self: *FlatStoreWriter) void {
+    pub fn deinit(self: *FlatStoreWriter) void {
         self.blocks_file.close();
         self.index_file.close();
         self.blooms_file.close();
@@ -199,7 +199,7 @@ test "write blocks then read back via core reader" {
     }
 
     var reader = openReaderFromDir(tmp.dir);
-    defer reader.close();
+    defer reader.deinit();
 
     try std.testing.expectEqual(@as(u64, 100), reader.first_block);
     try std.testing.expectEqual(@as(u64, 2), reader.index_count);
@@ -278,7 +278,7 @@ test "resume appends after reopen" {
     }
 
     var reader = openReaderFromDir(tmp.dir);
-    defer reader.close();
+    defer reader.deinit();
     try std.testing.expectEqual(@as(u64, 2), reader.index_count);
     var buf: [1024]u8 = undefined;
     _ = try reader.readBlock(100, &buf);
@@ -314,7 +314,7 @@ test "bloom scan finds written blocks" {
     }
 
     var reader = openReaderFromDir(tmp.dir);
-    defer reader.close();
+    defer reader.deinit();
 
     var matching = std.ArrayListUnmanaged(u64){};
     defer matching.deinit(std.testing.allocator);

@@ -180,7 +180,7 @@ pub const FlatStoreReader = struct {
         return lo;
     }
 
-    pub fn close(self: *FlatStoreReader) void {
+    pub fn deinit(self: *FlatStoreReader) void {
         self.blocks_file.close();
         std.posix.munmap(self.index_map);
         std.posix.munmap(self.blooms_map);

@@ -660,7 +660,7 @@ test "build: filters multi-contract flat store, primary contains exactly the mat
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
     var reader = try FlatStoreReader.open(src_path);
-    defer reader.close();
+    defer reader.deinit();
 
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
@@ -707,7 +707,7 @@ test "build: rebuild produces decoded-identical output" {
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
     var reader = try FlatStoreReader.open(src_path);
-    defer reader.close();
+    defer reader.deinit();
 
     const RebuildManifest: sdk_manifest.Manifest = .{
         .name = "rebuild",
@@ -816,7 +816,7 @@ test "build + appendChildren: primary holds creations, children holds child even
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
     var reader = try FlatStoreReader.open(src_path);
-    defer reader.close();
+    defer reader.deinit();
 
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
@@ -885,7 +885,7 @@ test "appendChildren: returns zero-result for empty discovered set" {
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
     var reader = try FlatStoreReader.open(src_path);
-    defer reader.close();
+    defer reader.deinit();
 
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
@@ -920,7 +920,7 @@ test "build: end_block clamps the scan range to a fixed window" {
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
     var reader = try FlatStoreReader.open(src_path);
-    defer reader.close();
+    defer reader.deinit();
 
     const ClampedManifest: sdk_manifest.Manifest = .{
         .name = "clamped",
@@ -967,7 +967,7 @@ test "appendBlocks extends a primary filter env over the new range" {
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
     var reader = try FlatStoreReader.open(src_path);
-    defer reader.close();
+    defer reader.deinit();
 
     const M: sdk_manifest.Manifest = .{
         .name = "ext",

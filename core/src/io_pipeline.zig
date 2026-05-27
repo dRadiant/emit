@@ -55,7 +55,8 @@ pub fn ReadPipeline(comptime QUEUE_DEPTH: u32) type {
         }
 
         pub fn submit(self: *Self, slot: u16, block_number: u64, offset: u64, length: u32) !void {
-            // Reject rather than truncate; the prior @min hid an LZ4 failure downstream.
+            // Reject rather than truncate. Silent clipping defeats the bounds
+            // check and surfaces as an opaque LZ4 decompression failure downstream.
             if (length > self.bufs[slot].len) return error.EntryExceedsBuffer;
             const sqe = try self.ring.get_sqe();
             sqe.prep_read(self.fd, self.bufs[slot][0..length], offset);

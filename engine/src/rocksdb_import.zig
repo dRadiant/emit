@@ -200,7 +200,7 @@ pub fn run(receipts_path: [*:0]const u8, output_path: []const u8) !void {
 
     std.fs.cwd().makeDir(output_path) catch {};
     var writer = try flat_writer.FlatStoreWriter.open(output_path);
-    defer writer.close();
+    defer writer.deinit();
 
     // Sequential bulk read: 4 MB readahead, skip block cache and checksums
     const read_opts = c.rocksdb_readoptions_create();
