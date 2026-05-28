@@ -255,6 +255,7 @@ pub fn run(receipts_path: [*:0]const u8, output_path: []const u8) !void {
     var blocks_with_logs: u64 = 0;
     var total_logs: u64 = 0;
     var decode_errors: u64 = 0;
+    var skipped_raw: u64 = 0;
 
     std.debug.print("Importing receipts ({} workers) from {s} → {s}\n", .{
         parallel.MAX_WORKERS, std.mem.span(receipts_path), output_path,
@@ -285,7 +286,7 @@ pub fn run(receipts_path: [*:0]const u8, output_path: []const u8) !void {
                 }
                 const next_slot = &slots[read_cursor % SLOT_COUNT];
                 if (next_slot.state.load(.acquire) != Slot.EMPTY) break;
-                if (fillSlot(next_slot, iter)) read_cursor += 1;
+                if (fillSlot(next_slot, iter)) read_cursor += 1 else skipped_raw += 1;
                 c.rocksdb_iter_next(iter);
             }
             if (!iterValid(iter)) read_done = true;
@@ -344,6 +345,14 @@ pub fn run(receipts_path: [*:0]const u8, output_path: []const u8) !void {
             @as(f64, @floatFromInt(blocks_processed)) / elapsed_s,
             @as(f64, @floatFromInt(total_logs)) / elapsed_s,
         });
+    }
+
+    if (skipped_raw > 0) {
+        std.debug.print(
+            "\nWARNING: skipped {d} RocksDB entries (short key or oversized value > {d}B). " ++
+                "Flat store may be incomplete; investigate before relying on counts.\n",
+            .{ skipped_raw, MAX_RAW_VALUE },
+        );
     }
 
     if (decode_errors > 0) {
