@@ -636,7 +636,7 @@ test "readPending: missing pending.bin returns empty snapshot" {
 
 // ── Live tick integration ────────────────────────────────────────────────
 
-const fake_engine = @import("fake_engine.zig");
+const fake_engine = @import("testing/fake_engine.zig");
 
 const TestTransfer = struct {
     pub const signature = "Transfer(address,address,uint256)";

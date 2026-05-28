@@ -189,7 +189,7 @@ test {
     _ = event_log;
     _ = entry;
     // Test-only fixture
-    _ = @import("fake_engine.zig");
+    _ = @import("testing/fake_engine.zig");
     _ = @import("live.zig");
 }
 
