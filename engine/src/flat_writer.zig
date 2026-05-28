@@ -101,10 +101,12 @@ pub const FlatStoreWriter = struct {
             _ = try self.index_file.pwrite(&hdr, 0);
         }
 
-        // Reject below-first-block appends — index uses block_number -
-        // first_block as the dense slot; an unsigned underflow here would
-        // silently scribble somewhere far past the file end.
+        // Index uses block_number - first_block as a dense slot; underflow would scribble.
         if (block_number < self.first_block) return error.BlockBeforeFirst;
+
+        // Idempotent on already-finalized blocks. A crash between commitMeta
+        // and ring.flush leaves pending.bin re-presenting them on restart.
+        if (self.meta.blocks_idx_count > 0 and block_number <= self.meta.last_finalized_block) return;
 
         // Append to blocks.dat
         const offset = self.meta.blocks_dat_size;
@@ -319,9 +321,10 @@ test "bloom scan finds written blocks" {
     var matching = std.ArrayListUnmanaged(u64){};
     defer matching.deinit(std.testing.allocator);
     var scanned: u64 = 0;
+    var dropped: u64 = 0;
 
     const targets = [_][20]u8{target_addr};
-    try core.block_filter.scanBlooms(&reader, &targets, &.{}, 0, 200, &matching, &scanned, std.testing.allocator);
+    try core.block_filter.scanBlooms(&reader, &targets, &.{}, 0, 200, &matching, &scanned, &dropped, std.testing.allocator);
 
     try std.testing.expectEqual(@as(u64, 3), scanned);
     try std.testing.expectEqual(@as(usize, 2), matching.items.len);

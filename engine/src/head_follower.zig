@@ -111,30 +111,28 @@ fn followWs(
         defer alloc.free(msg);
         const block_number = parseBlockNumber(msg) orelse continue;
 
-        if (ring.latestBlock()) |tip| {
-            // Stale or duplicate WS message — providers occasionally
-            // re-broadcast. The dense-ring invariant in pending_ring.getHash
-            // breaks if we append a block we already have, so skip.
-            if (block_number <= tip) continue;
+        // Cold-start fallback matches followPoll so an empty ring after
+        // import or pending-wipe doesn't skip last_finalized..block_number-1.
+        const tip = ring.latestBlock() orelse blk: {
+            if (writer.meta.last_finalized_block > 0) break :blk writer.meta.last_finalized_block;
+            break :blk block_number -| 1;
+        };
 
-            // Defensive gap-fill: WS can drop messages (NAT, provider
-            // hiccup) and recovery loops can leave a partial ring after
-            // RPC failure or process restart. `followPoll` does this
-            // naturally via tip+1..latest; mirror that here. If any gap
-            // block fails to ingest, abort the whole WS message — the
-            // next notification retries from the current tip. Partial
-            // gap-fill would leave pending non-dense and break getHash.
-            var bn = tip + 1;
-            var gap_ok = true;
-            while (bn < block_number) : (bn += 1) {
-                ingestBlock(bn, provider, ring, alloc) catch |err| {
-                    std.debug.print("Gap-fill block {d}: {s}\n", .{ bn, @errorName(err) });
-                    gap_ok = false;
-                    break;
-                };
-            }
-            if (!gap_ok) continue;
+        // Providers occasionally re-broadcast. Dense-ring invariant breaks if re-appended.
+        if (block_number <= tip) continue;
+
+        // Partial gap-fill would leave the ring non-dense and break getHash —
+        // abort on any failure and let the next notification retry from the tip.
+        var bn = tip + 1;
+        var gap_ok = true;
+        while (bn < block_number) : (bn += 1) {
+            ingestBlock(bn, provider, ring, alloc) catch |err| {
+                std.debug.print("Gap-fill block {d}: {s}\n", .{ bn, @errorName(err) });
+                gap_ok = false;
+                break;
+            };
         }
+        if (!gap_ok) continue;
 
         ingestBlock(block_number, provider, ring, alloc) catch |err| {
             std.debug.print("Block {d}: {s}\n", .{ block_number, @errorName(err) });
@@ -259,16 +257,19 @@ fn ingestBlockCore(
 /// Truncate divergent pending entries down to the fork point and return it,
 /// so the caller can re-ingest the canonical chain from `fork..from`.
 fn resolveReorg(ring: *PendingRing, from: u64, provider: *eth.provider.Provider) !u64 {
-    // Fetch canonical hashes walking backwards (most reorgs are 1-2 blocks)
+    // Walk backwards; most reorgs are 1-2 blocks.
     var canonical: [pending_ring.FINALITY_DEPTH][32]u8 = undefined;
     const oldest = ring.oldestBlock() orelse return from;
     const depth = @min(from - oldest, pending_ring.FINALITY_DEPTH);
+    var filled: usize = 0;
     for (0..depth) |i| {
         const hdr = (provider.getBlock(from - 1 - i) catch break) orelse break;
         canonical[i] = hdr.hash;
+        filled += 1;
     }
 
-    const fork = ring.findForkPoint(from, canonical[0..depth]);
+    // Pass only the filled prefix; uninitialized slots would corrupt the comparison.
+    const fork = ring.findForkPoint(from, canonical[0..filled]);
     const removed = try ring.truncateFrom(fork);
     try ring.flush();
     std.debug.print("Reorg: fork at {d}, removed {d} blocks\n", .{ fork, removed });
@@ -280,22 +281,25 @@ fn resolveReorg(ring: *PendingRing, from: u64, provider: *eth.provider.Provider)
 /// the next finalize attempt retries — popping first would orphan the
 /// block (pending forgets it, flat never recorded it).
 fn finalizeReady(ring: *PendingRing, writer: *FlatStoreWriter, head: u64, alloc: std.mem.Allocator) void {
+    var popped_count: u32 = 0;
     var finalized: u32 = 0;
     while (ring.canFinalize(head)) {
         const oldest = ring.peekOldest() orelse break;
+        const pre = writer.meta.last_finalized_block;
         writer.appendBlock(oldest.block_number, oldest.lz4_entry, &oldest.topic_bloom, &oldest.addr_bloom) catch |err| {
             std.debug.print("Finalize block {d}: {s}\n", .{ oldest.block_number, @errorName(err) });
             break;
         };
         const popped = ring.popOldest().?;
         alloc.free(popped.lz4_entry);
-        finalized += 1;
+        popped_count += 1;
+        if (writer.meta.last_finalized_block > pre) finalized += 1;
     }
-    if (finalized > 0) {
-        writer.commitMeta() catch {};
-        ring.flush() catch {};
-        std.debug.print("Finalized {d} blocks\n", .{finalized});
-    }
+    if (finalized > 0) writer.commitMeta() catch {};
+    // Flush ring on any pop, including idempotent skips, so a crash-recovery
+    // pass doesn't keep re-presenting the same finalized blocks.
+    if (popped_count > 0) ring.flush() catch {};
+    if (finalized > 0) std.debug.print("Finalized {d} blocks\n", .{finalized});
 }
 
 fn toRawLog(log: eth.receipt.Log, block_number: u64, alloc: std.mem.Allocator) !types.RawLog {
