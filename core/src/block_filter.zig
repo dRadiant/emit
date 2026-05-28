@@ -25,6 +25,7 @@ pub fn scanBlooms(
     end_block: u64,
     matching: *std.ArrayListUnmanaged(u64),
     blocks_scanned: *u64,
+    blocks_dropped: *u64,
     allocator: std.mem.Allocator,
 ) !void {
     std.debug.assert(target_addresses.len > 0 or target_topics.len > 0);
@@ -41,11 +42,13 @@ pub fn scanBlooms(
         .end_block = end_block,
         .result_matching = matching.*,
         .result_scanned = blocks_scanned.*,
+        .result_dropped = blocks_dropped.*,
         .alloc = allocator,
     };
     scanRange(false, &args);
     matching.* = args.result_matching;
     blocks_scanned.* = args.result_scanned;
+    blocks_dropped.* = args.result_dropped;
 }
 
 /// Parallel bloom scan: split blooms.bin across N threads, aggregate results
@@ -59,13 +62,14 @@ pub fn scanBloomsParallel(
     end_block: u64,
     matching: *std.ArrayListUnmanaged(u64),
     blocks_scanned: *u64,
+    blocks_dropped: *u64,
     allocator: std.mem.Allocator,
 ) !void {
     std.debug.assert(target_addresses.len > 0 or target_topics.len > 0);
 
     const num_workers = parallel.workerCount(reader.blooms_count, 100_000);
     if (num_workers <= 1) {
-        return scanBlooms(reader, target_addresses, target_topics, start_block, end_block, matching, blocks_scanned, allocator);
+        return scanBlooms(reader, target_addresses, target_topics, start_block, end_block, matching, blocks_scanned, blocks_dropped, allocator);
     }
 
     const addr_keys = try buildAddrKeys(target_addresses, allocator);
@@ -86,6 +90,7 @@ pub fn scanBloomsParallel(
             .end_block = end_block,
             .result_matching = .{},
             .result_scanned = 0,
+            .result_dropped = 0,
             .alloc = allocator,
         };
     }
@@ -97,6 +102,7 @@ pub fn scanBloomsParallel(
     for (0..num_workers) |i| {
         try matching.appendSlice(allocator, worker_args[i].result_matching.items);
         blocks_scanned.* += worker_args[i].result_scanned;
+        blocks_dropped.* += worker_args[i].result_dropped;
         worker_args[i].result_matching.deinit(allocator);
     }
 
@@ -122,6 +128,7 @@ const WorkerArgs = struct {
     end_block: u64,
     result_matching: std.ArrayListUnmanaged(u64),
     result_scanned: u64,
+    result_dropped: u64,
     alloc: std.mem.Allocator,
 };
 
@@ -146,7 +153,10 @@ fn scanRange(comptime prefetch: bool, args: *WorkerArgs) void {
             if (!TopicBloom.bytesContainAny(topic_bloom, args.topic_keys)) continue;
         }
 
-        args.result_matching.append(args.alloc, block_number) catch continue;
+        args.result_matching.append(args.alloc, block_number) catch {
+            args.result_dropped += 1;
+            continue;
+        };
 
         if (comptime prefetch and @import("builtin").os.tag == .linux) {
             if (args.reader.getBlockLoc(block_number)) |loc| {
@@ -187,11 +197,13 @@ test "scanBlooms: single address matches blocks via addr bloom" {
     var matching = std.ArrayListUnmanaged(u64){};
     defer matching.deinit(alloc);
     var scanned: u64 = 0;
+    var dropped: u64 = 0;
 
     const targets = [_][20]u8{target_addr};
-    try scanBlooms(&reader, &targets, &.{}, 0, 200, &matching, &scanned, alloc);
+    try scanBlooms(&reader, &targets, &.{}, 0, 200, &matching, &scanned, &dropped, alloc);
 
     try std.testing.expectEqual(@as(u64, 3), scanned);
+    try std.testing.expectEqual(@as(u64, 0), dropped);
     try std.testing.expectEqual(@as(usize, 2), matching.items.len);
     try std.testing.expectEqual(@as(u64, 100), matching.items[0]);
     try std.testing.expectEqual(@as(u64, 102), matching.items[1]);
@@ -224,9 +236,10 @@ test "scanBlooms: union of multiple addresses" {
     var matching = std.ArrayListUnmanaged(u64){};
     defer matching.deinit(alloc);
     var scanned: u64 = 0;
+    var dropped: u64 = 0;
 
     const targets = [_][20]u8{ addr_a, addr_b };
-    try scanBlooms(&reader, &targets, &.{}, 0, 200, &matching, &scanned, alloc);
+    try scanBlooms(&reader, &targets, &.{}, 0, 200, &matching, &scanned, &dropped, alloc);
 
     try std.testing.expectEqual(@as(u64, 3), scanned);
     try std.testing.expectEqual(@as(usize, 2), matching.items.len);
@@ -271,10 +284,11 @@ test "scanBlooms: dual-bloom AND rejects address hits whose topic bloom doesn't 
     var matching = std.ArrayListUnmanaged(u64){};
     defer matching.deinit(alloc);
     var scanned: u64 = 0;
+    var dropped: u64 = 0;
 
     const targets = [_][20]u8{target_addr};
     const topics = [_][32]u8{want_topic};
-    try scanBlooms(&reader, &targets, &topics, 0, 200, &matching, &scanned, alloc);
+    try scanBlooms(&reader, &targets, &topics, 0, 200, &matching, &scanned, &dropped, alloc);
 
     try std.testing.expectEqual(@as(u64, 3), scanned);
     try std.testing.expectEqual(@as(usize, 1), matching.items.len);

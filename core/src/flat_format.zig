@@ -40,7 +40,8 @@ pub fn openOrCreateWithMagic(dir: std.fs.Dir, name: []const u8, magic: Magic) !s
     if (dir.openFile(name, .{ .mode = .read_write })) |file| {
         errdefer file.close();
         var buf: [MAGIC_SIZE]u8 = undefined;
-        const n = file.pread(&buf, 0) catch 0;
+        // Propagate real I/O errors; swallowing them would silently truncate the file.
+        const n = try file.pread(&buf, 0);
         if (n < MAGIC_SIZE) {
             file.close();
             return createWithMagic(dir, name, magic);
