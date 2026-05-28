@@ -1,7 +1,9 @@
 /// Derived presentation helpers.
 const std = @import("std");
 
-const MERGE_BLOCK: u64 = 15_537_394;
+const core = @import("core");
+
+const MERGE_BLOCK = core.types.MERGE_BLOCK;
 const MERGE_TIMESTAMP: u64 = 1_663_224_162;
 
 /// Post-merge block times are exactly 12 seconds (Gasper consensus

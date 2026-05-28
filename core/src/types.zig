@@ -33,6 +33,12 @@ pub const COMMIT_INTERVAL: usize = 10_000;
 /// part of `ChainConfig` when multi-chain lands.
 pub const FINALITY_DEPTH: u64 = 64;
 
+/// Ethereum L1 merge block. Default import lower bound.
+///
+/// `emit-engine import` starts here unless the data dir already covers
+/// a later checkpoint. Override by pre-populating the data dir.
+pub const MERGE_BLOCK: u64 = 15_537_394;
+
 // ── Raw log ──────────────────────────────────────────────────────────────
 
 /// A single EVM log entry. Core interchange type between import, serialization,

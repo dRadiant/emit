@@ -225,10 +225,13 @@ pub fn run(receipts_path: [*:0]const u8, output_path: []const u8) !void {
     const finality_cutoff: u64 = if (head > FINALITY_DEPTH) head - FINALITY_DEPTH else 0;
     std.debug.print("Chain head: {d}; finality cutoff: {d} (head - {d}).\n", .{ head, finality_cutoff, FINALITY_DEPTH });
 
+    // Resume from where we left off, else start at the merge. Pre-merge
+    // events are rarely an indexing target; users who need them should
+    // pre-seed the data dir to lower `last_finalized_block`.
     const start_block: u64 = if (writer.meta.last_finalized_block > 0)
         writer.meta.last_finalized_block + 1
     else
-        0;
+        core.types.MERGE_BLOCK;
     if (start_block > finality_cutoff) {
         std.debug.print(
             "Flat store already covers the finalized prefix (last_finalized={d}); nothing to import.\n",
