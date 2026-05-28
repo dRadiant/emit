@@ -108,6 +108,11 @@ pub const FlatStoreWriter = struct {
         // and ring.flush leaves pending.bin re-presenting them on restart.
         if (self.meta.blocks_idx_count > 0 and block_number <= self.meta.last_finalized_block) return;
 
+        // Dense-append invariant: blocks.idx is indexed by block_number - first_block,
+        // so any gap would leave slots zero-filled and reads would silently return empty.
+        const expected = self.first_block + self.meta.blocks_idx_count;
+        if (block_number != expected) return error.NonDenseAppend;
+
         // Append to blocks.dat
         const offset = self.meta.blocks_dat_size;
         _ = try self.blocks_file.pwrite(lz4_entry, offset);

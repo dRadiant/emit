@@ -64,7 +64,8 @@ pub const PendingRing = struct {
         self.entries.deinit(self.alloc);
     }
 
-    /// Append a block. Persists immediately.
+    /// Append a block. Persists immediately. Enforces the dense-sequential
+    /// invariant that `getHash`'s O(1) index arithmetic relies on.
     pub fn insert(
         self: *PendingRing,
         block_number: u64,
@@ -73,6 +74,9 @@ pub const PendingRing = struct {
         addr_bloom: *const [bloom.ADDR_BLOOM_SIZE]u8,
         lz4_entry: []const u8,
     ) !void {
+        if (self.latestBlock()) |latest| {
+            if (block_number != latest + 1) return error.NonDenseInsert;
+        }
         const owned = try self.alloc.alloc(u8, lz4_entry.len);
         @memcpy(owned, lz4_entry);
         try self.entries.append(self.alloc, .{
@@ -208,7 +212,6 @@ const dummy_hash = [_]u8{0xAA} ** 32;
 const dummy_topic = [_]u8{0} ** bloom.BLOOM_SIZE;
 const dummy_addr = [_]u8{0} ** bloom.ADDR_BLOOM_SIZE;
 const dummy_entry = [_]u8{ 1, 0, 0, 0, 0x42 };
-
 
 test "insert and read back hash" {
     var tmp = testing.tmpDir(.{});
@@ -406,9 +409,7 @@ test "findForkPoint on empty ring returns from" {
 
 // Verifies the dense-ring invariant that head_follower's reorg recovery depends on:
 // after truncate + canonical re-insert, getHash() returns the canonical hash for
-// every block. The dense-array indexing in getHash() previously mis-reported
-// presence when ring entries had gaps, which surfaced as silently-dropped blocks
-// in WS-mode reorgs.
+// every block.
 test "truncate + re-insert restores dense ring with canonical hashes" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();

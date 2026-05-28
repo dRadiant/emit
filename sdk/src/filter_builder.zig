@@ -828,8 +828,7 @@ test "build + appendChildren: primary holds creations, children holds child even
     try testing.expectEqual(@as(u64, 1), primary.blocks_matched);
     try testing.expectEqual(@as(u64, 1), primary.total_logs);
 
-    // Phase 3: append children for the addresses the (would-be) pre-pass
-    // discovered. Stand-in for `scanner.scanCreations` until Group 6 lands.
+    // Phase 3: append children for the addresses the pre-pass discovered.
     const discovered = [_][20]u8{ ChildAddr1, ChildAddr2, ChildAddr3 };
     const children = try appendChildren(&reader, FactoryManifest, &discovered, dst_tmp.dir, allocator);
     try testing.expectEqual(@as(u64, 3), children.blocks_matched);

@@ -349,10 +349,11 @@ pub fn run(receipts_path: [*:0]const u8, output_path: []const u8) !void {
 
     if (skipped_raw > 0) {
         std.debug.print(
-            "\nWARNING: skipped {d} RocksDB entries (short key or oversized value > {d}B). " ++
-                "Flat store may be incomplete; investigate before relying on counts.\n",
+            "\nERROR: skipped {d} RocksDB entries (short key or oversized value > {d}B). " ++
+                "Flat store is incomplete.\n",
             .{ skipped_raw, MAX_RAW_VALUE },
         );
+        return error.ImportSkippedEntries;
     }
 
     if (decode_errors > 0) {

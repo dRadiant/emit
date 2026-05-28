@@ -125,12 +125,15 @@ pub fn MutableStore(comptime T: type) type {
         /// Drain block `N`'s overlay submap into the dirty cache. The disk
         /// write happens later via `materialize` + `state_snap.commit`.
         pub fn commitBlock(self: *Self, block: u64) !void {
-            const removed = self.pending.fetchRemove(block) orelse return;
-            var bm = removed.value;
-            defer bm.deinit(self.allocator);
-            var it = bm.iterator();
+            const sub = self.pending.getPtr(block) orelse return;
+            // Reserve cache capacity before removing the submap so a partial OOM
+            // can't strand entries between pending (removed) and cache (incomplete).
+            try self.cache.ensureUnusedCapacity(sub.count());
+            var removed = self.pending.fetchRemove(block).?;
+            defer removed.value.deinit(self.allocator);
+            var it = removed.value.iterator();
             while (it.next()) |entry| {
-                try self.cache.put(entry.key_ptr.*, .{ .entity = entry.value_ptr.*, .dirty = true });
+                self.cache.putAssumeCapacity(entry.key_ptr.*, .{ .entity = entry.value_ptr.*, .dirty = true });
             }
         }
 

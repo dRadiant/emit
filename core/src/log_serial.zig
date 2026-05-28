@@ -47,6 +47,13 @@ pub fn serializeLogs(logs: []const RawLog, buf: []u8) usize {
 /// Unpack logs from the flat store binary format. Returns log count.
 /// RawLog.data slices point into `buf` — valid until buf is overwritten.
 /// block_number is zeroed; caller fills it from the index key or context.
+///
+/// Trusted input: the flat store is written by the engine and consumed by
+/// the SDK in the same operator trust domain — no network producer, no
+/// untrusted source. This function does not bounds-check the buffer; a
+/// truncated or corrupt entry will either trip Zig safety in Debug builds
+/// or read past the end in ReleaseFast. If remote streaming ever crosses
+/// a trust boundary (TCP push), revisit and add fail-loud guards.
 pub fn deserializeLogs(buf: []const u8, out: []RawLog) usize {
     var pos: usize = 0;
 
