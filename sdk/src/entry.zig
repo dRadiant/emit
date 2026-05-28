@@ -354,12 +354,11 @@ pub fn init(
     var filter_dh = try std.fs.cwd().openDir(filter_dir, .{});
     defer filter_dh.close();
 
-    // Handler-only re-run gate: skip Phases 1-3 when the primary filtered
-    // pair has at least one entry (a prior build is on disk).
-    if (shouldSkipFilterBuild(filter_dh, allocator)) {
+    const fp = comptime sdk_manifest.fingerprint(m);
+
+    if (shouldSkipFilterBuild(filter_dh, allocator, fp)) {
         ctx.stats.phases_skipped = true;
     } else {
-        // Phase 1.
         const primary_result = try filter_builder.build(&reader, m, filter_dh, allocator);
         try requireCompleteFilter("phase 1 (build)", primary_result);
         ctx.stats.filter_blocks_scanned = primary_result.blocks_scanned;
@@ -396,17 +395,24 @@ pub fn init(
                 ctx.stats.append_children_ns = child_result.elapsed_ns;
             }
         }
+
+        try writeFilterFingerprint(filter_dh, fp);
     }
 
-    // Phase 4: prefetch. The dir handle is only needed to open the cache;
-    // Cache holds its own file handle and doesn't need the dir to persist.
-    var ethcall_dh = try std.fs.cwd().openDir(ethcall_dir, .{});
-    defer ethcall_dh.close();
-    const cache = try allocator.create(ethcall.Cache);
-    errdefer allocator.destroy(cache);
-    cache.* = try ethcall.Cache.open(allocator, ethcall_dh);
-    errdefer cache.deinit();
-    ctx._cache = cache;
+    // Cache + Phase 4 are prefetch-only. Opening the cache unconditionally
+    // would let handlers read stale entries from a previous manifest after
+    // the prefetch declaration is removed.
+    if (comptime (m.prefetch.len > 0 or m.static_prefetch.len > 0)) {
+        var ethcall_dh = try std.fs.cwd().openDir(ethcall_dir, .{});
+        defer ethcall_dh.close();
+        const cache = try allocator.create(ethcall.Cache);
+        errdefer allocator.destroy(cache);
+        cache.* = try ethcall.Cache.open(allocator, ethcall_dh);
+        errdefer cache.deinit();
+        ctx._cache = cache;
+    } else {
+        ctx._cache = null;
+    }
 
     if (comptime (m.prefetch.len > 0 or m.static_prefetch.len > 0)) {
         var phase4_timer = try std.time.Timer.start();
@@ -468,7 +474,7 @@ pub fn init(
             var gap_reader = try core.FlatStoreReader.open(options.engine_data_dir);
             defer gap_reader.deinit();
 
-            _ = try filter_builder.appendBlocks(
+            const gap_result = try filter_builder.appendBlocks(
                 &gap_reader,
                 m,
                 ctx._last_dispatched_block + 1,
@@ -476,6 +482,7 @@ pub fn init(
                 filter_dh,
                 allocator,
             );
+            try requireCompleteFilter("follow gap-fill", gap_result);
 
             _ = try scanner.replay(filter_dh, m, Handler, ctx, .{
                 .commit_interval = options.commit_interval,
@@ -547,13 +554,25 @@ fn runPhase4(
     ctx.stats.prefetch_calls_executed = missing.len;
 }
 
-/// True when the primary filtered pair has at least one entry — a prior
-/// build is on disk. Any open failure degrades to "don't skip" so the
-/// caller rebuilds from scratch.
-fn shouldSkipFilterBuild(filter_dh: std.fs.Dir, allocator: std.mem.Allocator) bool {
+/// Skip the filter build only when the on-disk filter has at least one entry
+/// AND its persisted manifest fingerprint matches the current manifest. Any
+/// open or read failure degrades to "rebuild" so a torn fingerprint cannot
+/// admit stale data.
+fn shouldSkipFilterBuild(filter_dh: std.fs.Dir, allocator: std.mem.Allocator, fp: [32]u8) bool {
     var store = filtered_store_mod.FilteredStore.open(allocator, filter_dh, filter_builder.BASE_PRIMARY) catch return false;
     defer store.deinit();
-    return store.count() > 0;
+    if (store.count() == 0) return false;
+
+    var on_disk: [32]u8 = undefined;
+    const file = filter_dh.openFile("manifest.fingerprint", .{}) catch return false;
+    defer file.close();
+    const n = file.readAll(&on_disk) catch return false;
+    if (n != 32) return false;
+    return std.mem.eql(u8, &on_disk, &fp);
+}
+
+fn writeFilterFingerprint(filter_dh: std.fs.Dir, fp: [32]u8) !void {
+    try core.atomic_file.write(filter_dh, "manifest.fingerprint.tmp", "manifest.fingerprint", &fp);
 }
 
 /// Hard-fail when a filter phase dropped blocks. Better than shipping a partial index.

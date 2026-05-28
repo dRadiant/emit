@@ -245,6 +245,53 @@ fn containsTopic(haystack: []const [32]u8, needle: [32]u8) bool {
     return false;
 }
 
+/// SHA-256 over fields that affect filtered-index content. The SDK persists
+/// this next to the filter dir and rebuilds if it doesn't match — manifest
+/// edits between runs would otherwise replay stale data into new handlers.
+pub fn fingerprint(comptime m: Manifest) [32]u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(200_000);
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update(m.name);
+        hasher.update(std.mem.asBytes(&m.chain_id));
+        hasher.update(std.mem.asBytes(&m.start_block));
+        const end: u64 = m.end_block orelse std.math.maxInt(u64);
+        hasher.update(std.mem.asBytes(&end));
+        for (m.contracts) |c| {
+            hasher.update(c.name);
+            hasher.update(&c.address);
+            for (c.events) |E| hasher.update(&eventTopic0(E));
+        }
+        for (m.factories) |f| {
+            hasher.update(f.name);
+            hasher.update(&f.address);
+            hasher.update(&eventTopic0(f.create_event));
+            hasher.update(f.spawn_param);
+            for (f.child_events) |E| hasher.update(&eventTopic0(E));
+        }
+        for (m.prefetch) |p| {
+            hasher.update(&eventTopic0(p.on_event));
+            for (p.calls) |call| {
+                hasher.update(call.method);
+                switch (call.address) {
+                    .log => hasher.update("log"),
+                    .param => |name| {
+                        hasher.update("param:");
+                        hasher.update(name);
+                    },
+                }
+            }
+        }
+        for (m.static_prefetch) |s| {
+            hasher.update(&s.address);
+            hasher.update(s.method);
+        }
+        var out: [32]u8 = undefined;
+        hasher.final(&out);
+        break :blk out;
+    };
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 const Transfer = struct {
