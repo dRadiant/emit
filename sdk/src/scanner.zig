@@ -714,7 +714,6 @@ test "replay: k-way merge across BLOCKS_PRIMARY and BLOCKS_CHILDREN preserves bl
     const child_addrs = [_][20]u8{ CHILD_1, CHILD_2 };
     _ = try filter_builder.appendChildren(&reader, FactoryManifest, &child_addrs, dst_tmp.dir, allocator);
 
-
     var counter = Counter{ .allocator = allocator };
     defer counter.deinit();
 
@@ -858,7 +857,6 @@ test "factory orchestration: build → scanCreations → appendChildren → repl
 
     const child_addrs = [_][20]u8{CHILD_1};
     _ = try filter_builder.appendChildren(&reader, FactoryManifest, &child_addrs, dst_tmp.dir, allocator);
-
 
     var counter = Counter{ .allocator = allocator };
     defer counter.deinit();

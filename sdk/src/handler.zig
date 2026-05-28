@@ -252,6 +252,11 @@ pub fn Log(comptime E: type) type {
 /// in one step. Backfill (`scanner.replay`) and live mode share this — keeping
 /// the per-log path in one place means a future change (e.g. metrics, tracing)
 /// lands once.
+///
+/// This routes by topic0 only — it does NOT gate by emitter address. Callers
+/// feeding *untrusted* logs (the live path's raw pending blocks) MUST pre-filter
+/// by address first; backfill is safe because `filter_builder` already pruned
+/// non-matching addresses before the filtered store was written.
 pub fn dispatchLog(
     comptime m: manifest.Manifest,
     comptime Handler: type,

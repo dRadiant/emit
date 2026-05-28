@@ -105,14 +105,38 @@ pub fn appendBlocks(
 
 /// Phase 3: walk the engine's flat store filtered by the
 /// scanner-discovered child addresses, write matching child-event logs to
-/// the `children` pair under `dir`. Returns a zero BuildResult immediately
-/// when `child_addresses` is empty. The per-log filter excludes addresses
-/// already in `static∪factory` so a static contract that's also a factory
-/// child does not produce duplicate entries across pairs.
+/// the `children` pair under `dir`. Spans the manifest's whole range; the
+/// follow-mode gap fill uses `appendChildrenBlocks` for a sub-range instead.
 pub fn appendChildren(
     reader: *const FlatStoreReader,
     comptime m: sdk_manifest.Manifest,
     child_addresses: []const [20]u8,
+    dir: std.fs.Dir,
+    allocator: std.mem.Allocator,
+) !BuildResult {
+    return appendChildrenBlocks(
+        reader,
+        m,
+        child_addresses,
+        m.start_block,
+        m.end_block orelse std.math.maxInt(u64),
+        dir,
+        allocator,
+    );
+}
+
+/// Extend the children pair over `from_block..=to_block` for `child_addresses`.
+/// Returns a zero BuildResult when there are no children or child events. The
+/// per-log filter excludes addresses already in `static∪factory` so a static
+/// contract that's also a factory child does not produce duplicate entries
+/// across pairs. Block numbers must exceed the children store's current tail
+/// (the caller fills strictly-increasing ranges).
+pub fn appendChildrenBlocks(
+    reader: *const FlatStoreReader,
+    comptime m: sdk_manifest.Manifest,
+    child_addresses: []const [20]u8,
+    from_block: u64,
+    to_block: u64,
     dir: std.fs.Dir,
     allocator: std.mem.Allocator,
 ) !BuildResult {
@@ -125,8 +149,8 @@ pub fn appendChildren(
     return runPhase(
         reader,
         child_addresses,
-        m.start_block,
-        m.end_block orelse std.math.maxInt(u64),
+        from_block,
+        to_block,
         .{
             .match_addrs = child_addresses,
             .match_topics = child_topics,
@@ -988,6 +1012,68 @@ test "appendBlocks extends a primary filter env over the new range" {
     try testing.expectEqual(@as(u64, 5), second.blocks_matched);
 
     var decoded = try dumpDecodedBlocks(dst_tmp.dir, BASE_PRIMARY, allocator);
+    defer freeDecoded(&decoded, allocator);
+    try testing.expectEqual(@as(usize, 10), decoded.items.len);
+    try testing.expectEqual(@as(u64, 100), decoded.items[0].block_number);
+    try testing.expectEqual(@as(u64, 109), decoded.items[9].block_number);
+}
+
+test "appendChildrenBlocks extends the children pair over a sub-range" {
+    const allocator = testing.allocator;
+
+    const ChildAddr: [20]u8 = [_]u8{0xC1} ** 20;
+    const FactoryAddr: [20]u8 = [_]u8{0xF0} ** 20;
+    const Create = struct {
+        pub const signature = "PairCreated(address indexed token0, address indexed token1, address pair)";
+    };
+    const Sync = struct {
+        pub const signature = "Sync(uint112,uint112)";
+    };
+    const M: sdk_manifest.Manifest = .{
+        .name = "gapchild",
+        .chain_id = 1,
+        .start_block = 0,
+        .factories = &.{.{
+            .name = "F",
+            .address = FactoryAddr,
+            .create_event = Create,
+            .spawn_param = "pair",
+            .child_events = &.{Sync},
+        }},
+    };
+
+    const sync_topic = topicOf(Sync);
+    var blocks_list: std.ArrayListUnmanaged(TestBlock) = .{};
+    defer blocks_list.deinit(allocator);
+    var log_arena = std.heap.ArenaAllocator.init(allocator);
+    defer log_arena.deinit();
+    const arena = log_arena.allocator();
+    // The same child emits Sync in 10 contiguous blocks.
+    for (0..10) |i| {
+        const buf = try arena.alloc(TestLog, 1);
+        buf[0] = .{ .address = ChildAddr, .topic0 = sync_topic };
+        try blocks_list.append(allocator, .{ .block_number = 100 + i, .logs = buf });
+    }
+
+    var src_tmp = testing.tmpDir(.{});
+    defer src_tmp.cleanup();
+    try writeFlatStore(src_tmp.dir, blocks_list.items, allocator);
+    var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
+    var reader = try FlatStoreReader.open(src_path);
+    defer reader.deinit();
+
+    var dst_tmp = testing.tmpDir(.{});
+    defer dst_tmp.cleanup();
+
+    const children = [_][20]u8{ChildAddr};
+    // Backfill covers 100..=104; the follow gap then extends 105..=109.
+    const first = try appendChildrenBlocks(&reader, M, &children, 100, 104, dst_tmp.dir, allocator);
+    try testing.expectEqual(@as(u64, 5), first.blocks_matched);
+    const second = try appendChildrenBlocks(&reader, M, &children, 105, 109, dst_tmp.dir, allocator);
+    try testing.expectEqual(@as(u64, 5), second.blocks_matched);
+
+    var decoded = try dumpDecodedBlocks(dst_tmp.dir, BASE_CHILDREN, allocator);
     defer freeDecoded(&decoded, allocator);
     try testing.expectEqual(@as(usize, 10), decoded.items.len);
     try testing.expectEqual(@as(u64, 100), decoded.items[0].block_number);

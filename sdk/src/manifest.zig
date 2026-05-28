@@ -212,6 +212,19 @@ pub fn extractAddress(
     };
 }
 
+/// Statically known emitter addresses: every contract plus every factory.
+/// These are the addresses whose logs the historical filter keeps and the
+/// live path admits without consulting the runtime child set. Factory
+/// children are discovered at runtime and tracked separately.
+pub fn knownAddresses(comptime m: Manifest) []const [20]u8 {
+    comptime {
+        var out: []const [20]u8 = &.{};
+        for (m.contracts) |c| out = out ++ &[_][20]u8{c.address};
+        for (m.factories) |f| out = out ++ &[_][20]u8{f.address};
+        return out;
+    }
+}
+
 /// Topic0-deduplicated flat list of every event referenced by `m`. Used to
 /// generate the comptime dispatch table.
 pub fn allEvents(comptime m: Manifest) []const type {

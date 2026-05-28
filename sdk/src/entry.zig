@@ -119,6 +119,13 @@ pub fn Context(comptime entities: anytype) type {
         /// `commitCycle` writes it into `state.snap.cursor` inside the same
         /// rename as the entity-slab flush so cursor and state are byte-atomic.
         _last_dispatched_block: u64 = 0,
+        /// Factory-discovered child addresses, or `null` for factory-free
+        /// manifests. Seeded from the historical `scanCreations` pass (on both
+        /// cold build and warm reuse) and extended live by `discoverChildren`
+        /// as new create-events arrive. `live.shouldDispatch` consults it so
+        /// child logs pass the address gate alongside statically declared
+        /// contracts. Owned by the Context; freed in `deinit`.
+        _child_addresses: ?*std.AutoHashMap([20]u8, void) = null,
 
         pub fn deinit(self: *Self) void {
             inline for (std.meta.fields(Stores)) |f| {
@@ -134,6 +141,10 @@ pub fn Context(comptime entities: anytype) type {
             if (self._cache) |c| {
                 c.deinit();
                 self._allocator.destroy(c);
+            }
+            if (self._child_addresses) |set| {
+                set.deinit();
+                self._allocator.destroy(set);
             }
             self._allocator.destroy(self);
         }
@@ -358,7 +369,20 @@ pub fn init(
 
     if (shouldSkipFilterBuild(filter_dh, allocator, fp)) {
         ctx.stats.phases_skipped = true;
+        // Even with the filter reused, factory children must be rediscovered
+        // so the live address gate admits them. The primary store always
+        // holds the factory create-events, so scanCreations rebuilds the same
+        // set without re-running the (skipped) full build.
+        if (comptime m.factories.len > 0) {
+            const discovered = try scanner.scanCreations(filter_dh, m, allocator);
+            ctx.stats.discovered_children = discovered.count();
+            try setChildAddresses(C, ctx, allocator, discovered);
+        }
     } else {
+        // A stale filter on disk (fingerprint mismatch or torn write) would
+        // otherwise make build() try to append blocks <= the existing tail,
+        // raising error.OutOfOrder. Clear first so the rebuild starts clean.
+        try clearFilterFiles(filter_dh);
         const primary_result = try filter_builder.build(&reader, m, filter_dh, allocator);
         try requireCompleteFilter("phase 1 (build)", primary_result);
         ctx.stats.filter_blocks_scanned = primary_result.blocks_scanned;
@@ -369,8 +393,7 @@ pub fn init(
         // Phases 2 + 3 (factory-only).
         if (comptime m.factories.len > 0) {
             var phase23_timer = try std.time.Timer.start();
-            var discovered = try scanner.scanCreations(filter_dh, m, allocator);
-            defer discovered.deinit();
+            const discovered = try scanner.scanCreations(filter_dh, m, allocator);
             ctx.stats.scan_creations_ns = phase23_timer.read();
 
             ctx.stats.discovered_children = discovered.count();
@@ -394,6 +417,8 @@ pub fn init(
                 ctx.stats.children_total_logs = child_result.total_logs;
                 ctx.stats.append_children_ns = child_result.elapsed_ns;
             }
+
+            try setChildAddresses(C, ctx, allocator, discovered);
         }
 
         try writeFilterFingerprint(filter_dh, fp);
@@ -474,15 +499,48 @@ pub fn init(
             var gap_reader = try core.FlatStoreReader.open(options.engine_data_dir);
             defer gap_reader.deinit();
 
+            const gap_from = ctx._last_dispatched_block + 1;
             const gap_result = try filter_builder.appendBlocks(
                 &gap_reader,
                 m,
-                ctx._last_dispatched_block + 1,
+                gap_from,
                 engine_last,
                 filter_dh,
                 allocator,
             );
             try requireCompleteFilter("follow gap-fill", gap_result);
+
+            // Factories: the gap may hold create-events for children unknown to
+            // the backfill pass (and child events from already-known children).
+            // Rediscover over the now-extended primary, merge into the live set,
+            // and extend children.dat across the gap so replay sees them. The
+            // gap range is strictly above the children store's tail, so the
+            // append stays monotonic.
+            if (comptime m.factories.len > 0) {
+                var gap_children = try scanner.scanCreations(filter_dh, m, allocator);
+                defer gap_children.deinit();
+                if (ctx._child_addresses) |set| {
+                    var it = gap_children.keyIterator();
+                    while (it.next()) |addr| try set.put(addr.*, {});
+                    if (set.count() > 0) {
+                        const addrs = try allocator.alloc([20]u8, set.count());
+                        defer allocator.free(addrs);
+                        var i: usize = 0;
+                        var ks = set.keyIterator();
+                        while (ks.next()) |a| : (i += 1) addrs[i] = a.*;
+                        const cres = try filter_builder.appendChildrenBlocks(
+                            &gap_reader,
+                            m,
+                            addrs,
+                            gap_from,
+                            engine_last,
+                            filter_dh,
+                            allocator,
+                        );
+                        try requireCompleteFilter("follow gap-fill children", cres);
+                    }
+                }
+            }
 
             _ = try scanner.replay(filter_dh, m, Handler, ctx, .{
                 .commit_interval = options.commit_interval,
@@ -573,6 +631,32 @@ fn shouldSkipFilterBuild(filter_dh: std.fs.Dir, allocator: std.mem.Allocator, fp
 
 fn writeFilterFingerprint(filter_dh: std.fs.Dir, fp: [32]u8) !void {
     try core.atomic_file.write(filter_dh, "manifest.fingerprint.tmp", "manifest.fingerprint", &fp);
+}
+
+/// Move `discovered` onto the heap and hand ownership to `ctx`. The set has
+/// the lifetime of the Context (same allocator); `Context.deinit` frees it.
+/// The live address gate and child-discovery pre-pass both read/extend it.
+fn setChildAddresses(
+    comptime C: type,
+    ctx: *C,
+    allocator: std.mem.Allocator,
+    discovered: std.AutoHashMap([20]u8, void),
+) !void {
+    const set_ptr = try allocator.create(std.AutoHashMap([20]u8, void));
+    set_ptr.* = discovered;
+    ctx._child_addresses = set_ptr;
+}
+
+fn clearFilterFiles(filter_dh: std.fs.Dir) !void {
+    const names = [_][]const u8{
+        "primary.dat",     "primary.idx",
+        "children.dat",    "children.idx",
+        "manifest.fingerprint",
+    };
+    for (names) |n| filter_dh.deleteFile(n) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
 }
 
 /// Hard-fail when a filter phase dropped blocks. Better than shipping a partial index.

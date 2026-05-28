@@ -288,13 +288,76 @@ const LiveSession = struct {
             log.block_number = entry.block_number;
         }
 
-        try self.maybePrefetchBlock(m, ctx, self.log_buf[0..log_count]);
+        // Pending blocks are raw — unlike the backfill path, nothing filtered
+        // them by address. Discover factory children spawned in this block
+        // first (a create-event is emitted by the factory, which always
+        // passes the gate), then compact to the dispatchable logs so prefetch
+        // and dispatch both operate on a trusted slice — the same
+        // filter→prefetch→dispatch order the historical pipeline uses.
+        try discoverChildren(m, ctx, self.log_buf[0..log_count]);
+
+        var keep: usize = 0;
+        for (self.log_buf[0..log_count]) |log| {
+            if (!shouldDispatch(m, ctx, log.address)) continue;
+            self.log_buf[keep] = log;
+            keep += 1;
+        }
+
+        try self.maybePrefetchBlock(m, ctx, self.log_buf[0..keep]);
 
         ctx.block_number = entry.block_number;
         ctx.timestamp = humanize.blockTimestamp(entry.block_number);
 
-        for (self.log_buf[0..log_count]) |log| {
+        for (self.log_buf[0..keep]) |log| {
             try handler_mod.dispatchLog(m, Handler, ctx, log);
+        }
+    }
+
+    /// Stage-1 address gate for raw live logs. Mirrors `filter_builder`'s
+    /// per-log address predicate: keep emitters that are statically declared
+    /// (contracts + factories) or runtime-discovered factory children. A
+    /// manifest declaring no addresses keeps nothing — correct, since its
+    /// dispatcher matches no event either.
+    fn shouldDispatch(comptime m: sdk_manifest.Manifest, ctx: anytype, address: [20]u8) bool {
+        const known = comptime sdk_manifest.knownAddresses(m);
+        inline for (known) |addr| {
+            if (std.mem.eql(u8, &address, &addr)) return true;
+        }
+        if (comptime m.factories.len > 0) {
+            const T = std.meta.Child(@TypeOf(ctx));
+            if (comptime @hasField(T, "_child_addresses")) {
+                if (ctx._child_addresses) |set| {
+                    if (set.contains(address)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Insert factory children spawned by create-events in `logs` into the
+    /// runtime child set, so their own events later in the same block (or in
+    /// later blocks) pass `shouldDispatch`. No-op for factory-free manifests
+    /// or when ctx carries no `_child_addresses` (counter-shaped tests).
+    fn discoverChildren(comptime m: sdk_manifest.Manifest, ctx: anytype, logs: []const core.RawLog) !void {
+        if (comptime m.factories.len == 0) return;
+        const T = std.meta.Child(@TypeOf(ctx));
+        if (comptime !@hasField(T, "_child_addresses")) return;
+        const set = ctx._child_addresses orelse return;
+        for (logs) |log| {
+            if (log.topic_count == 0) continue;
+            inline for (m.factories) |f| {
+                // Only the factory's own address legitimately spawns children.
+                // Gating on it also guards extractFactoryAddress against a stray
+                // contract whose topic0 collides with create_event but whose
+                // data is too short to hold the spawn param.
+                const create_topic = comptime sdk_manifest.eventTopic0(f.create_event);
+                if (std.mem.eql(u8, &log.address, &f.address) and
+                    std.mem.eql(u8, &log.topics[0], &create_topic))
+                {
+                    const addr = sdk_manifest.extractFactoryAddress(f, &log.topics, log.data);
+                    try set.put(addr, {});
+                }
+            }
         }
     }
 
@@ -710,6 +773,118 @@ test "tick dispatches a pending block ingested by FakeEngine" {
 
     try testing.expectEqual(@as(u32, 1), runner.transfers);
     try testing.expectEqual(@as(u64, 100), runner.block_number);
+}
+
+test "tick drops a pending log whose emitter is not in the manifest" {
+    // Regression: the live path used to dispatch every topic0 match in a raw
+    // pending block, counting Ethereum-wide ERC-20 Transfers as if they were
+    // the manifest contract. shouldDispatch must reject foreign emitters.
+    var engine_tmp = testing.tmpDir(.{});
+    defer engine_tmp.cleanup();
+    var fake = fake_engine.FakeEngine.init(engine_tmp.dir, testing.allocator);
+    defer fake.deinit();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const engine_path = try engine_tmp.dir.realpath(".", &path_buf);
+
+    var session = try LiveSession.init(testing.allocator, engine_path);
+    defer session.deinit();
+
+    const ALICE: [20]u8 = [_]u8{0xA1} ** 20;
+    var data_buf: [32]u8 = undefined;
+    var log = makeTransferLog([_]u8{0} ** 20, ALICE, 100, &data_buf);
+    log.address = [_]u8{0xCC} ** 20; // not TEST_CONTRACT
+    try fake.ingest(100, [_]u8{0xAA} ** 32, &.{log});
+
+    var runner = TestRunner{ ._allocator = testing.allocator };
+    try session.tick(TestManifest, TestRunner, &runner, 200);
+
+    try testing.expectEqual(@as(u32, 0), runner.transfers);
+}
+
+test "tick discovers a factory child spawned live and dispatches its events" {
+    const PairCreated = struct {
+        pub const signature = "PairCreated(address indexed t0, address indexed t1, address pair, uint256 n)";
+    };
+    const Sync = struct {
+        pub const signature = "Sync(uint112 r0, uint112 r1)";
+    };
+    const FACTORY: [20]u8 = [_]u8{0xF0} ** 20;
+    const CHILD: [20]u8 = [_]u8{0xC1} ** 20;
+    const M: sdk_manifest.Manifest = .{
+        .name = "live-factory",
+        .chain_id = 1,
+        .start_block = 0,
+        .factories = &.{.{
+            .name = "F",
+            .address = FACTORY,
+            .create_event = PairCreated,
+            .spawn_param = "pair",
+            .child_events = &.{Sync},
+        }},
+    };
+    const Runner = struct {
+        _allocator: std.mem.Allocator,
+        block_number: u64 = 0,
+        timestamp: u64 = 0,
+        _last_dispatched_block: u64 = 0,
+        _child_addresses: ?*std.AutoHashMap([20]u8, void) = null,
+        creates: u32 = 0,
+        syncs: u32 = 0,
+        pub fn handlePairCreated(_: handler_mod.Log(PairCreated), self: *@This()) !void {
+            self.creates += 1;
+        }
+        pub fn handleSync(_: handler_mod.Log(Sync), self: *@This()) !void {
+            self.syncs += 1;
+        }
+    };
+
+    var engine_tmp = testing.tmpDir(.{});
+    defer engine_tmp.cleanup();
+    var fake = fake_engine.FakeEngine.init(engine_tmp.dir, testing.allocator);
+    defer fake.deinit();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const engine_path = try engine_tmp.dir.realpath(".", &path_buf);
+
+    var session = try LiveSession.init(testing.allocator, engine_path);
+    defer session.deinit();
+
+    // Empty runtime child set: the child is unknown until the create-event in
+    // this very block adds it (the warm-start set starts empty here).
+    var children = std.AutoHashMap([20]u8, void).init(testing.allocator);
+    defer children.deinit();
+
+    // Block 100: factory spawns CHILD, then CHILD emits Sync in the same block.
+    var create_data: [32]u8 = std.mem.zeroes([32]u8);
+    @memcpy(create_data[12..32], &CHILD);
+    const create_log: core.RawLog = .{
+        .block_number = 0,
+        .tx_index = 0,
+        .log_index = 0,
+        .address = FACTORY,
+        .topic_count = 1,
+        .topics = .{ sdk_manifest.eventTopic0(PairCreated), [_]u8{0} ** 32, [_]u8{0} ** 32, [_]u8{0} ** 32 },
+        .data = &create_data,
+        .tx_hash = [_]u8{0xFE} ** 32,
+    };
+    const sync_log: core.RawLog = .{
+        .block_number = 0,
+        .tx_index = 0,
+        .log_index = 1,
+        .address = CHILD,
+        .topic_count = 1,
+        .topics = .{ sdk_manifest.eventTopic0(Sync), [_]u8{0} ** 32, [_]u8{0} ** 32, [_]u8{0} ** 32 },
+        .data = &.{},
+        .tx_hash = [_]u8{0xFE} ** 32,
+    };
+    try fake.ingest(100, [_]u8{0xAA} ** 32, &.{ create_log, sync_log });
+
+    var runner = Runner{ ._allocator = testing.allocator, ._child_addresses = &children };
+    try session.tick(M, Runner, &runner, 200);
+
+    try testing.expectEqual(@as(u32, 1), runner.creates);
+    try testing.expectEqual(@as(u32, 1), runner.syncs); // same-block child event caught
+    try testing.expect(children.contains(CHILD));
 }
 
 test "tick routes saves through the per-block overlay, not the slab" {
