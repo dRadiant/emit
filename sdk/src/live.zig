@@ -781,20 +781,20 @@ test "tick routes saves through the per-block overlay, not the slab" {
 
     try session.tick(Manifest, OverlayHandler, ctx, 200);
 
-    // Overlay holds one entry per key, each tagged with its dispatch block.
+    // Per-block isolation: each block's submap holds exactly its own writes.
     try testing.expectEqual(@as(u32, 3), ctx.stores.accounts.pendingCount());
 
-    const alice_entry = ctx.stores.accounts.pending.get(ALICE).?;
-    try testing.expectEqual(@as(u64, 100), alice_entry.block);
-    try testing.expectEqual(@as(u64, 100), alice_entry.value.balance);
+    const block_100 = ctx.stores.accounts.pending.get(100).?;
+    try testing.expectEqual(@as(u32, 1), block_100.count());
+    try testing.expectEqual(@as(u64, 100), block_100.get(ALICE).?.balance);
 
-    const bob_entry = ctx.stores.accounts.pending.get(BOB).?;
-    try testing.expectEqual(@as(u64, 101), bob_entry.block);
-    try testing.expectEqual(@as(u64, 200), bob_entry.value.balance);
+    const block_101 = ctx.stores.accounts.pending.get(101).?;
+    try testing.expectEqual(@as(u32, 1), block_101.count());
+    try testing.expectEqual(@as(u64, 200), block_101.get(BOB).?.balance);
 
-    const carl_entry = ctx.stores.accounts.pending.get(CARL).?;
-    try testing.expectEqual(@as(u64, 102), carl_entry.block);
-    try testing.expectEqual(@as(u64, 300), carl_entry.value.balance);
+    const block_102 = ctx.stores.accounts.pending.get(102).?;
+    try testing.expectEqual(@as(u32, 1), block_102.count());
+    try testing.expectEqual(@as(u64, 300), block_102.get(CARL).?.balance);
 
     // Nothing committed to disk — the slab is empty, only the overlay holds the data.
     try testing.expectEqual(@as(u32, 0), ctx.stores.accounts.count());

@@ -7,10 +7,11 @@
 /// commit succeeds and clears dirty flags. Disk I/O happens via
 /// `state_snap`, not this module.
 ///
-/// In live mode, saves route through a per-block overlay tagged with the
-/// block that produced them. `commitBlock` drains a block's slice into
-/// the regular dirty cache so the next `state.snap` commit picks it up.
-/// `discardAll` drops the overlay on reorg recovery.
+/// In live mode, saves route through per-block overlay submaps keyed by
+/// block number. `commitBlock(N)` drains submap N into the dirty cache;
+/// `discardAll` drops every submap on reorg recovery. Per-block isolation
+/// preserves each block's mutation even when later blocks touch the same
+/// key.
 ///
 /// Not thread-safe.
 const std = @import("std");
@@ -34,7 +35,7 @@ pub fn MutableStore(comptime T: type) type {
         pub const value_size = VALUE_SIZE;
 
         const CacheEntry = struct { entity: T, dirty: bool };
-        const PendingEntry = struct { block: u64, value: T };
+        const BlockMap = std.AutoHashMapUnmanaged(KeyField, T);
         const KeyBytes = [KEY_SIZE]u8;
 
         allocator: std.mem.Allocator,
@@ -44,7 +45,8 @@ pub fn MutableStore(comptime T: type) type {
 
         live: bool = false,
         live_block: u64 = 0,
-        pending: std.AutoHashMapUnmanaged(KeyField, PendingEntry) = .{},
+        /// Per-block overlay submaps. Bounded by FINALITY_DEPTH (~64).
+        pending: std.AutoHashMapUnmanaged(u64, BlockMap) = .{},
 
         /// `slab` is borrowed from the owning `StateSnap`. Caller must
         /// call `refreshSlab` after every `state_snap.commit` so this
@@ -58,13 +60,27 @@ pub fn MutableStore(comptime T: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            var it = self.pending.valueIterator();
+            while (it.next()) |bm| bm.deinit(self.allocator);
             self.pending.deinit(self.allocator);
             self.cache.deinit();
         }
 
         pub fn load(self: *Self, key: KeyField) !?T {
             if (self.live) {
-                if (self.pending.get(key)) |e| return e.value;
+                // Newest-block wins; walk all pending submaps. Bounded ~64.
+                var winner_block: ?u64 = null;
+                var winner_value: ?T = null;
+                var it = self.pending.iterator();
+                while (it.next()) |entry| {
+                    if (entry.value_ptr.get(key)) |v| {
+                        if (winner_block == null or entry.key_ptr.* > winner_block.?) {
+                            winner_block = entry.key_ptr.*;
+                            winner_value = v;
+                        }
+                    }
+                }
+                if (winner_value) |v| return v;
             }
             if (self.cache.get(key)) |entry| return entry.entity;
 
@@ -83,7 +99,7 @@ pub fn MutableStore(comptime T: type) type {
             var entity = std.mem.zeroes(T);
             @field(entity, key_field_name) = key;
             if (self.live) {
-                try self.pending.put(self.allocator, key, .{ .block = self.live_block, .value = entity });
+                try self.putPending(key, entity);
             } else {
                 try self.cache.put(key, .{ .entity = entity, .dirty = true });
             }
@@ -94,31 +110,35 @@ pub fn MutableStore(comptime T: type) type {
         pub fn save(self: *Self, entity: T) !void {
             const key = @field(entity, key_field_name);
             if (self.live) {
-                try self.pending.put(self.allocator, key, .{ .block = self.live_block, .value = entity });
+                try self.putPending(key, entity);
                 return;
             }
             try self.cache.put(key, .{ .entity = entity, .dirty = true });
         }
 
-        /// Move every overlay entry tagged with `block` into the regular
-        /// cache (marked dirty). The disk write happens later via
-        /// `materialize` + `state_snap.commit`.
-        pub fn commitBlock(self: *Self, block: u64) !void {
-            if (self.pending.count() == 0) return;
-            var to_remove: std.ArrayListUnmanaged(KeyField) = .{};
-            defer to_remove.deinit(self.allocator);
-            var it = self.pending.iterator();
-            while (it.next()) |entry| {
-                if (entry.value_ptr.block != block) continue;
-                try self.cache.put(entry.key_ptr.*, .{ .entity = entry.value_ptr.value, .dirty = true });
-                try to_remove.append(self.allocator, entry.key_ptr.*);
-            }
-            for (to_remove.items) |k| _ = self.pending.remove(k);
+        fn putPending(self: *Self, key: KeyField, value: T) !void {
+            const gop = try self.pending.getOrPut(self.allocator, self.live_block);
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            try gop.value_ptr.put(self.allocator, key, value);
         }
 
-        /// Drop the entire overlay. Used on reorg — the caller re-dispatches
-        /// every block in the fresh pending file.
+        /// Drain block `N`'s overlay submap into the dirty cache. The disk
+        /// write happens later via `materialize` + `state_snap.commit`.
+        pub fn commitBlock(self: *Self, block: u64) !void {
+            const removed = self.pending.fetchRemove(block) orelse return;
+            var bm = removed.value;
+            defer bm.deinit(self.allocator);
+            var it = bm.iterator();
+            while (it.next()) |entry| {
+                try self.cache.put(entry.key_ptr.*, .{ .entity = entry.value_ptr.*, .dirty = true });
+            }
+        }
+
+        /// Drop every overlay submap. Used on reorg; caller re-dispatches
+        /// the fresh canonical chain.
         pub fn discardAll(self: *Self) void {
+            var it = self.pending.valueIterator();
+            while (it.next()) |bm| bm.deinit(self.allocator);
             self.pending.clearRetainingCapacity();
         }
 
@@ -127,7 +147,10 @@ pub fn MutableStore(comptime T: type) type {
         }
 
         pub fn pendingCount(self: *const Self) u32 {
-            return self.pending.count();
+            var n: u32 = 0;
+            var it = self.pending.valueIterator();
+            while (it.next()) |bm| n += bm.count();
+            return n;
         }
 
         /// Produce the sorted slab bytes for the next `state.snap` commit.
