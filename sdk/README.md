@@ -64,9 +64,9 @@ Re-exported from `root.zig`:
 
 See [examples/erc20/](../examples/erc20/) for a working four-file indexer and [examples/uniswap-v2/](../examples/uniswap-v2/) for the factory pre-pass pattern.
 
-## Using emit from your own project
+## Using EMIT from your own project
 
-Add emit as a dependency:
+Add EMIT as a dependency:
 
 ```sh
 zig fetch --save git+https://github.com/dradiant/emit

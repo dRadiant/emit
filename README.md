@@ -143,6 +143,7 @@ A dedicated migration guide is planned for v1.2.0. Until then, the example index
 - [`docs/adr/`](docs/adr/) — architectural decision records (pending block storage, filtered-index format, SDK storage, ethcall strictness)
 - [`core/README.md`](core/README.md), [`engine/README.md`](engine/README.md), [`sdk/README.md`](sdk/README.md) — per-package orientation
 - [`examples/`](examples/) — runnable reference indexers with their own READMEs
+- [`CHANGELOG.md`](CHANGELOG.md) — release history
 
 ## License
 
@@ -152,7 +153,7 @@ Proprietary software is not cypherpunk.
 
 ## Contributing
 
-Issue reports, feature discussions, and pull requests are welcome. See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) for more details and guidelines.
+Issue reports, feature discussions, and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, commit conventions, and review norms.
 
 ## Acknowledgements
 
