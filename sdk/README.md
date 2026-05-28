@@ -4,7 +4,7 @@ Zig library for writing typed event indexers against an emit-engine flat log sto
 
 ## What it does
 
-`emit-sdk` is the consumer side of EMIT. It reads the engine's flat log store, materializes a per-manifest filtered index, runs comptime-dispatched handlers against the filtered logs, and persists entities to a pure-Zig flat store. The two-stage pipeline (filter build then handler replay) is why sub-second handler re-runs are possible.
+`emit-sdk` is the consumer side of EMIT. It reads the Engine's flat log store, materializes a per-manifest filtered index, runs comptime-dispatched handlers against the filtered logs, and persists entities to a pure-Zig flat store. The two-stage pipeline (filter build then handler replay) is why sub-second handler re-runs are possible.
 
 Module index:
 
@@ -27,7 +27,7 @@ Module index:
 | `prefetch.zig` | Per-event Multicall3 prefetch (static + per-log + per-block) |
 | `humanize.zig` | `Amount` formatter, `blockTimestamp()` derivation |
 | `live.zig` | Live head-following loop, inotify wakeup, reorg classification |
-| `fake_engine.zig` | Test fixture: pure-Zig `pending.bin` + `meta.bin` writer |
+| `testing/fake_engine.zig` | Test fixture: pure-Zig `pending.bin` + `meta.bin` writer (test-only; not part of the public surface) |
 
 ## Usage
 
@@ -104,22 +104,22 @@ For monorepo embedders (forks or vendored copies), pin a `.path = "../emit"` for
 
 ## What sdk does NOT do
 
-- No log import — that's the engine's job. SDK reads the engine's output via `core.FlatStoreReader`.
+- No log import — that's the Engine's job. SDK reads the Engine's output via `core.FlatStoreReader`.
 - No API serving — entity stores are flat files; serve them however you want.
 - No historical `eth_call` — `Context.ethCall` is strict cache-only, populated by the prefetch declared in the manifest. Events-first by design.
-- No engine linkage. **SDK never imports engine.**
+- No Engine linkage. **SDK never imports Engine.**
 
 ## Events-first contract
 
-All time-varying state must derive from events. `Context.ethCall` returns immutable metadata only (`decimals()`, `symbol()`, `name()`, `factory()`, etc.) — cached permanently on first read. This is not a limitation; it's a design choice to avoid requiring an archive node, and also increasing throughput through barring poor indexer design. ERC20 balances reconstruct from `Transfer` events; Uniswap V2 prices reconstruct from `Swap` events; stETH balances reconstruct from `TransferShares` + `TokenRebased`.
+All time-varying state must derive from events. `Context.ethCall` returns immutable metadata only (`decimals()`, `symbol()`, `name()`, `factory()`, etc.) — cached permanently on first read. This is a deliberate design choice: it removes the need for an archive node and rules out the poor-indexer-design patterns that depend on historical state queries. ERC20 balances reconstruct from `Transfer` events; Uniswap V2 prices reconstruct from `Swap` events; stETH balances reconstruct from `TransferShares` + `TokenRebased`.
 
 ## Build and test
 
 ```sh
-zig build test-sdk --summary all
+zig build test --summary all
 ```
 
-176 tests covering manifest validation, ABI parsing, entity serialization, store round-trips, filter build, scanner, prefetch, live head-following.
+176 SDK tests covering manifest validation, ABI parsing, entity serialization, store round-trips, filter build, scanner, prefetch, and live head-following.
 
 ## Performance
 
@@ -130,7 +130,7 @@ zig build test-sdk --summary all
 | Handler re-run | <1s | filtered index hot in page cache |
 | Head-follow tick latency | <1s | local engine, inotify wakeup on `pending.bin` |
 
-The live head-follower (`live.zig`) uses Linux inotify on the engine's data directory to wake on `pending.bin` rename events. On non-Linux hosts the inotify path stubs to no-op and live mode degrades to a periodic re-check loop.
+The live head-follower (`live.zig`) uses Linux inotify on the Engine's data directory to wake on `pending.bin` rename events. On non-Linux hosts the inotify path stubs to no-op and live mode degrades to a periodic re-check loop.
 
 ## License
 

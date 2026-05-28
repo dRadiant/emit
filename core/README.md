@@ -39,7 +39,7 @@ The full module set is intentionally public.
 ## Build and test
 
 ```sh
-zig build test-core --summary all
+zig build test --summary all
 ```
 
 Tests are in-memory where possible. mmap-backed structs use page-aligned heap buffers via `testReader()` / `buildTestBlooms()` helpers in `flat_reader.zig` and `block_filter.zig` rather than tmp directories.

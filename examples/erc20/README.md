@@ -12,7 +12,7 @@ zig build run -Doptimize=ReleaseFast -- \
   --follow
 ```
 
-Expected output: a per-cycle line summarizing the backfill, then a steady tick once caught up to the engine's flat store and pending ring:
+Expected output: a per-cycle line summarizing the backfill, then a steady tick once caught up to the Engine's flat store and pending ring:
 
 ```
 scan: 124,500 blocks / filtered: 8,213 / handler: 1,082,996 events / commit: 29 ms

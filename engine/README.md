@@ -4,7 +4,7 @@ Standalone binary that imports historical receipts from an Ethereum execution cl
 
 ## What it does
 
-`emit-engine` is the producer side of EMIT. It owns the flat log store at `<data-dir>/` and is the only process that ever writes to it. SDK indexers read from the store; the engine is blind to them.
+`emit-engine` is the producer side of EMIT. It owns the flat log store at `<data-dir>/` and is the only process that ever writes to it. SDK indexers read from the store; the Engine is blind to them.
 
 Two operations:
 
@@ -39,7 +39,7 @@ Commands:
 Build:
 
 ```sh
-zig build engine -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseFast
 ./zig-out/bin/emit-engine status --data-dir /var/lib/emit-engine
 ```
 
@@ -109,7 +109,7 @@ Total at mainnet chain tip: ~249 GB.
 - No API serving, no query interface, no GraphQL.
 - No SDK linkage. **Engine never imports SDK.**
 
-Indexers built with `sdk` read the flat store via `core.FlatStoreReader` and watch `pending.bin` via inotify. The engine is unaware of them.
+Indexers built with `sdk` read the flat store via `core.FlatStoreReader` and watch `pending.bin` via inotify. The Engine is unaware of them.
 
 ## Performance
 
