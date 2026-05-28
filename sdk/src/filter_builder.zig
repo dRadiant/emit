@@ -166,6 +166,7 @@ fn runPhase(
         end_block,
         &matching,
         &result.blocks_scanned,
+        &result.dropped_blocks,
         allocator,
     );
 

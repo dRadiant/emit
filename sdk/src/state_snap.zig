@@ -168,9 +168,13 @@ pub fn StateSnap(comptime mutables: usize, comptime immutables: usize) type {
                 pos += slab.len;
             }
 
+            // Allocate the new body first so a post-rename OOM can't desync
+            // disk from in-memory state.
+            const new_body = try self.allocator.dupe(u8, buf[HEADER_SIZE..]);
+            errdefer self.allocator.free(new_body);
+
             try core.atomic_file.write(self.dir, "state.snap.tmp", "state.snap", buf);
 
-            const new_body = try self.allocator.dupe(u8, buf[HEADER_SIZE..]);
             if (self.body.len > 0) self.allocator.free(self.body);
             self.body = new_body;
             self.cursor = new_cursor;

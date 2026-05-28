@@ -97,12 +97,12 @@ pub fn ImmutableStore(comptime T: type) type {
         /// Drain one block's overlay into the pending-append queue. The
         /// actual disk write happens later via `flushAppends`.
         pub fn commitBlock(self: *Self, block: u64) AppendError!void {
-            const removed = self.block_pending.fetchRemove(block) orelse return;
-            var entities = removed.value;
-            defer entities.deinit(self.allocator);
-            for (entities.items) |e| {
-                self.pending_appended.append(self.allocator, e) catch return error.OutOfMemory;
-            }
+            const entry = self.block_pending.getPtr(block) orelse return;
+            // Reserve capacity before draining so a partial OOM can't strand entries.
+            try self.pending_appended.ensureUnusedCapacity(self.allocator, entry.items.len);
+            for (entry.items) |e| self.pending_appended.appendAssumeCapacity(e);
+            var removed = self.block_pending.fetchRemove(block).?;
+            removed.value.deinit(self.allocator);
         }
 
         /// Append every queued record to `events.dat`. Caller must follow
