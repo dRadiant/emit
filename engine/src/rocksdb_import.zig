@@ -68,6 +68,19 @@ const WorkerArgs = struct {
     worker_id: usize,
 };
 
+/// Fill `slot` with a canonical zero-log entry and empty blooms. Used for
+/// no-log blocks and (on the error path) for blocks we failed to decode —
+/// every block in range MUST land in the flat store so the reader's dense
+/// index (`idx = block_number - first_block`) stays aligned. Skipping a block
+/// would shift every later block's logs onto the wrong block number.
+fn writeEmptyEntry(slot: *Slot, serialize_buf: []u8) void {
+    const n = log_serial.serializeLogs(&[_]types.RawLog{}, serialize_buf);
+    slot.entry_len = log_serial.compressEntry(serialize_buf[0..n], &slot.entry) catch 0;
+    slot.topic_bloom = std.mem.zeroes([bloom.BLOOM_SIZE]u8);
+    slot.addr_bloom = std.mem.zeroes([bloom.ADDR_BLOOM_SIZE]u8);
+    slot.log_count = 0;
+}
+
 /// Worker: decode RLP receipts → build blooms → serialize → LZ4 compress.
 /// Stack scratch is safe under the buffer rule in `core.parallel`: spawned
 /// with `WORKER_STACK_SIZE`.
@@ -86,25 +99,24 @@ fn workerFn(args: *WorkerArgs) void {
                 slot.block_number, slot.raw_value[0..slot.raw_len], &log_buf, &data_buf,
             ) catch |e| {
                 std.debug.print("decode error block {d}: {}\n", .{ slot.block_number, e });
+                writeEmptyEntry(slot, &serialize_buf);
                 slot.has_error = true;
-                slot.log_count = 0;
-                slot.entry_len = 0;
                 slot.state.store(Slot.DONE, .release);
                 continue;
             };
 
-            if (log_count == 0) {
-                slot.log_count = 0;
-                slot.entry_len = 0;
-                slot.state.store(Slot.DONE, .release);
-                continue;
-            }
-
+            // No-log blocks (empty post-merge blocks, or blocks whose txs emit
+            // nothing) still flow through here: serializeLogs writes a zero-count
+            // entry, the blooms come out empty, and the writer appends it so the
+            // dense block index stays contiguous. Skipping them corrupts every
+            // later block's number.
             const topic_bloom = log_serial.buildTopicBloom(log_buf[0..log_count]);
             const addr_bloom = log_serial.buildAddrBloom(log_buf[0..log_count]);
             const serialized_len = log_serial.serializeLogs(log_buf[0..log_count], &serialize_buf);
 
             slot.entry_len = log_serial.compressEntry(serialize_buf[0..serialized_len], &slot.entry) catch {
+                std.debug.print("compress error block {d}\n", .{slot.block_number});
+                writeEmptyEntry(slot, &serialize_buf);
                 slot.has_error = true;
                 slot.state.store(Slot.DONE, .release);
                 continue;
@@ -169,13 +181,21 @@ pub fn main() !void {
     const alloc = std.heap.page_allocator;
     const args = try std.process.argsAlloc(alloc);
     if (args.len < 3) {
-        std.debug.print("Usage: rocksdb-import <receipts_db_path> <data_dir>\n", .{});
+        std.debug.print("Usage: rocksdb-import <receipts_db_path> <data_dir> [start_block] [end_block]\n", .{});
         std.process.exit(1);
     }
-    try run(args[1], args[2]);
+    // Optional bounded range (debug/isolation): import only [start, end].
+    const start_override: ?u64 = if (args.len > 3) try std.fmt.parseInt(u64, args[3], 10) else null;
+    const end_override: ?u64 = if (args.len > 4) try std.fmt.parseInt(u64, args[4], 10) else null;
+    try run(args[1], args[2], start_override, end_override);
 }
 
-pub fn run(receipts_path: [*:0]const u8, output_path: []const u8) !void {
+pub fn run(
+    receipts_path: [*:0]const u8,
+    output_path: []const u8,
+    start_override: ?u64,
+    end_override: ?u64,
+) !void {
     const allocator = std.heap.page_allocator;
 
     // Open Nethermind's receipts DB read-only with column families.
@@ -222,13 +242,15 @@ pub fn run(receipts_path: [*:0]const u8, output_path: []const u8) !void {
         return;
     }
     const head = iterKeyBlock(iter) orelse return error.InvalidKey;
-    const finality_cutoff: u64 = if (head > FINALITY_DEPTH) head - FINALITY_DEPTH else 0;
+    const head_cutoff: u64 = if (head > FINALITY_DEPTH) head - FINALITY_DEPTH else 0;
+    // An explicit end caps the import below finality for bounded/isolation runs.
+    const finality_cutoff: u64 = if (end_override) |e| @min(head_cutoff, e) else head_cutoff;
     std.debug.print("Chain head: {d}; finality cutoff: {d} (head - {d}).\n", .{ head, finality_cutoff, FINALITY_DEPTH });
 
-    // Resume from where we left off, else start at the merge. Pre-merge
-    // events are rarely an indexing target; users who need them should
-    // pre-seed the data dir to lower `last_finalized_block`.
-    const start_block: u64 = if (writer.meta.last_finalized_block > 0)
+    // Resume from where we left off, else start at the merge (or an explicit
+    // override for bounded runs). Pre-merge events are rarely an indexing
+    // target; users who need them should pre-seed the data dir.
+    const start_block: u64 = start_override orelse if (writer.meta.last_finalized_block > 0)
         writer.meta.last_finalized_block + 1
     else
         core.types.MERGE_BLOCK;
@@ -307,10 +329,12 @@ pub fn run(receipts_path: [*:0]const u8, output_path: []const u8) !void {
         if (slot.has_error) {
             decode_errors += 1;
         } else if (slot.log_count > 0) {
-            try writer.appendBlock(slot.block_number, slot.entry[0..slot.entry_len], &slot.topic_bloom, &slot.addr_bloom);
             blocks_with_logs += 1;
             total_logs += slot.log_count;
         }
+        // Append every block — including no-log and (post-loop-fatal) errored
+        // ones — so the flat store's dense index never skips a block number.
+        try writer.appendBlock(slot.block_number, slot.entry[0..slot.entry_len], &slot.topic_bloom, &slot.addr_bloom);
 
         blocks_processed += 1;
         slot.state.store(Slot.EMPTY, .release);
