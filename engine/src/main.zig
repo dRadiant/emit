@@ -40,10 +40,16 @@ pub fn main() !void {
 
         if (getFlag(args, "--rocksdb")) |rocksdb_path| {
             // RocksDB import is a separate binary (avoids linking ~20MB of C into engine).
-            // Exec it directly once built.
+            // Exec it directly once built. Pass --rpc through so the importer can
+            // resolve the canonical receipt row for blocks that carry reorg-history
+            // duplicates (Nethermind keeps orphan rows even past finality).
+            const argv: []const []const u8 = if (getFlag(args, "--rpc")) |rpc_url|
+                &.{ "rocksdb-import", rocksdb_path, data_dir, "--rpc", rpc_url }
+            else
+                &.{ "rocksdb-import", rocksdb_path, data_dir };
             const result = std.process.Child.run(.{
                 .allocator = alloc,
-                .argv = &.{ "rocksdb-import", rocksdb_path, data_dir },
+                .argv = argv,
             });
             if (result) |r| {
                 if (r.stdout.len > 0) std.debug.print("{s}", .{r.stdout});

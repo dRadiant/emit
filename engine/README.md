@@ -29,12 +29,20 @@ Module index:
 Usage: emit-engine <command> [options]
 
 Commands:
-  import --rocksdb <path> --data-dir <path>   Bulk import from Nethermind
+  import --rocksdb <path> --data-dir <path> [--rpc <url>]
+                                              Bulk import from Nethermind
   import --rpc <url> --data-dir <path>        Import via eth_getLogs (v2)
   follow --rpc <url> [--ws <url>] --data-dir <path> [--catch-up-rpc]
                                               Follow chain head
   status --data-dir <path>                    Print store status
 ```
+
+Pass `--rpc` to the RocksDB import so it can resolve the canonical receipt row
+for blocks that carry reorg-history duplicates. Nethermind keys receipts by
+`blockNumber + blockHash` and keeps the orphaned rows of reorged-out blocks even
+past finality; the importer needs the canonical hash (one `eth_getBlockByNumber`
+per duplicate, rare) to keep the right one. Without `--rpc` it fast-paths
+single-row blocks and fails loud on a duplicate rather than guessing.
 
 Build:
 

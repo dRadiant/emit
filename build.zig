@@ -118,6 +118,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "core", .module = core },
                     .{ .name = "lz4", .module = lz4 },
+                    .{ .name = "eth", .module = eth },
                     .{ .name = "rocksdb", .module = dep.module("rocksdb") },
                 },
             }),

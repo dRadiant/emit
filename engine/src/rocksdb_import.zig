@@ -20,6 +20,7 @@ const std = @import("std");
 
 const c = @import("rocksdb");
 const core = @import("core");
+const eth = @import("eth");
 
 const flat_writer = @import("flat_writer.zig");
 const receipt_decoder = @import("receipt_decoder.zig");
@@ -134,22 +135,87 @@ fn workerFn(args: *WorkerArgs) void {
     }
 }
 
-/// Copy the current iterator entry into a slot. Keys are block numbers (u64 BE).
-fn fillSlot(slot: *Slot, iter: Iterator) bool {
+const FillStatus = enum { filled, skipped };
+
+/// Fill `slot` with the canonical receipt row for the block number at the
+/// current iterator position, then advance the iterator past every row of that
+/// block number (leaving it at the next block, or invalid).
+///
+/// Nethermind keys receipts by block_number(8 BE) ++ block_hash(32) and retains
+/// reorg-orphan rows even for finalized blocks. When a block number carries more
+/// than one row we must keep the one whose hash matches the canonical chain;
+/// `provider` (eth_getBlockByNumber) supplies that hash. Single-row blocks — the
+/// overwhelming majority — take the provider-free fast path. A duplicate with no
+/// `provider` fails loud rather than guessing.
+fn fillSlotCanonical(slot: *Slot, iter: Iterator, provider: ?*eth.provider.Provider, dup_blocks: *u64) !FillStatus {
     var klen: usize = 0;
     var vlen: usize = 0;
-    const key_ptr: [*]const u8 = @ptrCast(c.rocksdb_iter_key(iter, &klen) orelse return false);
-    const val_ptr: [*]const u8 = @ptrCast(c.rocksdb_iter_value(iter, &vlen) orelse return false);
-    if (klen < 8 or vlen > MAX_RAW_VALUE) return false;
+    const kp: [*]const u8 = @ptrCast(c.rocksdb_iter_key(iter, &klen) orelse return error.RocksDBError);
+    const vp: [*]const u8 = @ptrCast(c.rocksdb_iter_value(iter, &vlen) orelse return error.RocksDBError);
+    if (klen < 8) {
+        c.rocksdb_iter_next(iter);
+        return .skipped;
+    }
+    const bn = std.mem.readInt(u64, kp[0..8], .big);
 
-    slot.block_number = std.mem.readInt(u64, key_ptr[0..8], .big);
-    @memcpy(slot.raw_value[0..vlen], val_ptr[0..vlen]);
-    slot.raw_len = vlen;
+    // Provisionally take the first row; it wins outright unless a duplicate
+    // group turns up and a sibling matches the canonical hash.
+    const have_row = vlen <= MAX_RAW_VALUE;
+    if (have_row) {
+        @memcpy(slot.raw_value[0..vlen], vp[0..vlen]);
+        slot.raw_len = vlen;
+    }
+    var first_hash: [32]u8 = undefined;
+    const first_has_hash = klen >= 40;
+    if (first_has_hash) @memcpy(&first_hash, kp[8..40]);
+
+    c.rocksdb_iter_next(iter);
+
+    // Fast path: the next row is a different block (or EOF) — single-row block.
+    if (!iterValid(iter) or (iterKeyBlock(iter) orelse (bn +% 1)) != bn) {
+        if (!have_row) return .skipped;
+        finalizeFilled(slot, bn);
+        return .filled;
+    }
+
+    // Duplicate group: keep the row whose hash is canonical for this number.
+    dup_blocks.* += 1;
+    const p = provider orelse {
+        std.debug.print("block {d} has reorg-duplicate receipt rows; rerun with --rpc <url> to resolve canonical.\n", .{bn});
+        return error.DuplicateNeedsRpc;
+    };
+    const canon = (try p.getBlock(bn)) orelse return error.CanonicalBlockNotFound;
+
+    var found = have_row and first_has_hash and std.mem.eql(u8, &first_hash, &canon.hash);
+    while (iterValid(iter)) {
+        var k2: usize = 0;
+        const kp2: [*]const u8 = @ptrCast(c.rocksdb_iter_key(iter, &k2) orelse break);
+        if (k2 < 8 or std.mem.readInt(u64, kp2[0..8], .big) != bn) break;
+        if (!found and k2 >= 40 and std.mem.eql(u8, kp2[8..40], &canon.hash)) {
+            var v2: usize = 0;
+            const vp2: [*]const u8 = @ptrCast(c.rocksdb_iter_value(iter, &v2) orelse break);
+            if (v2 <= MAX_RAW_VALUE) {
+                @memcpy(slot.raw_value[0..v2], vp2[0..v2]);
+                slot.raw_len = v2;
+                found = true;
+            }
+        }
+        c.rocksdb_iter_next(iter);
+    }
+    if (!found) {
+        std.debug.print("block {d}: no receipt row matched the canonical hash among duplicates.\n", .{bn});
+        return error.CanonicalRowMissing;
+    }
+    finalizeFilled(slot, bn);
+    return .filled;
+}
+
+fn finalizeFilled(slot: *Slot, bn: u64) void {
+    slot.block_number = bn;
     slot.has_error = false;
     slot.log_count = 0;
     slot.entry_len = 0;
     slot.state.store(Slot.FILLED, .release);
-    return true;
 }
 
 /// Convert a RocksDB error pointer to a Zig error. Frees the C string.
@@ -181,20 +247,58 @@ pub fn main() !void {
     const alloc = std.heap.page_allocator;
     const args = try std.process.argsAlloc(alloc);
     if (args.len < 3) {
-        std.debug.print("Usage: rocksdb-import <receipts_db_path> <data_dir> [start_block] [end_block]\n", .{});
+        std.debug.print(
+            "Usage: rocksdb-import <receipts_db_path> <data_dir> [--start N] [--end N] [--rpc URL]\n",
+            .{},
+        );
         std.process.exit(1);
     }
-    // Optional bounded range (debug/isolation): import only [start, end].
-    const start_override: ?u64 = if (args.len > 3) try std.fmt.parseInt(u64, args[3], 10) else null;
-    const end_override: ?u64 = if (args.len > 4) try std.fmt.parseInt(u64, args[4], 10) else null;
-    try run(args[1], args[2], start_override, end_override);
+    // Flags after the two required positionals. --start/--end bound the import
+    // (debug/isolation); --rpc lets the importer resolve the canonical row for
+    // blocks that carry reorg-history receipt duplicates.
+    var start_override: ?u64 = null;
+    var end_override: ?u64 = null;
+    var rpc_url: ?[:0]const u8 = null;
+    var i: usize = 3;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--start") and i + 1 < args.len) {
+            start_override = try std.fmt.parseInt(u64, args[i + 1], 10);
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--end") and i + 1 < args.len) {
+            end_override = try std.fmt.parseInt(u64, args[i + 1], 10);
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--rpc") and i + 1 < args.len) {
+            rpc_url = args[i + 1];
+            i += 1;
+        }
+    }
+    try run(args[1], args[2], start_override, end_override, rpc_url);
 }
 
+/// Wire up an optional RPC provider (kept alive for the whole import) and run.
 pub fn run(
     receipts_path: [*:0]const u8,
     output_path: []const u8,
     start_override: ?u64,
     end_override: ?u64,
+    rpc_url: ?[:0]const u8,
+) !void {
+    const allocator = std.heap.page_allocator;
+    if (rpc_url) |url| {
+        var http = eth.http_transport.HttpTransport.init(allocator, url);
+        var provider = eth.provider.Provider.init(allocator, &http);
+        try runInner(receipts_path, output_path, start_override, end_override, &provider);
+    } else {
+        try runInner(receipts_path, output_path, start_override, end_override, null);
+    }
+}
+
+fn runInner(
+    receipts_path: [*:0]const u8,
+    output_path: []const u8,
+    start_override: ?u64,
+    end_override: ?u64,
+    provider: ?*eth.provider.Provider,
 ) !void {
     const allocator = std.heap.page_allocator;
 
@@ -281,6 +385,7 @@ pub fn run(
     var total_logs: u64 = 0;
     var decode_errors: u64 = 0;
     var skipped_raw: u64 = 0;
+    var dup_blocks: u64 = 0;
 
     std.debug.print("Importing receipts ({} workers) from {s} → {s}\n", .{
         parallel.MAX_WORKERS, std.mem.span(receipts_path), output_path,
@@ -311,8 +416,12 @@ pub fn run(
                 }
                 const next_slot = &slots[read_cursor % SLOT_COUNT];
                 if (next_slot.state.load(.acquire) != Slot.EMPTY) break;
-                if (fillSlot(next_slot, iter)) read_cursor += 1 else skipped_raw += 1;
-                c.rocksdb_iter_next(iter);
+                // fillSlotCanonical advances the iterator past the block it
+                // consumes (collapsing reorg-duplicate rows to the canonical one).
+                switch (try fillSlotCanonical(next_slot, iter, provider, &dup_blocks)) {
+                    .filled => read_cursor += 1,
+                    .skipped => skipped_raw += 1,
+                }
             }
             if (!iterValid(iter)) read_done = true;
         }
@@ -364,9 +473,10 @@ pub fn run(
         \\Blocks with logs:  {d}
         \\Total logs:        {d}
         \\Decode errors:     {d}
+        \\Reorg dups solved: {d}
         \\Elapsed:           {d:.1}s
         \\
-    , .{ blocks_processed, blocks_with_logs, total_logs, decode_errors, elapsed_s });
+    , .{ blocks_processed, blocks_with_logs, total_logs, decode_errors, dup_blocks, elapsed_s });
     if (elapsed_s > 0) {
         std.debug.print("Blocks/sec:        {d:.0}\nLogs/sec:          {d:.0}\n", .{
             @as(f64, @floatFromInt(blocks_processed)) / elapsed_s,

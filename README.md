@@ -41,9 +41,12 @@ cd emit
 zig build -Doptimize=ReleaseFast
 
 # 2. Import historical logs from a local Nethermind RocksDB (~13 min full chain).
+#    --rpc lets the importer resolve the canonical receipt row for the rare
+#    blocks that kept reorg-orphan duplicates (see engine/README.md).
 ./zig-out/bin/emit-engine import \
   --rocksdb /var/lib/nethermind/nethermind_db/mainnet/receipts \
-  --data-dir /var/lib/emit-engine
+  --data-dir /var/lib/emit-engine \
+  --rpc http://localhost:8545
 
 # 3. Follow the chain head into the same store.
 ./zig-out/bin/emit-engine follow \
