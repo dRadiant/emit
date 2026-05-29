@@ -6,13 +6,13 @@ EMIT follows semantic versioning. Major bumps (1.x → 2.x) signal breaking chan
 
 ## EMIT 1.0.0
 
-Released: 2026-05-27
+Released: 2026-05-29
 
 First release. EMIT is a self-hosted EVM event indexer in Zig with zero managed dependencies, designed to run on modest dedicated hardware and exceed the performance of every comparable indexer.
 
 ### Engine
 
-- `emit-engine import` — bulk historical import from a Nethermind RocksDB receipts column family. Seven parallel decode workers, ~13 minutes for full mainnet on the reference benchmark hardware.
+- `emit-engine import` — bulk historical import from a Nethermind RocksDB receipts column family. Seven parallel decode workers, ~13 minutes for full mainnet on the reference benchmark hardware. Pass `--rpc` to resolve the canonical receipt row for blocks that retain reorg-orphan duplicates (Nethermind keys receipts by number+hash and keeps orphans past finality). Every block, including no-log blocks, is appended so the reader's dense block index stays aligned.
 - `emit-engine follow` — chain-head follower over WebSocket (`eth_subscribe(newHeads)`) with HTTP `eth_getLogs` gap-fill and reorg recovery. Sub-second head-follow latency against a local node.
 - `emit-engine status` — print flat log store metadata.
 - 64-block pending ring (`pending.bin`) with atomic tmp + rename writes for crash safety and reorg recovery.
@@ -21,7 +21,7 @@ First release. EMIT is a self-hosted EVM event indexer in Zig with zero managed 
 
 ### SDK
 
-- `sdk.run` / `sdk.init` entry points. Comptime-validated entity tuple, handler struct, and manifest.
+- `sdk.run` / `sdk.init` / `sdk.spawn` entry points. Comptime-validated entity tuple, handler struct, and manifest. `run` blocks (backfill + follow); `init` returns a caught-up context; `spawn` runs the live loop on a background thread and returns a context for in-process queries.
 - Manifest types: `Manifest`, `ContractDef`, `FactoryDef`, `PrefetchDef`, `PrefetchCall`, `StaticCall`. Static contracts, factory pre-pass for dynamically discovered child addresses, and event-driven + address-driven prefetch declarations.
 - Two-stage backfill pipeline: filter build (matching blocks via bloom scan, ~10 s for rETH) followed by handler replay (<1 s for warm re-runs). Most development cycles become instant.
 - `MutableStore(T)` with HashMap + sorted-slab cold-load binary search; `ImmutableStore(T)` append-only with comptime-rejected `load()`.
@@ -29,7 +29,8 @@ First release. EMIT is a self-hosted EVM event indexer in Zig with zero managed 
 - Strict `ethCall` cache (cache-or-error, per ADR-004). Pre-fetched and batched through Multicall3 during the prefetch phase between filter build and handler replay. Zero RPC calls on re-backfill once warmed.
 - Comptime topic0 dispatch — handlers are named `handle<EventName>` and routed by topic without runtime indirection.
 - ABI signature parser for canonical event signatures, named-parameter resolution, and `paramByName` lookup.
-- Live head-following loop with Linux `inotify` wakeup on `pending.bin` rename events. Sub-second tick latency to the Engine's flat store + pending ring updates.
+- Live head-following loop with Linux `inotify` wakeup on `pending.bin` rename events. Sub-second tick latency to the Engine's flat store + pending ring updates. Live dispatch is address-gated — only logs from manifest contracts and runtime-discovered factory children are handled, matching the historical filter.
+- In-process serving: `sdk.spawn` runs the follow loop on a background thread; query the live, tip-inclusive (pending-overlay), reorg-aware state via `ctx.read(T, key)`. A Context mutex serializes reads against the loop, so handler code stays lock-free. External read-only replicas on the finalized `state.snap` remain the horizontal read scale-out path.
 - Pure-Zig storage throughout — the SDK ships with zero external KV dependency.
 
 ### Core
