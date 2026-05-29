@@ -234,10 +234,8 @@ const LiveSession = struct {
     ) !void {
         try self.watcher.wait(timeout_ms);
 
-        // Hold the Context lock for the mutation body only — never across the
-        // wait above (that would block API readers for up to timeout_ms). The
-        // unlock defer is registered first, so it runs last (after curr /
-        // classification cleanup).
+        // Lock the mutation body only — not the wait above (that would stall
+        // API readers for up to timeout_ms).
         lockCtx(ctx);
         defer unlockCtx(ctx);
 
@@ -443,18 +441,16 @@ pub fn run(
     }
 }
 
-/// `spawn` runs this loop on a background thread; `deinit` sets `_stop` and the
-/// loop exits within one `tick` (bounded by `tick_timeout_ms`). Counter-shaped
-/// test contexts have no `_stop` field and never stop here (tests drive `tick`
-/// directly).
+/// `deinit` sets `_stop`; the loop exits within one `tick`. Test contexts have
+/// no `_stop` field and never stop here.
 fn stopRequested(ctx: anytype) bool {
     const T = std.meta.Child(@TypeOf(ctx));
     if (comptime @hasField(T, "_stop")) return ctx._stop.load(.seq_cst);
     return false;
 }
 
-/// The Context mutex guards every store mutation in a `tick` against in-process
-/// API readers. Comptime no-op for test contexts without a `_lock` field.
+/// Guards a `tick`'s mutations against API readers. No-op for test contexts
+/// without a `_lock` field.
 fn lockCtx(ctx: anytype) void {
     const T = std.meta.Child(@TypeOf(ctx));
     if (comptime @hasField(T, "_lock")) ctx._lock.lock();

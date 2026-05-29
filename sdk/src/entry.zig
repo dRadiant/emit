@@ -129,21 +129,25 @@ pub fn Context(comptime entities: anytype) type {
         /// child logs pass the address gate alongside statically declared
         /// contracts. Owned by the Context; freed in `deinit`.
         _child_addresses: ?*std.AutoHashMap([20]u8, void) = null,
-        /// Coarse Context-level lock shared by the follow thread (writer, per
-        /// dispatch/commit/reorg cycle) and in-process API readers (per query).
-        /// Serializing reads keeps the caching `MutableStore.load` safe to reuse.
-        /// Stores stay lock-agnostic; this is taken once per tick / query.
+        /// Coarse lock: the follow thread holds it per tick, API readers per
+        /// query. Serializing reads is what makes the caching `load` reusable.
         _lock: std.Thread.Mutex = .{},
-        /// Set when `spawn` runs the live loop on a background thread; null for
-        /// `run`/`init`. `deinit` signals `_stop` and joins it.
+        /// Non-null only under `spawn` (live loop on a thread); `deinit` joins it.
         _follow_thread: ?std.Thread = null,
         _stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-        /// First error the follow thread hit before exiting (e.g. a reorg
-        /// deeper than finality). Readers surface it via `followError`.
+        /// First error the follow thread hit before exiting; surfaced via `followError`.
         _follow_error: ?anyerror = null,
 
-        /// Reader guard for in-process API queries. Hold only across the
-        /// in-memory read, then release before serializing / I/O.
+        /// Locked point read for in-process API callers — a value copy of
+        /// mutable entity `T` for `key`. Not for handlers: they already run
+        /// under the loop's lock, so `read` there would deadlock.
+        pub fn read(self: *Self, comptime T: type, key: anytype) !?T {
+            self.lock();
+            defer self.unlock();
+            return @field(self.stores, entityFieldName(T)).load(key);
+        }
+
+        /// Manual guard for multi-key snapshots; prefer `read` for single keys.
         pub fn lock(self: *Self) void {
             self._lock.lock();
         }
@@ -586,16 +590,13 @@ pub fn init(
             try ctx.commitCycle();
         }
     }
-    // init never enters the live loop — it returns a caught-up Context.
-    // run() drives the loop inline (blocking); spawn() runs it on a background
-    // thread. Both reuse followLoop below.
+    // init never enters the live loop; run/spawn drive followLoop below.
     return ctx;
 }
 
-/// The live follow loop body: set up the Multicall (if a node RPC is
-/// configured) and run `live.run` until stop/error. Used inline by `run`
-/// (blocking) and on a thread by `spawn`. The transport/provider/multicall
-/// live on this frame, so they stay valid for the loop's whole lifetime.
+/// Live loop body: set up the Multicall (when a node RPC is configured) and run
+/// `live.run` until stop/error. Inline under `run`, on a thread under `spawn`;
+/// the multicall stays on this frame for the loop's lifetime.
 fn followLoop(
     comptime m: sdk_manifest.Manifest,
     comptime Handler: type,
@@ -617,11 +618,10 @@ fn followLoop(
     }
 }
 
-/// Backfill, then run the live loop on a **background thread** and return the
-/// caught-up `*Context`. The caller stands up an in-process API and reads the
-/// stores under `ctx.lock()` — tip-fresh, reorg-aware. `ctx.deinit()` signals
-/// the thread to stop and joins it. The follow loop forces `follow = true` so
-/// `init` performs the gap-fill before the thread starts.
+/// Backfill, then run the live loop on a background thread and return the
+/// caught-up `*Context` for in-process reads (`ctx.read` / `ctx.lock`).
+/// `deinit` stops + joins the thread. Forces `follow = true` so `init`
+/// gap-fills before the thread starts.
 pub fn spawn(
     comptime m: sdk_manifest.Manifest,
     comptime Handler: type,
@@ -1194,6 +1194,71 @@ test "spawn: follows on a background thread, reads under lock, deinit joins" {
         const alice = (try ctx.stores.accounts.load(ALICE)) orelse return error.MissingAlice;
         try testing.expectEqual(@as(u256, 150), alice.balance);
     }
+    try testing.expectEqual(@as(?anyerror, null), ctx.followError());
+}
+
+fn pollBalance(ctx: anytype, key: [20]u8, want: u256, max_ms: u32) !void {
+    var waited: u32 = 0;
+    while (waited <= max_ms) : (waited += 20) {
+        if (try ctx.read(Account, key)) |a| if (a.balance == want) return;
+        std.Thread.sleep(20 * std.time.ns_per_ms);
+    }
+    return error.TipNotObserved;
+}
+
+test "spawn: follow thread dispatches a live pending block + reorg; reader sees the tip" {
+    const allocator = testing.allocator;
+    const fake_engine = @import("testing/fake_engine.zig");
+    const ALICE: [20]u8 = [_]u8{0xA1} ** 20;
+
+    // Backfill two finalized mints → alice = 150.
+    var data_bufs: [2][32]u8 = undefined;
+    const b100 = makeTransferLog(100, 0, [_]u8{0} ** 20, ALICE, 100, &data_bufs[0]);
+    const b101 = makeTransferLog(101, 0, [_]u8{0} ** 20, ALICE, 50, &data_bufs[1]);
+    var src_tmp = testing.tmpDir(.{});
+    defer src_tmp.cleanup();
+    const blocks = [_][]const core.RawLog{ &.{b100}, &.{b101} };
+    try writeFlatStoreFromLogs(src_tmp.dir, &blocks, allocator);
+    var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
+
+    var data_tmp = testing.tmpDir(.{});
+    defer data_tmp.cleanup();
+    var data_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_path = try data_tmp.dir.realpath(".", &data_path_buf);
+
+    const Manifest: sdk_manifest.Manifest = .{
+        .name = "erc20",
+        .chain_id = 1,
+        .start_block = 0,
+        .contracts = &.{.{ .name = "T", .address = ADDR_TOKEN, .events = &.{Transfer} }},
+    };
+
+    const ctx = try spawn(
+        Manifest,
+        TransferHandler,
+        .{Account},
+        .{ .engine_data_dir = src_path, .data_dir = data_path, .commit_interval = 100_000 },
+        allocator,
+    );
+    defer ctx.deinit(); // joins the follow thread before the dirs below are removed
+
+    var fake = fake_engine.FakeEngine.init(src_tmp.dir, allocator);
+    fake.last_finalized = 101; // keep meta consistent with the backfilled flat store
+    defer fake.deinit();
+
+    // Pending block 102 mints +25 to alice; the follow thread must dispatch it
+    // into the overlay so a reader sees the tip value 175.
+    var pbuf: [32]u8 = undefined;
+    try fake.ingest(102, [_]u8{0xAA} ** 32, &.{makeTransferLog(102, 0, [_]u8{0} ** 20, ALICE, 25, &pbuf)});
+    try pollBalance(ctx, ALICE, 175, 5000);
+
+    // Reorg 102 to a version minting +99; the reader must converge to 249.
+    try fake.reorg(102);
+    var pbuf2: [32]u8 = undefined;
+    try fake.ingest(102, [_]u8{0xBB} ** 32, &.{makeTransferLog(102, 0, [_]u8{0} ** 20, ALICE, 99, &pbuf2)});
+    try pollBalance(ctx, ALICE, 249, 5000);
+
     try testing.expectEqual(@as(?anyerror, null), ctx.followError());
 }
 
