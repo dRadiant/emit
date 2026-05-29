@@ -234,6 +234,13 @@ const LiveSession = struct {
     ) !void {
         try self.watcher.wait(timeout_ms);
 
+        // Hold the Context lock for the mutation body only — never across the
+        // wait above (that would block API readers for up to timeout_ms). The
+        // unlock defer is registered first, so it runs last (after curr /
+        // classification cleanup).
+        lockCtx(ctx);
+        defer unlockCtx(ctx);
+
         var curr = try readPending(self.allocator, self.engine_data_dir);
         errdefer curr.deinit(self.allocator);
 
@@ -431,9 +438,30 @@ pub fn run(
     session.multicall = options.multicall;
     session.multicall_batch_size = options.multicall_batch_size;
 
-    while (true) {
+    while (!stopRequested(ctx)) {
         try session.tick(m, Handler, ctx, options.tick_timeout_ms);
     }
+}
+
+/// `spawn` runs this loop on a background thread; `deinit` sets `_stop` and the
+/// loop exits within one `tick` (bounded by `tick_timeout_ms`). Counter-shaped
+/// test contexts have no `_stop` field and never stop here (tests drive `tick`
+/// directly).
+fn stopRequested(ctx: anytype) bool {
+    const T = std.meta.Child(@TypeOf(ctx));
+    if (comptime @hasField(T, "_stop")) return ctx._stop.load(.seq_cst);
+    return false;
+}
+
+/// The Context mutex guards every store mutation in a `tick` against in-process
+/// API readers. Comptime no-op for test contexts without a `_lock` field.
+fn lockCtx(ctx: anytype) void {
+    const T = std.meta.Child(@TypeOf(ctx));
+    if (comptime @hasField(T, "_lock")) ctx._lock.lock();
+}
+fn unlockCtx(ctx: anytype) void {
+    const T = std.meta.Child(@TypeOf(ctx));
+    if (comptime @hasField(T, "_lock")) ctx._lock.unlock();
 }
 
 /// Flip `live = true` on every entity store. Saves from this point go

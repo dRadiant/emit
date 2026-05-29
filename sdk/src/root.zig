@@ -44,6 +44,7 @@ pub const Options = entry.Options;
 pub const PrefetchCall = manifest.PrefetchCall;
 pub const PrefetchDef = manifest.PrefetchDef;
 pub const run = entry.run;
+pub const spawn = entry.spawn;
 pub const RunStats = entry.RunStats;
 pub const StaticCall = manifest.StaticCall;
 

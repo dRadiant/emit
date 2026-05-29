@@ -8,9 +8,12 @@
 ///
 /// Phases 1-3 are skipped when an existing filter env is present (the
 /// handler-only re-run path). Phase 4 is skipped when the manifest declares
-/// no prefetch. `run` performs the full backfill and tears down the context.
-/// `init` performs the same backfill but returns a live `Context` whose
-/// entity stores stay open so the caller (e.g. an HTTP server) can read.
+/// no prefetch. Three entry points share the pipeline:
+///   `init`  — backfill, return a caught-up `Context` (does not follow).
+///   `run`   — backfill, then (if `follow`) run the live loop inline, blocking.
+///   `spawn` — backfill, then run the live loop on a background thread and
+///             return the `Context`, so an in-process API can read the stores
+///             under `ctx.lock()` (tip-fresh, reorg-aware).
 const std = @import("std");
 
 const core = @import("core");
@@ -126,8 +129,40 @@ pub fn Context(comptime entities: anytype) type {
         /// child logs pass the address gate alongside statically declared
         /// contracts. Owned by the Context; freed in `deinit`.
         _child_addresses: ?*std.AutoHashMap([20]u8, void) = null,
+        /// Coarse Context-level lock shared by the follow thread (writer, per
+        /// dispatch/commit/reorg cycle) and in-process API readers (per query).
+        /// Serializing reads keeps the caching `MutableStore.load` safe to reuse.
+        /// Stores stay lock-agnostic; this is taken once per tick / query.
+        _lock: std.Thread.Mutex = .{},
+        /// Set when `spawn` runs the live loop on a background thread; null for
+        /// `run`/`init`. `deinit` signals `_stop` and joins it.
+        _follow_thread: ?std.Thread = null,
+        _stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        /// First error the follow thread hit before exiting (e.g. a reorg
+        /// deeper than finality). Readers surface it via `followError`.
+        _follow_error: ?anyerror = null,
+
+        /// Reader guard for in-process API queries. Hold only across the
+        /// in-memory read, then release before serializing / I/O.
+        pub fn lock(self: *Self) void {
+            self._lock.lock();
+        }
+        pub fn unlock(self: *Self) void {
+            self._lock.unlock();
+        }
+        /// Non-null once the follow thread has exited on an error.
+        pub fn followError(self: *Self) ?anyerror {
+            self.lock();
+            defer self.unlock();
+            return self._follow_error;
+        }
 
         pub fn deinit(self: *Self) void {
+            if (self._follow_thread) |t| {
+                self._stop.store(true, .seq_cst);
+                t.join();
+                self._follow_thread = null;
+            }
             inline for (std.meta.fields(Stores)) |f| {
                 var s = &@field(self.stores, f.name);
                 s.deinit();
@@ -296,9 +331,11 @@ pub fn run(
     allocator: std.mem.Allocator,
 ) !RunStats {
     const ctx = try init(m, Handler, entities, options, allocator);
-    const stats = ctx.stats;
-    ctx.deinit();
-    return stats;
+    defer ctx.deinit();
+    // Headless follow: run the live loop inline on this thread (blocks forever
+    // under normal operation). Backfill-only (`follow = false`) returns stats.
+    if (options.follow) try followLoop(m, Handler, ctx, options);
+    return ctx.stats;
 }
 
 /// Backfill to completion and return the live `Context`. Caller owns the
@@ -548,25 +585,67 @@ pub fn init(
             });
             try ctx.commitCycle();
         }
-
-        // Live-mode Multicall lives for the whole follow loop (never
-        // returns under normal operation), so the transport + provider +
-        // multicall sit on this stack frame and stay valid.
-        if (options.node_rpc) |rpc_url| {
-            var http = eth.http_transport.HttpTransport.init(allocator, rpc_url);
-            var provider = eth.provider.Provider.init(allocator, &http);
-            var mc = eth.multicall.Multicall.init(allocator, &provider, options.multicall_address);
-            defer mc.deinit();
-            try live.run(m, Handler, ctx, .{
-                .engine_data_dir = options.engine_data_dir,
-                .multicall = &mc,
-                .multicall_batch_size = options.multicall_batch_size,
-            });
-        } else {
-            try live.run(m, Handler, ctx, .{ .engine_data_dir = options.engine_data_dir });
-        }
-        unreachable;
     }
+    // init never enters the live loop — it returns a caught-up Context.
+    // run() drives the loop inline (blocking); spawn() runs it on a background
+    // thread. Both reuse followLoop below.
+    return ctx;
+}
+
+/// The live follow loop body: set up the Multicall (if a node RPC is
+/// configured) and run `live.run` until stop/error. Used inline by `run`
+/// (blocking) and on a thread by `spawn`. The transport/provider/multicall
+/// live on this frame, so they stay valid for the loop's whole lifetime.
+fn followLoop(
+    comptime m: sdk_manifest.Manifest,
+    comptime Handler: type,
+    ctx: anytype,
+    options: Options,
+) !void {
+    if (options.node_rpc) |rpc_url| {
+        var http = eth.http_transport.HttpTransport.init(ctx._allocator, rpc_url);
+        var provider = eth.provider.Provider.init(ctx._allocator, &http);
+        var mc = eth.multicall.Multicall.init(ctx._allocator, &provider, options.multicall_address);
+        defer mc.deinit();
+        try live.run(m, Handler, ctx, .{
+            .engine_data_dir = options.engine_data_dir,
+            .multicall = &mc,
+            .multicall_batch_size = options.multicall_batch_size,
+        });
+    } else {
+        try live.run(m, Handler, ctx, .{ .engine_data_dir = options.engine_data_dir });
+    }
+}
+
+/// Backfill, then run the live loop on a **background thread** and return the
+/// caught-up `*Context`. The caller stands up an in-process API and reads the
+/// stores under `ctx.lock()` — tip-fresh, reorg-aware. `ctx.deinit()` signals
+/// the thread to stop and joins it. The follow loop forces `follow = true` so
+/// `init` performs the gap-fill before the thread starts.
+pub fn spawn(
+    comptime m: sdk_manifest.Manifest,
+    comptime Handler: type,
+    comptime entities: anytype,
+    options: Options,
+    allocator: std.mem.Allocator,
+) !*Context(entities) {
+    var opts = options;
+    opts.follow = true;
+    const ctx = try init(m, Handler, entities, opts, allocator);
+    errdefer ctx.deinit();
+
+    const Ctx = Context(entities);
+    const Thunk = struct {
+        fn entry(c: *Ctx, o: Options) void {
+            followLoop(m, Handler, c, o) catch |e| {
+                c.lock();
+                c._follow_error = e;
+                c.unlock();
+            };
+        }
+    };
+    ctx._stop.store(false, .seq_cst);
+    ctx._follow_thread = try std.Thread.spawn(.{}, Thunk.entry, .{ ctx, opts });
     return ctx;
 }
 
@@ -1066,6 +1145,56 @@ test "init: backfills planted Transfers and final balances match" {
     try testing.expectEqual(@as(u64, 90), alice.balance);
     try testing.expectEqual(@as(u64, 30), bob.balance);
     try testing.expectEqual(@as(u64, 30), carl.balance);
+}
+
+test "spawn: follows on a background thread, reads under lock, deinit joins" {
+    const allocator = testing.allocator;
+    const ALICE: [20]u8 = [_]u8{0xA1} ** 20;
+
+    // Two finalized mints to alice (100 + 50). No pending.bin, so the follow
+    // thread ticks on an empty ring and idles — we're exercising spawn's
+    // thread lifecycle + locked reads + deinit join, not live dispatch (which
+    // the live.zig tick tests already cover).
+    var data_bufs: [2][32]u8 = undefined;
+    const log_b100 = makeTransferLog(100, 0, [_]u8{0} ** 20, ALICE, 100, &data_bufs[0]);
+    const log_b101 = makeTransferLog(101, 0, [_]u8{0} ** 20, ALICE, 50, &data_bufs[1]);
+
+    var src_tmp = testing.tmpDir(.{});
+    defer src_tmp.cleanup();
+    const blocks = [_][]const core.RawLog{ &.{log_b100}, &.{log_b101} };
+    try writeFlatStoreFromLogs(src_tmp.dir, &blocks, allocator);
+    var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
+
+    var data_tmp = testing.tmpDir(.{});
+    defer data_tmp.cleanup();
+    var data_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_path = try data_tmp.dir.realpath(".", &data_path_buf);
+
+    const Manifest: sdk_manifest.Manifest = .{
+        .name = "erc20",
+        .chain_id = 1,
+        .start_block = 0,
+        .contracts = &.{.{ .name = "T", .address = ADDR_TOKEN, .events = &.{Transfer} }},
+    };
+
+    const ctx = try spawn(
+        Manifest,
+        TransferHandler,
+        .{Account},
+        .{ .engine_data_dir = src_path, .data_dir = data_path, .commit_interval = 100_000 },
+        allocator,
+    );
+    defer ctx.deinit(); // sets _stop + joins the follow thread; hangs the test if join fails
+
+    try testing.expect(ctx._follow_thread != null);
+    {
+        ctx.lock();
+        defer ctx.unlock();
+        const alice = (try ctx.stores.accounts.load(ALICE)) orelse return error.MissingAlice;
+        try testing.expectEqual(@as(u256, 150), alice.balance);
+    }
+    try testing.expectEqual(@as(?anyerror, null), ctx.followError());
 }
 
 test "run: returns stats and tears down without leaking" {
