@@ -74,7 +74,7 @@ EMIT is designed to run on modest hardware. The minimum requirements are 2 TB of
 
 Below is listed the measured benchmarks from EMIT deployed on varying Hetzner dedicated server configurations.
 
-$40/month Hetzner dedicated server (i7-8700, 64GB DDR4, 2x 1TB Gen3 NVMe + Software RAID0):
+$50/month Hetzner dedicated server (i7-8700, 64GB DDR4, 2x 1TB Gen3 NVMe + Software RAID0):
 
 **Operations**
 

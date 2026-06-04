@@ -4,6 +4,20 @@ All notable changes to EMIT are documented here.
 
 EMIT follows semantic versioning. Major bumps (1.x → 2.x) signal breaking changes. Minor bumps (1.0 → 1.1) add features in a backward-compatible way, but may contain breaking changes. Patch bumps (1.0.0 → 1.0.1) are bug fixes only.
 
+## EMIT 1.1.0 (unreleased)
+
+### SDK
+
+- Symmetric in-process reads: the `Context` returned by `sdk.spawn`/`init` can now read both store kinds, so an in-process API serves the live, tip-inclusive, reorg-aware state. `Context.read(T, key)` does a point read for either kind — a `MutableStore`'s tip-fresh state, or an `ImmutableStore`'s live log (finalized records plus the pending overlay). Previously only mutable point reads were exposed; immutable stores were unreadable in-process despite the overlay living in memory.
+- `ImmutableStore(T)` gains overlay-aware ordered reads — `count()`, `get(key)`, and `range(start, out)` — surfaced on the Context as `Context.count(T)` and `Context.range(T, start, out)`. `range` orders the bounded overlay once per call (not per record) and spans the finalized log and the live overlay; build a newest-first page with `start = count(T) - n`. These are native to the append-only log; `Context.count`/`range` are a compile error for mutable entities, which are point-read by key via `read`.
+- `Context.cursor()` returns the highest fully-dispatched (committed) block for an honest health/progress readout.
+- `sdk.EventId` is the canonical (un)packer for the 16-byte event key: `EventId.unpack(id)` decodes a stored key into `(block_number, tx_index, log_index)`, and `EventId{ ... }.pack()` builds a key from components. `log.eventId()` is now defined as `EventId{ ... }.pack()`, so encode and decode live in one type.
+- All read accessors take the Context mutex internally, so API code never manages the lock. They must not be called from handlers, which already hold it.
+
+### Examples
+
+- New `examples/erc20-api`: the rETH indexer served over HTTP from the same process via `sdk.spawn` + the Context read surface, using [http.zig](https://github.com/karlseguin/http.zig) (pinned to its `zig-0.15` branch). `GET /account/:addr`, `/allowance/:owner/:spender`, `/transfers?limit=&offset=` (paginated, newest-first), and `/health` (cursor + liveness). The worked demonstration of EMIT's in-process serving model.
+
 ## EMIT 1.0.0
 
 Released: 2026-05-29

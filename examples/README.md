@@ -5,6 +5,7 @@ Reference indexers built on [emit-sdk](../sdk/README.md). Each lives in its own 
 | Example | Contracts indexed | Entities | Demonstrates |
 |---|---|---|---|
 | [erc20](erc20/README.md) | rETH (single ERC20, retargetable) | `Account`, `Allowance`, `Transfer`, `Approval` | Mutable + immutable stores, single-address indexing |
+| [erc20-api](erc20-api/README.md) | rETH (same as erc20) | `Account`, `Allowance`, `Transfer`, `Approval` | In-process HTTP serving via `sdk.spawn` + the Context read surface (`read`/`count`/`range`/`cursor`), http.zig |
 | [uniswap-v2](uniswap-v2/README.md) | Uniswap V2 factory + every spawned pair | `Pair`, `SwapEvent` | Factory pre-pass, static + dynamic prefetch, Multicall3 batching |
 
 Shared CLI scaffolding lives in [`utils/cli.zig`](utils/cli.zig) so every example reuses the same `--engine-data-dir`, `--data-dir`, `--node-rpc`, `--follow` flag parsing.
