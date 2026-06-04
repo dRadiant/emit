@@ -23,10 +23,13 @@ pub fn ImmutableStore(comptime T: type) type {
 
     const KEY_SIZE = entity_serial.fixedSize(fields[0].type, @typeName(T) ++ "." ++ fields[0].name);
     const VALUE_SIZE = entity_serial.entitySize(T);
+    const KeyField = fields[0].type;
+    const key_field_name = fields[0].name;
 
     return struct {
         const Self = @This();
         pub const Entity = T;
+        pub const Key = KeyField;
         pub const Log = event_log_mod.EventLog(T);
         pub const key_size = KEY_SIZE;
         pub const value_size = VALUE_SIZE;
@@ -145,6 +148,107 @@ pub fn ImmutableStore(comptime T: type) type {
             var it = self.block_pending.iterator();
             while (it.next()) |entry| total += @intCast(entry.value_ptr.items.len);
             return total;
+        }
+
+        // ── In-process read surface ────────────────────────────────────────
+        // Overlay-aware so an API reader sees the live tip.
+        // Callers take the Context lock
+        // Reader never straddles a commit, so `committed_count`
+        // and the overlay are mutually consistent
+
+        /// Live record count: finalized records plus the live overlay.
+        pub fn count(self: *const Self) u64 {
+            return self.committed_count + self.pendingCount();
+        }
+
+        /// Point lookup by primary key. Binary-searches the finalized log,
+        /// then scans the live overlay. Null when absent.
+        pub fn get(self: *Self, key: KeyField) !?T {
+            var target: [KEY_SIZE]u8 = undefined;
+            entity_serial.encodeKey(KeyField, key, &target);
+            if (try self.log.binarySearch(self.committed_count, target)) |idx| {
+                return try self.log.read(idx);
+            }
+            return self.overlayGet(&target);
+        }
+
+        /// Fill `out` with up to `out.len` records starting at logical index
+        /// `start` (0 = oldest) in ascending key order, returning the filled
+        /// prefix. Spans the finalized log then the live overlay. The overlay
+        /// is collected and sorted once per call (bounded by the pending-ring
+        /// depth), so a page costs one sort, not one per record. Build a
+        /// newest-first page with `start = count() - n`.
+        pub fn range(self: *Self, start: u64, out: []T) ![]T {
+            const total = self.count();
+            if (start >= total or out.len == 0) return out[0..0];
+            const end = @min(start + out.len, total);
+
+            var n: usize = 0;
+            var i = start;
+            while (i < end and i < self.committed_count) : (i += 1) {
+                out[n] = try self.log.read(i);
+                n += 1;
+            }
+            if (i >= end) return out[0..n];
+
+            // The window reaches the overlay: sort it once, then index in.
+            const tmp = try self.allocator.alloc(T, self.pendingCount());
+            defer self.allocator.free(tmp);
+            const ordered = self.collectOverlaySorted(tmp);
+            var j: usize = @intCast(i - self.committed_count);
+            while (i < end) : (i += 1) {
+                out[n] = ordered[j];
+                n += 1;
+                j += 1;
+            }
+            return out[0..n];
+        }
+
+        /// Scan the live overlay (drained-append queue, then per-block buffers)
+        /// for a record whose key matches `target`. Keys are unique, so the
+        /// first match wins.
+        fn overlayGet(self: *Self, target: *const [KEY_SIZE]u8) ?T {
+            for (self.pending_appended.items) |e| {
+                if (keyMatches(e, target)) return e;
+            }
+            var it = self.block_pending.valueIterator();
+            while (it.next()) |list| {
+                for (list.items) |e| if (keyMatches(e, target)) return e;
+            }
+            return null;
+        }
+
+        /// Copy every overlay record into `tmp` and sort ascending by key.
+        /// `tmp.len` must equal `pendingCount()`. Returns the filled slice.
+        fn collectOverlaySorted(self: *Self, tmp: []T) []T {
+            var idx: usize = 0;
+            for (self.pending_appended.items) |e| {
+                tmp[idx] = e;
+                idx += 1;
+            }
+            var it = self.block_pending.valueIterator();
+            while (it.next()) |list| {
+                for (list.items) |e| {
+                    tmp[idx] = e;
+                    idx += 1;
+                }
+            }
+            std.sort.pdq(T, tmp[0..idx], {}, lessThanByKey);
+            return tmp[0..idx];
+        }
+
+        fn keyMatches(entity: T, target: *const [KEY_SIZE]u8) bool {
+            var kb: [KEY_SIZE]u8 = undefined;
+            entity_serial.encodeKey(KeyField, @field(entity, key_field_name), &kb);
+            return std.mem.eql(u8, &kb, target);
+        }
+
+        fn lessThanByKey(_: void, a: T, b: T) bool {
+            var ka: [KEY_SIZE]u8 = undefined;
+            var kb: [KEY_SIZE]u8 = undefined;
+            entity_serial.encodeKey(KeyField, @field(a, key_field_name), &ka);
+            entity_serial.encodeKey(KeyField, @field(b, key_field_name), &kb);
+            return std.mem.order(u8, &ka, &kb) == .lt;
         }
     };
 }
@@ -301,4 +405,60 @@ test "open against an existing log anchors last_key for monotonic checks" {
     defer store.deinit();
     try testing.expectError(error.KeyOutOfOrder, store.save(.{ .id = idKey(10, 1), .value = 999 }));
     try store.save(.{ .id = idKey(11, 0), .value = 3 });
+}
+
+test "count, get, range span the finalized log and the live overlay" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var log = try event_log_mod.EventLog(E).open(testing.allocator, tmp.dir, "ev.events.dat");
+    defer log.deinit();
+
+    var store = try ImmutableStore(E).open(testing.allocator, &log, 0);
+    defer store.deinit();
+
+    // Two finalized records via a backfill lifecycle.
+    try store.save(.{ .id = idKey(1, 0), .value = 10 });
+    try store.save(.{ .id = idKey(1, 1), .value = 11 });
+    try store.flushAppends();
+    store.markCommitted();
+    try testing.expectEqual(@as(u64, 2), store.committed_count);
+
+    // Two more in the live per-block overlay (not yet finalized).
+    store.live = true;
+    store.live_block = 2;
+    try store.save(.{ .id = idKey(2, 0), .value = 20 });
+    store.live_block = 3;
+    try store.save(.{ .id = idKey(3, 0), .value = 30 });
+
+    // count spans both regions.
+    try testing.expectEqual(@as(u64, 4), store.count());
+
+    // get hits the finalized log, the live overlay, and misses cleanly.
+    try testing.expectEqual(@as(u64, 11), (try store.get(idKey(1, 1))).?.value);
+    try testing.expectEqual(@as(u64, 30), (try store.get(idKey(3, 0))).?.value);
+    try testing.expectEqual(@as(?E, null), try store.get(idKey(9, 9)));
+
+    // range over the whole store, ascending across the durable/overlay seam.
+    var buf: [8]E = undefined;
+    const all = try store.range(0, &buf);
+    try testing.expectEqual(@as(usize, 4), all.len);
+    try testing.expectEqual(@as(u64, 10), all[0].value);
+    try testing.expectEqual(@as(u64, 11), all[1].value);
+    try testing.expectEqual(@as(u64, 20), all[2].value);
+    try testing.expectEqual(@as(u64, 30), all[3].value);
+
+    // A window that begins inside the overlay region only.
+    const tail = try store.range(2, buf[0..2]);
+    try testing.expectEqual(@as(usize, 2), tail.len);
+    try testing.expectEqual(@as(u64, 20), tail[0].value);
+    try testing.expectEqual(@as(u64, 30), tail[1].value);
+
+    // Newest-first page of size 2 (start = count - 2); caller reverses.
+    const page = try store.range(store.count() - 2, buf[0..2]);
+    try testing.expectEqual(@as(u64, 20), page[0].value);
+    try testing.expectEqual(@as(u64, 30), page[1].value);
+
+    // Out-of-range start yields an empty slice.
+    try testing.expectEqual(@as(usize, 0), (try store.range(99, &buf)).len);
 }

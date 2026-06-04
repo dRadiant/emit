@@ -139,12 +139,37 @@ pub fn Context(comptime entities: anytype) type {
         _follow_error: ?anyerror = null,
 
         /// Locked point read for in-process API callers — a value copy of
-        /// mutable entity `T` for `key`. Not for handlers: they already run
-        /// under the loop's lock, so `read` there would deadlock.
+        /// entity `T` for `key`: the mutable store's tip-fresh state, or the
+        /// immutable store's live log (finalized records plus the overlay). Not
+        /// for handlers: they already run under the loop's lock, so a read here
+        /// would deadlock.
         pub fn read(self: *Self, comptime T: type, key: anytype) !?T {
             self.lock();
             defer self.unlock();
-            return @field(self.stores, entityFieldName(T)).load(key);
+            const store = &@field(self.stores, entityFieldName(T));
+            if (comptime T.storage == .immutable) return store.get(key);
+            return store.load(key);
+        }
+
+        /// Live record count of immutable entity `T` (finalized + overlay).
+        /// Locked. Mutable entities are point-read by key via `read`.
+        pub fn count(self: *Self, comptime T: type) u64 {
+            comptime assertImmutable(T, "count");
+            self.lock();
+            defer self.unlock();
+            return @field(self.stores, entityFieldName(T)).count();
+        }
+
+        /// Fill `out` with immutable records [start, start+out.len) of entity
+        /// `T` in ascending key order, returning the filled prefix. Tip-overlay
+        /// aware and taken under the Context lock, so callers never lock
+        /// directly. Build a newest-first page with `start = count(T) - n`.
+        /// Mutable entities are point-read by key via `read`.
+        pub fn range(self: *Self, comptime T: type, start: u64, out: []T) ![]T {
+            comptime assertImmutable(T, "range");
+            self.lock();
+            defer self.unlock();
+            return @field(self.stores, entityFieldName(T)).range(start, out);
         }
 
         /// Manual guard for multi-key snapshots; prefer `read` for single keys.
@@ -159,6 +184,14 @@ pub fn Context(comptime entities: anytype) type {
             self.lock();
             defer self.unlock();
             return self._follow_error;
+        }
+
+        /// Last fully-dispatched block — the indexer's cursor, for an honest
+        /// health/progress readout. Locked. Not for handlers.
+        pub fn cursor(self: *Self) u64 {
+            self.lock();
+            defer self.unlock();
+            return self._last_dispatched_block;
         }
 
         pub fn deinit(self: *Self) void {
@@ -844,6 +877,17 @@ fn resolveEntities(comptime entities: anytype) []const type {
     );
 }
 
+/// Compile-time guard for the immutable-only Context reads (`count`, `range`).
+/// Mutable entities are point-read by key via `read`; iterating them would
+/// mean a union+dedup over the slab, cache, and overlays, a different and
+/// unbuilt read shape.
+fn assertImmutable(comptime T: type, comptime who: []const u8) void {
+    if (T.storage != .immutable) @compileError(
+        "Context." ++ who ++ "(): '" ++ @typeName(T) ++ "' is a mutable entity. " ++
+            who ++ "() serves immutable event-log entities; use read() for keyed state.",
+    );
+}
+
 fn entityFieldName(comptime T: type) [:0]const u8 {
     return comptime blk: {
         @setEvalBranchQuota(20_000);
@@ -1145,6 +1189,88 @@ test "init: backfills planted Transfers and final balances match" {
     try testing.expectEqual(@as(u64, 90), alice.balance);
     try testing.expectEqual(@as(u64, 30), bob.balance);
     try testing.expectEqual(@as(u64, 30), carl.balance);
+}
+
+test "Context read/count/range/cursor over an immutable store after backfill" {
+    const allocator = testing.allocator;
+    const ALICE: [20]u8 = [_]u8{0xA1} ** 20;
+    const BOB: [20]u8 = [_]u8{0xB2} ** 20;
+    const CARL: [20]u8 = [_]u8{0xC3} ** 20;
+
+    // Immutable event entity plus a handler that records one per Transfer.
+    const XferEvent = struct {
+        pub const storage: root.StorageMode = .immutable;
+        id: [16]u8,
+        to: [20]u8,
+        value: u64,
+    };
+    const XferHandler = struct {
+        pub fn handleTransfer(log: @import("handler.zig").Log(Transfer), ctx: anytype) !void {
+            const to = log.topics[2][12..32].*;
+            const value: u64 = std.mem.readInt(u64, log.data[24..32], .big);
+            try ctx.stores.xferEvents.save(.{ .id = log.eventId(), .to = to, .value = value });
+        }
+    };
+
+    // Three transfers across three blocks -> monotonic immutable ids.
+    var data_bufs: [3][32]u8 = undefined;
+    const blocks = [_][]const core.RawLog{
+        &.{makeTransferLog(100, 0, [_]u8{0} ** 20, ALICE, 100, &data_bufs[0])},
+        &.{makeTransferLog(101, 0, [_]u8{0} ** 20, BOB, 200, &data_bufs[1])},
+        &.{makeTransferLog(102, 0, [_]u8{0} ** 20, CARL, 300, &data_bufs[2])},
+    };
+
+    var src_tmp = testing.tmpDir(.{});
+    defer src_tmp.cleanup();
+    try writeFlatStoreFromLogs(src_tmp.dir, &blocks, allocator);
+    var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
+
+    var data_tmp = testing.tmpDir(.{});
+    defer data_tmp.cleanup();
+    var data_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_path = try data_tmp.dir.realpath(".", &data_path_buf);
+
+    const Manifest: sdk_manifest.Manifest = .{
+        .name = "erc20",
+        .chain_id = 1,
+        .start_block = 0,
+        .contracts = &.{.{ .name = "T", .address = ADDR_TOKEN, .events = &.{Transfer} }},
+    };
+
+    const ctx = try init(
+        Manifest,
+        XferHandler,
+        .{XferEvent},
+        .{ .engine_data_dir = src_path, .data_dir = data_path, .commit_interval = 100_000 },
+        allocator,
+    );
+    defer ctx.deinit();
+
+    // count spans the finalized log; cursor is the last dispatched block.
+    try testing.expectEqual(@as(u64, 3), ctx.count(XferEvent));
+    try testing.expectEqual(@as(u64, 102), ctx.cursor());
+
+    // range over the whole store, ascending by id (block order).
+    var buf: [8]XferEvent = undefined;
+    const all = try ctx.range(XferEvent, 0, &buf);
+    try testing.expectEqual(@as(usize, 3), all.len);
+    try testing.expectEqual(@as(u64, 100), all[0].value);
+    try testing.expectEqualSlices(u8, &ALICE, &all[0].to);
+    try testing.expectEqual(@as(u64, 300), all[2].value);
+    try testing.expectEqualSlices(u8, &CARL, &all[2].to);
+
+    // Newest-first page of size 2 (start = count - 2); the caller reverses.
+    // Its own buffer so the `all` slice above (aliasing `buf`) stays valid.
+    var page_buf: [2]XferEvent = undefined;
+    const page = try ctx.range(XferEvent, ctx.count(XferEvent) - 2, &page_buf);
+    try testing.expectEqual(@as(u64, 200), page[0].value);
+    try testing.expectEqual(@as(u64, 300), page[1].value);
+
+    // read by key round-trips the middle record.
+    const got = (try ctx.read(XferEvent, all[1].id)) orelse return error.MissingMid;
+    try testing.expectEqual(@as(u64, 200), got.value);
+    try testing.expectEqualSlices(u8, &BOB, &got.to);
 }
 
 test "spawn: follows on a background thread, reads under lock, deinit joins" {

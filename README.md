@@ -108,7 +108,7 @@ $170/month Hetzner dedicated server (i9-13900, 128GB DDR5 ECC, 2x 2TB Gen4 U.2 N
 
 **v1.0.0, pre-release.** EMIT is not yet fully production ready, and is still under active development. Use at your own risk, and expect breaking changes.
 
-**Remote engine TCP streaming, transaction traces, variable-length entity fields, and array/tuple ABI types ship in v1.1.0** We also plan to support direct import paths from more nodes and seamlessly handle more chains in the future.
+**v1.1.0 ships remote engine TCP streaming** (remote indexers, no collocation), a production RPC import path (direct import for L2s and L1 operators without a local node), array/tuple ABI types, and a full indexer example with a REST API. Transaction traces and variable-length entity fields follow in v1.2; seamless multi-chain handling is on the longer-term roadmap.
 
 ## Packages
 
