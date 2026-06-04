@@ -122,23 +122,52 @@ pub const DecodedLog = struct {
         return out;
     }
 
-    /// Canonical 16-byte event id: `block_number(BE u64) ++ tx_index(BE u32) ++ log_index(BE u32)`.
-    /// Big-endian so the events.dat append order matches dispatch order,
-    /// satisfying `ImmutableStore.save`'s monotonic-key invariant. The same
-    /// construction underpins envio's `${block.number}-${logIndex}` string
-    /// id without the runtime concat.
+    /// Canonical 16-byte event id. Equivalent to `EventId.pack` over this
+    /// log's `(block_number, tx_index, log_index)`. See `EventId` for the byte
+    /// layout and the inverse `unpack`.
     pub fn eventId(self: DecodedLog) [16]u8 {
-        return encodeEventId(self.block_number, self.tx_index, self.log_index);
+        return (EventId{
+            .block_number = self.block_number,
+            .tx_index = self.tx_index,
+            .log_index = self.log_index,
+        }).pack();
     }
 };
 
-fn encodeEventId(block_number: u64, tx_index: u16, log_index: u16) [16]u8 {
-    var id: [16]u8 = undefined;
-    std.mem.writeInt(u64, id[0..8], block_number, .big);
-    std.mem.writeInt(u32, id[8..12], tx_index, .big);
-    std.mem.writeInt(u32, id[12..16], log_index, .big);
-    return id;
-}
+/// Structured view of an event's 16-byte storage key. `pack` and `unpack` are
+/// inverses, so `EventId.unpack(log.eventId())` round-trips. The packed form is
+/// big-endian, so byte-order sort equals chronological `(block, tx, log)` order
+/// — that is what lets `ImmutableStore.save` append in monotonic-key order. It
+/// is the binary equivalent of envio's `${block.number}-${logIndex}` string id
+/// without the runtime concat.
+///
+/// `pack` also builds a key from components, which makes the immutable by-key
+/// read usable: `ctx.read(MyEvent, (EventId{ ... }).pack())`.
+///
+/// Layout: `block_number(BE u64) ++ tx_index(BE u32) ++ log_index(BE u32)`.
+/// A log's `tx_index`/`log_index` are u16-ranged at the source and widen into
+/// the u32 fields, so the top 16 bits of each are always zero.
+pub const EventId = struct {
+    block_number: u64,
+    tx_index: u32,
+    log_index: u32,
+
+    pub fn pack(self: EventId) [16]u8 {
+        var id: [16]u8 = undefined;
+        std.mem.writeInt(u64, id[0..8], self.block_number, .big);
+        std.mem.writeInt(u32, id[8..12], self.tx_index, .big);
+        std.mem.writeInt(u32, id[12..16], self.log_index, .big);
+        return id;
+    }
+
+    pub fn unpack(id: [16]u8) EventId {
+        return .{
+            .block_number = std.mem.readInt(u64, id[0..8], .big),
+            .tx_index = std.mem.readInt(u32, id[8..12], .big),
+            .log_index = std.mem.readInt(u32, id[12..16], .big),
+        };
+    }
+};
 
 // ── Comptime parameter resolution ────────────────────────────────────────
 
@@ -243,7 +272,11 @@ pub fn Log(comptime E: type) type {
         }
 
         pub fn eventId(self: @This()) [16]u8 {
-            return encodeEventId(self.block_number, self.tx_index, self.log_index);
+            return (EventId{
+                .block_number = self.block_number,
+                .tx_index = self.tx_index,
+                .log_index = self.log_index,
+            }).pack();
         }
     };
 }
@@ -564,4 +597,34 @@ test "DecodedLog.fromRawLog preserves all fields" {
     try std.testing.expectEqualSlices(u8, &raw.address, &log.address);
     try std.testing.expectEqualSlices(u8, &raw.topics[0], &log.topics[0]);
     try std.testing.expectEqualSlices(u8, raw.data, log.data);
+}
+
+test "EventId pack/unpack round-trips and lays out big-endian" {
+    const id = (EventId{ .block_number = 0x0102030405060708, .tx_index = 7, .log_index = 3 }).pack();
+    // block_number is the high 8 bytes, big-endian; tx/log are the next two u32 fields.
+    try std.testing.expectEqual(@as(u8, 0x01), id[0]);
+    try std.testing.expectEqual(@as(u8, 0x08), id[7]);
+    try std.testing.expectEqual(@as(u8, 7), id[11]);
+    try std.testing.expectEqual(@as(u8, 3), id[15]);
+
+    const back = EventId.unpack(id);
+    try std.testing.expectEqual(@as(u64, 0x0102030405060708), back.block_number);
+    try std.testing.expectEqual(@as(u32, 7), back.tx_index);
+    try std.testing.expectEqual(@as(u32, 3), back.log_index);
+
+    // DecodedLog.eventId() equals packing the log's coordinates.
+    const raw = core.RawLog{
+        .block_number = 100,
+        .tx_index = 5,
+        .log_index = 9,
+        .tx_hash = [_]u8{0} ** 32,
+        .address = [_]u8{0} ** 20,
+        .topic_count = 0,
+        .topics = .{ [_]u8{0} ** 32, [_]u8{0} ** 32, [_]u8{0} ** 32, [_]u8{0} ** 32 },
+        .data = &.{},
+    };
+    const ev = EventId.unpack(DecodedLog.fromRawLog(raw).eventId());
+    try std.testing.expectEqual(@as(u64, 100), ev.block_number);
+    try std.testing.expectEqual(@as(u32, 5), ev.tx_index);
+    try std.testing.expectEqual(@as(u32, 9), ev.log_index);
 }

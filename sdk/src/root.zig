@@ -36,6 +36,7 @@ pub const Context = entry.Context;
 pub const DEFAULT_BATCH_SIZE = ethcall.DEFAULT_BATCH_SIZE;
 pub const ContractDef = manifest.ContractDef;
 pub const DecodedLog = handler.DecodedLog;
+pub const EventId = handler.EventId;
 pub const Log = handler.Log;
 pub const FactoryDef = manifest.FactoryDef;
 pub const init = entry.init;
