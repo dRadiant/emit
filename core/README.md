@@ -4,7 +4,7 @@ Shared infrastructure: types, bloom filter, flat-store reader, log serializer, b
 
 ## What it does
 
-`core` is the foundation imported by `engine` and `sdk`. It owns the on-disk format for the flat log store (`blocks.dat`, `blooms.bin`, `blocks.idx`, `meta.bin`, `pending.bin`) and the read-side primitives both consumers need: bloom scan, LZ4-compressed log decode, parallel block reads via io_uring, atomic file writes.
+`core` is the foundation imported by `engine` and `sdk`. It owns the on-disk format for the flat log store (`blocks.dat`, `blooms.bin`, `blocks.idx`, `meta.bin`, `pending.bin`, `timestamps.bin`) and the read-side primitives both consumers need: bloom scan, LZ4-compressed log decode, parallel block reads via io_uring, atomic file writes.
 
 Module index:
 
@@ -20,13 +20,14 @@ Module index:
 | `pending_format.zig` | `pending.bin` wire format (single source of truth) |
 | `atomic_file.zig` | tmp + fsync + rename primitive used by every commit point |
 | `flat_format.zig` | Magic header helpers for all flat-file pairs |
+| `timestamps.zig` | `TimestampReader`/`TimestampWriter`: exact per-block Unix timestamps (`timestamps.bin`) |
 
 ## Public surface
 
 Re-exported from `root.zig`:
 
-- `RawLog`, `Bloom`, `AddrBloom`, `FlatStoreReader`, `Meta`
-- Submodules `types`, `bloom`, `flat_reader`, `block_filter`, `log_serial`, `io_pipeline`, `parallel`, `pending_format`, `atomic_file`, `flat_format`
+- `RawLog`, `Bloom`, `AddrBloom`, `FlatStoreReader`, `Meta`, `TimestampReader`
+- Submodules `types`, `bloom`, `flat_reader`, `block_filter`, `log_serial`, `io_pipeline`, `parallel`, `pending_format`, `atomic_file`, `flat_format`, `timestamps`
 
 The full module set is intentionally public.
 

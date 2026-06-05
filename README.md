@@ -51,7 +51,7 @@ zig build -Doptimize=ReleaseFast
 # 3. Follow the chain head into the same store.
 ./zig-out/bin/emit-engine follow \
   --rpc http://localhost:8545 \
-  --ws ws://localhost:8546 \
+  --ws ws://localhost:8545 \
   --data-dir /var/lib/emit-engine
 
 # 4. In another shell, run the ERC20 example against rETH.
@@ -63,6 +63,8 @@ zig build run -Doptimize=ReleaseFast -- \
 ```
 
 Expected output from step 4: a per-cycle line like `scan: 124,500 blocks / filtered: 8,213 / handler: 1,082,996 events`, then once caught up, a steady tick as new blocks arrive. See [examples/erc20/README.md](examples/erc20/README.md) for the entity layout and [examples/uniswap-v2/README.md](examples/uniswap-v2/README.md) for the factory-contract walkthrough.
+
+For a fully featured example with a REST API, see [examples/erc20-api/README.md](examples/erc20-api/README.md).
 
 If you prefer Docker, see [engine/README.md](engine/README.md#container-deployment) for the `compose.node.yml` + `compose.emit.yml` operator flow.
 

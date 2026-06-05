@@ -13,6 +13,12 @@ EMIT follows semantic versioning. Major bumps (1.x → 2.x) signal breaking chan
 - `Context.cursor()` returns the highest fully-dispatched (committed) block for an honest health/progress readout.
 - `sdk.EventId` is the canonical (un)packer for the 16-byte event key: `EventId.unpack(id)` decodes a stored key into `(block_number, tx_index, log_index)`, and `EventId{ ... }.pack()` builds a key from components. `log.eventId()` is now defined as `EventId{ ... }.pack()`, so encode and decode live in one type.
 - All read accessors take the Context mutex internally, so API code never manages the lock. They must not be called from handlers, which already hold it.
+- Exact block timestamps. `ctx.timestamp` (and `humanize.timestampOf`) now read the engine's `timestamps.bin` when present, falling back to the `MERGE_TS + n*12` formula otherwise. The formula assumes one block per slot; missed slots make it drift by the accumulated miss count — ~10 days at the current chain tip. With the new index, `ctx.timestamp` is exact (0 s error, verified across the chain).
+
+### Engine
+
+- `emit-engine import --rocksdb` now backfills exact per-block timestamps into `timestamps.bin`, in tandem with the receipts decode. A concurrent pass reads Nethermind's sibling `headers` DB — whose keys are `block_number(8 BE) ++ block_hash(32)`, so it iterates in block order like the receipts CF — and extracts the RLP `timestamp` field (header field 11). Fully offline (no `--rpc`), runs even when the log import is already caught up (so existing stores get backfilled), and resumes from the first un-backfilled block. ~9.7 M timestamps in ~15 s on the reference box.
+- `timestamps.bin`: a dense `u32 LE` array indexed by `block - first_block` (~39 MB at the tip; `u32` epoch-seconds is exact until 2106). Advisory — a missing or partial file degrades to the formula, so old stores keep working.
 
 ### Examples
 
