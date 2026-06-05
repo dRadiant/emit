@@ -15,6 +15,7 @@ pub const parallel = @import("parallel.zig");
 pub const pending_format = @import("pending_format.zig");
 pub const atomic_file = @import("atomic_file.zig");
 pub const flat_format = @import("flat_format.zig");
+pub const timestamps = @import("timestamps.zig");
 
 // Re-export commonly used types at top level for convenience.
 pub const RawLog = types.RawLog;
@@ -22,6 +23,7 @@ pub const Bloom = bloom.Bloom;
 pub const AddrBloom = bloom.AddrBloom;
 pub const FlatStoreReader = flat_reader.FlatStoreReader;
 pub const Meta = flat_reader.Meta;
+pub const TimestampReader = timestamps.TimestampReader;
 
 test {
     _ = types;
@@ -34,4 +36,5 @@ test {
     _ = pending_format;
     _ = atomic_file;
     _ = flat_format;
+    _ = timestamps;
 }
