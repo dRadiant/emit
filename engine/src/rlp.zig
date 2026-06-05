@@ -112,6 +112,20 @@ pub const Rlp = struct {
     }
 };
 
+/// Extract the `timestamp` (field 11) from an RLP-encoded block header.
+/// Header field order is fixed: parentHash, ommersHash, beneficiary,
+/// stateRoot, txRoot, receiptsRoot, logsBloom, difficulty, number, gasLimit,
+/// gasUsed, **timestamp**, extraData, ... so we enter the list and skip the
+/// first 11 fields. Post-1559/Shanghai/Cancun fields trail the timestamp and
+/// are irrelevant here.
+pub fn headerTimestamp(header_rlp: []const u8) Error!u64 {
+    var rlp = Rlp.init(header_rlp);
+    _ = try rlp.enterList();
+    var i: usize = 0;
+    while (i < 11) : (i += 1) try rlp.skip();
+    return rlp.uint();
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 test "empty list has zero length" {
@@ -159,4 +173,11 @@ test "padLeft reconstructs zero-stripped topic" {
     try std.testing.expectEqual(@as(u8, 0), padded[29]);
     try std.testing.expectEqual(@as(u8, 0xAB), padded[30]);
     try std.testing.expectEqual(@as(u8, 0xCD), padded[31]);
+}
+
+test "headerTimestamp reads field 11" {
+    // Synthetic header: 11 empty fields (0..10), then a 4-byte timestamp.
+    // List payload = 11*1 + 5 = 16 bytes, so the list prefix is 0xC0+16 = 0xD0.
+    const header = [_]u8{0xD0} ++ ([_]u8{0x80} ** 11) ++ [_]u8{ 0x84, 0x64, 0x32, 0x5a, 0x80 };
+    try std.testing.expectEqual(@as(u64, 0x64325a80), try headerTimestamp(&header));
 }

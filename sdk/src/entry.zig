@@ -118,6 +118,10 @@ pub fn Context(comptime entities: anytype) type {
         /// runs without prefetch declared — every `ethCall` then returns
         /// `error.NotPrefetched`, matching the strict-mode semantics.
         _cache: ?*ethcall.Cache = null,
+        /// Engine's per-block timestamp index, or null when the store predates
+        /// the feature. `humanize.timestampOf` reads it for exact `timestamp`
+        /// and falls back to the derivation formula when absent.
+        _timestamps: ?core.timestamps.TimestampReader = null,
         /// Highest fully-dispatched block. Updated at block boundaries.
         /// `commitCycle` writes it into `state.snap.cursor` inside the same
         /// rename as the entity-slab flush so cursor and state are byte-atomic.
@@ -210,6 +214,7 @@ pub fn Context(comptime entities: anytype) type {
             }
             self._state_snap.deinit();
             self._entity_dir.close();
+            if (self._timestamps) |*ts| ts.deinit();
             if (self._cache) |c| {
                 c.deinit();
                 self._allocator.destroy(c);
@@ -419,6 +424,17 @@ pub fn init(
     };
     errdefer ctx._state_snap.deinit();
     ctx._last_dispatched_block = ctx._state_snap.cursor;
+
+    // Open the engine's per-block timestamp index if present. Absence (stores
+    // predating the feature) or a corrupt file leaves it null, and
+    // `humanize.timestampOf` falls back to the derivation formula. The mmap
+    // outlives the directory handle.
+    {
+        var engine_dh = try std.fs.cwd().openDir(options.engine_data_dir, .{});
+        defer engine_dh.close();
+        ctx._timestamps = core.timestamps.TimestampReader.open(engine_dh) catch null;
+    }
+    errdefer if (ctx._timestamps) |*ts| ts.deinit();
 
     // Open every ImmutableStore's events.dat. Logs live on the Context so
     // each ImmutableStore can hold a stable pointer into the field.

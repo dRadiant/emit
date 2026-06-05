@@ -311,7 +311,7 @@ const LiveSession = struct {
         try self.maybePrefetchBlock(m, ctx, self.log_buf[0..keep]);
 
         ctx.block_number = entry.block_number;
-        ctx.timestamp = humanize.blockTimestamp(entry.block_number);
+        ctx.timestamp = humanize.timestampOf(ctx, entry.block_number);
 
         for (self.log_buf[0..keep]) |log| {
             try handler_mod.dispatchLog(m, Handler, ctx, log);

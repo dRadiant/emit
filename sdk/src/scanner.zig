@@ -178,7 +178,7 @@ pub fn replay(
         // Update ctx for this block. Handlers that want timestamp can read
         // it from ctx; we set it once per block to avoid recomputing.
         ctx.block_number = block_number;
-        ctx.timestamp = humanize.blockTimestamp(block_number);
+        ctx.timestamp = humanize.timestampOf(ctx, block_number);
         result.blocks_dispatched += 1;
 
         for (merge_buf[0..merge_count]) |log| {

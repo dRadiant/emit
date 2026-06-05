@@ -24,6 +24,7 @@ const eth = @import("eth");
 
 const flat_writer = @import("flat_writer.zig");
 const receipt_decoder = @import("receipt_decoder.zig");
+const rlp = @import("rlp.zig");
 
 const types = core.types;
 const log_serial = core.log_serial;
@@ -241,6 +242,93 @@ fn iterKeyBlock(iter: Iterator) ?u64 {
     return std.mem.readInt(u64, key_ptr[0..8], .big);
 }
 
+// ── Timestamp pass (sibling headers DB) ──────────────────────────────────
+
+/// Thread entry: best-effort timestamp pass. Any failure (missing headers DB,
+/// FD pressure, decode error) is logged and swallowed — block timestamps then
+/// fall back to `humanize.blockTimestamp`, so the log import is never blocked.
+fn importHeaderTimestamps(
+    headers_path: [*:0]const u8,
+    output_path: []const u8,
+    first_block: u64,
+    cutoff: u64,
+) void {
+    const n = runHeaderTimestamps(headers_path, output_path, first_block, cutoff) catch |err| {
+        std.debug.print("Timestamp pass skipped: {s} (timestamps fall back to the formula)\n", .{@errorName(err)});
+        return;
+    };
+    if (n > 0) std.debug.print("Imported {d} block timestamps from headers\n", .{n});
+}
+
+/// Iterate Nethermind's `headers` DB over [start_block, cutoff], decode each
+/// header's `timestamp` (RLP field 11) and write timestamps.bin. The headers
+/// key is `block_number(8 BE) ++ block_hash(32)`, so iteration is in block
+/// order like the receipts CF. Duplicate rows for one number (reorg orphans
+/// near the unfinalized tip) collapse to the first seen.
+fn runHeaderTimestamps(
+    headers_path: [*:0]const u8,
+    output_path: []const u8,
+    first_block: u64,
+    cutoff: u64,
+) !u64 {
+    var err: ?[*:0]u8 = null;
+    const opts = c.rocksdb_options_create();
+    defer c.rocksdb_options_destroy(opts);
+
+    // headers has a single "default" CF; open it read-only like the receipts DB.
+    const cf_names = [_][*c]const u8{@ptrCast("default")};
+    const cf_opts = [1]?*const c.rocksdb_options_t{opts};
+    var cf_handles: [1]?*c.rocksdb_column_family_handle_t = .{null};
+    const db = c.rocksdb_open_for_read_only_column_families(
+        opts, headers_path, 1, &cf_names, &cf_opts, &cf_handles, 0, @ptrCast(&err),
+    );
+    try rocksErr(&err);
+    if (db == null) return error.RocksDBError;
+    defer c.rocksdb_close(db);
+    defer for (&cf_handles) |h| if (h) |handle| c.rocksdb_column_family_handle_destroy(handle);
+    const default_cf = cf_handles[0] orelse return error.RocksDBError;
+
+    var dir = try std.fs.cwd().openDir(output_path, .{});
+    defer dir.close();
+    var ts_writer = try core.timestamps.TimestampWriter.open(dir, first_block);
+    defer ts_writer.deinit();
+
+    const read_opts = c.rocksdb_readoptions_create();
+    defer c.rocksdb_readoptions_destroy(read_opts);
+    c.rocksdb_readoptions_set_readahead_size(read_opts, 4 * 1024 * 1024);
+    c.rocksdb_readoptions_set_fill_cache(read_opts, 0);
+    c.rocksdb_readoptions_set_verify_checksums(read_opts, 0);
+
+    const iter = c.rocksdb_create_iterator_cf(db, read_opts, default_cf);
+    if (iter == null) return error.RocksDBError;
+    defer c.rocksdb_iter_destroy(iter);
+
+    // Resume from the first un-backfilled block so re-runs only fill the gap.
+    const start_block = first_block + ts_writer.count;
+    if (start_block > cutoff) return 0;
+    var seek_key: [8]u8 = undefined;
+    std.mem.writeInt(u64, &seek_key, start_block, .big);
+    c.rocksdb_iter_seek(iter, @ptrCast(&seek_key), seek_key.len);
+
+    var written: u64 = 0;
+    var last: ?u64 = null;
+    while (iterValid(iter)) : (c.rocksdb_iter_next(iter)) {
+        const bn = iterKeyBlock(iter) orelse continue;
+        if (bn > cutoff) break;
+        if (bn < start_block) continue;
+        if (last) |l| if (l == bn) continue;
+        var vlen: usize = 0;
+        const vp: [*]const u8 = @ptrCast(c.rocksdb_iter_value(iter, &vlen) orelse continue);
+        const ts = rlp.headerTimestamp(vp[0..vlen]) catch continue;
+        const ts32 = std.math.cast(u32, ts) orelse continue; // valid until 2106
+        ts_writer.set(bn, ts32) catch continue;
+        last = bn;
+        written += 1;
+    }
+    try ts_writer.sync();
+    return written;
+}
+
 // ── Entry points ─────────────────────────────────────────────────────────
 
 pub fn main() !void {
@@ -351,6 +439,29 @@ fn runInner(
     const finality_cutoff: u64 = if (end_override) |e| @min(head_cutoff, e) else head_cutoff;
     std.debug.print("Chain head: {d}; finality cutoff: {d} (head - {d}).\n", .{ head, finality_cutoff, FINALITY_DEPTH });
 
+    // Backfill timestamps.bin from the sibling `headers` DB over the store's
+    // full finalized range, concurrent with the receipts decode (different DB,
+    // different output file). Runs even when the log import is already caught
+    // up, so an existing store still gets its historical timestamps. The pass
+    // resumes from the first un-backfilled block. Best-effort: any failure
+    // leaves block timestamps on the formula fallback.
+    const ts_first_block: u64 = if (writer.meta.blocks_idx_count > 0)
+        writer.first_block
+    else
+        (start_override orelse core.types.MERGE_BLOCK);
+    const receipts_span = std.mem.span(receipts_path);
+    const headers_path: ?[:0]u8 = if (std.fs.path.dirname(receipts_span)) |parent|
+        std.mem.concatWithSentinel(allocator, u8, &.{ parent, "/headers" }, 0) catch null
+    else
+        null;
+    defer if (headers_path) |hp| allocator.free(hp);
+    var ts_thread: ?std.Thread = null;
+    if (headers_path) |hp| {
+        ts_thread = std.Thread.spawn(.{}, importHeaderTimestamps, .{
+            @as([*:0]const u8, hp.ptr), output_path, ts_first_block, finality_cutoff,
+        }) catch null;
+    }
+
     // Resume from where we left off, else start at the merge (or an explicit
     // override for bounded runs). Pre-merge events are rarely an indexing
     // target; users who need them should pre-seed the data dir.
@@ -360,9 +471,10 @@ fn runInner(
         core.types.MERGE_BLOCK;
     if (start_block > finality_cutoff) {
         std.debug.print(
-            "Flat store already covers the finalized prefix (last_finalized={d}); nothing to import.\n",
+            "Flat store already covers the finalized prefix (last_finalized={d}); only timestamps backfilled.\n",
             .{writer.meta.last_finalized_block},
         );
+        if (ts_thread) |t| t.join();
         return;
     }
 
@@ -462,6 +574,7 @@ fn runInner(
     // Signal workers to exit and wait
     slots[0].block_number = std.math.maxInt(u64);
     for (&workers) |*w| w.join();
+    if (ts_thread) |t| t.join();
 
     try writer.finalize();
 
