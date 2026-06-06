@@ -10,6 +10,7 @@ const std = @import("std");
 const core = @import("core");
 
 const head_follower = @import("head_follower.zig");
+const rpc_import = @import("rpc_import.zig");
 
 pub fn main() !void {
     const alloc = std.heap.page_allocator;
@@ -60,11 +61,14 @@ pub fn main() !void {
             return;
         }
 
-        if (getFlag(args, "--rpc")) |_| {
-            std.debug.print("RPC import is experimental and not yet implemented.\n", .{});
-            std.debug.print("Use --rocksdb for production imports.\n", .{});
-            std.debug.print("RPC import is intended for unsupported chains or remote nodes only.\n", .{});
-            return;
+        if (getFlag(args, "--rpc")) |rpc_url| {
+            return rpc_import.run(.{
+                .rpc_url = rpc_url,
+                .data_dir = data_dir,
+                .from_block = if (getFlag(args, "--from")) |f| try std.fmt.parseInt(u64, f, 10) else null,
+                .to_block = if (getFlag(args, "--to")) |t| try std.fmt.parseInt(u64, t, 10) else null,
+                .timestamps = !hasFlag(args, "--no-timestamps"),
+            });
         }
 
         return usage();
@@ -115,7 +119,8 @@ fn usage() void {
         \\
         \\Commands:
         \\  import --rocksdb <path> --data-dir <path>   Bulk import from Nethermind
-        \\  import --rpc <url> --data-dir <path>        Import via eth_getLogs
+        \\  import --rpc <url> --data-dir <path> [--from N] [--to N] [--no-timestamps]
+        \\                                              Import via eth_getLogs (+ timestamps)
         \\  follow --rpc <url> [--ws <url>] --data-dir <path> [--catch-up-rpc]
         \\                                              Follow chain head
         \\  status --data-dir <path>                    Print store status
