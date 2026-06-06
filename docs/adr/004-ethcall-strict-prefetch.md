@@ -2,6 +2,7 @@
 
 **Status**: Accepted
 **Date**: 2026-05-11
+**Amendment (2026-06-05)**: The strict decision stands unchanged. The *reserved* lazy escape hatch (`Cache.warm` / `ethCallLazy`, see Decision below) is **withdrawn, not planned**. The only real cache-miss case is chained metadata: (`event → pool.token0() → token0.decimals()`). It is better served by **multi-round prefetch**: a bounded fixpoint over the existing prefetch pass that resolves every call *before* dispatch, preserving the network-free, replay-deterministic hot loop that an inline lazy call would break. 
 **Context**: `BlockContext.ethCall` had been declared as a stub returning `error.NotYetImplemented`. The decision is whether handlers may issue ad-hoc network calls (lazy mode) or only read pre-declared prefetched results (strict mode).
 
 ## Problem

@@ -16,6 +16,8 @@ The test suite is hermetic; nothing reaches the network.
 
 Branch from `main`. Rebase to stay current; the project keeps a linear history with no merge commits on `main`.
 
+Branches generally follow the [conventional branches](https://conventionalbranch.org/) spec.
+
 Commit messages use subsystem-prefix imperative mood:
 
 - `engine: pin RocksDB read snapshot during import`

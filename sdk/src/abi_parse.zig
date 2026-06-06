@@ -64,6 +64,23 @@ pub fn paramByName(comptime parsed: ParsedEvent, comptime param_name: []const u8
     };
 }
 
+/// Extract a parameter's 32-byte ABI word from a log's `topics`/`data` per its
+/// assigned slot: indexed params read `topics[slot_index]`, non-indexed params
+/// read the data word at `slot_index`. Data slots beyond `data.len` zero-fill —
+/// the ABI's zero-padding convention, and the guard against short or malformed
+/// payloads (truncated RPC responses, test fixtures). Single source of truth
+/// for the slot→word read shared by `handler` decode and `manifest`
+/// address extraction.
+pub fn wordAt(comptime p: ParsedParam, topics: []const [32]u8, data: []const u8) [32]u8 {
+    return switch (comptime p.slot_kind) {
+        .topic => topics[comptime p.slot_index],
+        .data => if (data.len < comptime p.slot_index + 32)
+            std.mem.zeroes([32]u8)
+        else
+            data[comptime p.slot_index..][0..32].*,
+    };
+}
+
 // ── Internals ────────────────────────────────────────────────────────────
 
 fn parseEventInner(comptime sig: []const u8) ParsedEvent {
@@ -230,6 +247,25 @@ fn err(comptime sig: []const u8, comptime msg: []const u8) noreturn {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
+
+test "wordAt reads topic and data slots and zero-fills short data" {
+    const parsed = comptime parseEvent("E(address indexed a, uint256 b)");
+    const pa = comptime paramByName(parsed, "a"); // indexed → topic slot 1
+    const pb = comptime paramByName(parsed, "b"); // non-indexed → data slot 0
+
+    var topics: [4][32]u8 = std.mem.zeroes([4][32]u8);
+    topics[1][31] = 0xAB;
+    var data: [32]u8 = std.mem.zeroes([32]u8);
+    data[31] = 0xCD;
+
+    try std.testing.expectEqual(@as(u8, 0xAB), wordAt(pa, &topics, &data)[31]);
+    try std.testing.expectEqual(@as(u8, 0xCD), wordAt(pb, &topics, &data)[31]);
+
+    // Data shorter than slot_index+32 zero-fills instead of reading OOB —
+    // the guard `param` and `extractAddress` previously lacked.
+    const short = wordAt(pb, &topics, &.{});
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &short);
+}
 
 test "parses bare signature with no names" {
     const p = comptime parseEvent("Transfer(address,address,uint256)");

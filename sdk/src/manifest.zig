@@ -203,10 +203,7 @@ pub fn extractAddress(
         .param => |name| blk: {
             const parsed = comptime parsedEvent(E);
             const p = comptime abi_parse.paramByName(parsed, name);
-            const word: [32]u8 = switch (comptime p.slot_kind) {
-                .topic => topics[comptime p.slot_index],
-                .data => data[comptime p.slot_index..][0..32].*,
-            };
+            const word = abi_parse.wordAt(p, topics, data);
             break :blk word[12..32].*;
         },
     };

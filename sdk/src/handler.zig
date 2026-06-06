@@ -93,10 +93,7 @@ pub const DecodedLog = struct {
     /// helpers.
     pub fn param(self: DecodedLog, comptime E: type, comptime param_name: []const u8) TypeFor(resolveParam(E, param_name).type_str) {
         const p = comptime resolveParam(E, param_name);
-        const word: [32]u8 = switch (comptime p.slot_kind) {
-            .topic => self.topics[comptime p.slot_index],
-            .data => self.data[comptime p.slot_index..][0..32].*,
-        };
+        const word = abi_parse.wordAt(p, &self.topics, self.data);
         return decodeWord(TypeFor(p.type_str), p.type_str, &word);
     }
 
@@ -110,13 +107,7 @@ pub const DecodedLog = struct {
         var out: ParamsOf(E) = undefined;
         inline for (comptime manifest.parsedEvent(E).params) |p| {
             if (comptime p.name.len == 0) continue;
-            const word: [32]u8 = switch (comptime p.slot_kind) {
-                .topic => self.topics[comptime p.slot_index],
-                .data => if (self.data.len < comptime p.slot_index + 32)
-                    std.mem.zeroes([32]u8)
-                else
-                    self.data[comptime p.slot_index..][0..32].*,
-            };
+            const word = abi_parse.wordAt(p, &self.topics, self.data);
             @field(out, p.name) = decodeWord(TypeFor(p.type_str), p.type_str, &word);
         }
         return out;
