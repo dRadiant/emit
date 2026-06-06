@@ -47,6 +47,18 @@ pub fn run(config: FollowConfig) !void {
         ring.deinit();
     }
 
+    // Resume the importer's timestamps.bin so blocks finalized after the import
+    // keep exact times for cold re-backfills (a live SDK already gets them via
+    // pending.bin). Keyed off the flat store's first_block, so it aligns with
+    // the importer's dense indexing. A fresh follow-only store (no import,
+    // first_block == 0) skips this and falls back to the formula until imported.
+    var ts_writer: ?core.timestamps.TimestampWriter =
+        if (writer.first_block != 0)
+            core.timestamps.TimestampWriter.open(dir, writer.first_block) catch null
+        else
+            null;
+    defer if (ts_writer) |*w| w.deinit();
+
     // Refuse follow against a stale baseline. The check uses the highest
     // known block — pending tip if any, else the last finalized — and
     // compares to current chain tip. Skipped when the dir is fresh
@@ -79,14 +91,14 @@ pub fn run(config: FollowConfig) !void {
             break :ws;
         };
         defer ws.close();
-        followWs(&ws, &provider, &writer, &ring, alloc) catch |err| {
+        followWs(&ws, &provider, &writer, &ring, alloc, if (ts_writer) |*w| w else null) catch |err| {
             std.debug.print("WS error ({s}), falling back to HTTP\n", .{@errorName(err)});
         };
     }
 
     std.debug.print("Polling {s} every {d}ms\n", .{ config.rpc_url, config.poll_interval_ms });
     while (true) {
-        followPoll(&provider, &writer, &ring, alloc) catch |err| {
+        followPoll(&provider, &writer, &ring, alloc, if (ts_writer) |*w| w else null) catch |err| {
             std.debug.print("Poll error: {s}\n", .{@errorName(err)});
         };
         std.Thread.sleep(config.poll_interval_ms * std.time.ns_per_ms);
@@ -101,6 +113,7 @@ fn followWs(
     writer: *FlatStoreWriter,
     ring: *PendingRing,
     alloc: std.mem.Allocator,
+    ts_writer: ?*core.timestamps.TimestampWriter,
 ) !void {
     var sub = try eth.subscription.Subscription.subscribe(alloc, ws, .{ .new_heads = {} });
     defer sub.deinit();
@@ -138,7 +151,7 @@ fn followWs(
             std.debug.print("Block {d}: {s}\n", .{ block_number, @errorName(err) });
             continue;
         };
-        finalizeReady(ring, writer, block_number, alloc);
+        finalizeReady(ring, writer, block_number, alloc, ts_writer);
     }
 }
 
@@ -149,6 +162,7 @@ fn followPoll(
     writer: *FlatStoreWriter,
     ring: *PendingRing,
     alloc: std.mem.Allocator,
+    ts_writer: ?*core.timestamps.TimestampWriter,
 ) !void {
     const latest = try provider.getBlockNumber();
     const tip = ring.latestBlock() orelse
@@ -161,7 +175,7 @@ fn followPoll(
             break;
         };
     }
-    finalizeReady(ring, writer, latest, alloc);
+    finalizeReady(ring, writer, latest, alloc, ts_writer);
 }
 
 // ── Shared ───────────────────────────────────────────────────────────────
@@ -250,7 +264,8 @@ fn ingestBlockCore(
     const compress_buf = try alloc.alloc(u8, types.BLOCK_BUF_SIZE);
     const entry_len = try log_serial.compressEntry(serialize_buf[0..serialized_len], compress_buf);
 
-    try ring.insert(block_number, header.hash, &topic_bloom.bits, &addr_bloom.bits, compress_buf[0..entry_len]);
+    const ts: u32 = std.math.cast(u32, header.timestamp) orelse 0; // exact block time; valid until 2106
+    try ring.insert(block_number, ts, header.hash, &topic_bloom.bits, &addr_bloom.bits, compress_buf[0..entry_len]);
     std.debug.print("Block {d}: {d} logs\n", .{ block_number, raw_logs.len });
 }
 
@@ -280,7 +295,13 @@ fn resolveReorg(ring: *PendingRing, from: u64, provider: *eth.provider.Provider)
 /// Peek-then-pop: appendBlock failure must leave the entry on the ring so
 /// the next finalize attempt retries — popping first would orphan the
 /// block (pending forgets it, flat never recorded it).
-fn finalizeReady(ring: *PendingRing, writer: *FlatStoreWriter, head: u64, alloc: std.mem.Allocator) void {
+fn finalizeReady(
+    ring: *PendingRing,
+    writer: *FlatStoreWriter,
+    head: u64,
+    alloc: std.mem.Allocator,
+    ts_writer: ?*core.timestamps.TimestampWriter,
+) void {
     var popped_count: u32 = 0;
     var finalized: u32 = 0;
     while (ring.canFinalize(head)) {
@@ -290,12 +311,22 @@ fn finalizeReady(ring: *PendingRing, writer: *FlatStoreWriter, head: u64, alloc:
             std.debug.print("Finalize block {d}: {s}\n", .{ oldest.block_number, @errorName(err) });
             break;
         };
+        // Mirror the flat-store append into timestamps.bin so cold re-backfills
+        // over post-import blocks stay exact. Advisory: a write error degrades
+        // to the formula via the reader's zero-is-unknown rule, never blocks
+        // finalization. count is published after the batch via `sync`.
+        if (ts_writer) |w| {
+            if (oldest.timestamp != 0) w.set(oldest.block_number, oldest.timestamp) catch {};
+        }
         const popped = ring.popOldest().?;
         alloc.free(popped.lz4_entry);
         popped_count += 1;
         if (writer.meta.last_finalized_block > pre) finalized += 1;
     }
-    if (finalized > 0) writer.commitMeta() catch {};
+    if (finalized > 0) {
+        writer.commitMeta() catch {};
+        if (ts_writer) |w| w.sync() catch {};
+    }
     // Flush ring on any pop, including idempotent skips, so a crash-recovery
     // pass doesn't keep re-presenting the same finalized blocks.
     if (popped_count > 0) ring.flush() catch {};
@@ -342,4 +373,39 @@ test "parseBlockNumber from newHeads notification" {
     ;
     try std.testing.expectEqual(@as(u64, 0x134b6a1), parseBlockNumber(valid).?);
     try std.testing.expect(parseBlockNumber("{\"id\":1,\"result\":true}") == null);
+}
+
+test "finalizeReady mirrors finalized timestamps into timestamps.bin" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const alloc = std.testing.allocator;
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpath(".", &path_buf);
+
+    var writer = try FlatStoreWriter.open(path);
+    defer writer.deinit();
+    var ring = try PendingRing.open(tmp.dir, alloc);
+    defer ring.deinit();
+
+    const topic = [_]u8{0} ** core.bloom.BLOOM_SIZE;
+    const addr = [_]u8{0} ** core.bloom.ADDR_BLOOM_SIZE;
+    const entry = [_]u8{ 0, 0, 0, 0 }; // packed payload, log_count = 0
+    const hash = [_]u8{0xAB} ** 32;
+
+    // Two pending blocks carrying exact header timestamps.
+    try ring.insert(100, 1_700_000_000, hash, &topic, &addr, &entry);
+    try ring.insert(101, 1_700_000_012, hash, &topic, &addr, &entry);
+
+    // Opened at the known first block, as run() does post-import.
+    var ts_writer = try core.timestamps.TimestampWriter.open(tmp.dir, 100);
+    defer ts_writer.deinit();
+
+    // head = 100 + FINALITY_DEPTH finalizes only block 100; 101 stays pending.
+    finalizeReady(&ring, &writer, 100 + pending_ring.FINALITY_DEPTH, alloc, &ts_writer);
+
+    var reader = (try core.timestamps.TimestampReader.open(tmp.dir)).?;
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(?u64, 1_700_000_000), reader.get(100));
+    try std.testing.expectEqual(@as(?u64, null), reader.get(101)); // not yet finalized
 }

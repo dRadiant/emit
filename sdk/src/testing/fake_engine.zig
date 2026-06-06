@@ -25,6 +25,9 @@ pub const FakeEngine = struct {
 
     pub const Entry = struct {
         block_number: u64,
+        /// Exact block time (epoch seconds). 0 = unknown — mirrors the engine
+        /// follower carrying `header.timestamp` into `pending.bin`.
+        timestamp: u32 = 0,
         hash: [32]u8,
         topic_bloom: [bloom.BLOOM_SIZE]u8,
         addr_bloom: [bloom.ADDR_BLOOM_SIZE]u8,
@@ -42,9 +45,22 @@ pub const FakeEngine = struct {
     }
 
     /// Append a block to pending and atomically rewrite `pending.bin`.
+    /// Timestamp is left unknown (0); use `ingestAt` to drive the exact path.
     pub fn ingest(
         self: *FakeEngine,
         block_number: u64,
+        hash: [32]u8,
+        logs: []const core.RawLog,
+    ) !void {
+        return self.ingestAt(block_number, 0, hash, logs);
+    }
+
+    /// Like `ingest` but carries an exact block timestamp, matching the
+    /// follower writing `header.timestamp` into the pending ring.
+    pub fn ingestAt(
+        self: *FakeEngine,
+        block_number: u64,
+        timestamp: u32,
         hash: [32]u8,
         logs: []const core.RawLog,
     ) !void {
@@ -63,6 +79,7 @@ pub const FakeEngine = struct {
 
         try self.entries.append(self.alloc, .{
             .block_number = block_number,
+            .timestamp = timestamp,
             .hash = hash,
             .topic_bloom = tb.bits,
             .addr_bloom = ab.bits,

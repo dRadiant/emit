@@ -31,6 +31,7 @@ const HASH_SIZE = pending_format.HASH_SIZE;
 /// the engine writes and frees these bytes.
 pub const Entry = struct {
     block_number: u64,
+    timestamp: u32 = 0,
     hash: [HASH_SIZE]u8,
     topic_bloom: [bloom.BLOOM_SIZE]u8,
     addr_bloom: [bloom.ADDR_BLOOM_SIZE]u8,
@@ -54,6 +55,11 @@ pub const PendingRing = struct {
         };
         ring.load() catch |err| switch (err) {
             error.FileNotFound => {},
+            // An old (pre-magic) or unrecognized pending.bin is discarded: the
+            // follower re-baselines from meta and rewrites it in the current
+            // format. Genuine corruption of a current-format file still fails
+            // loud (Truncated / NonDense).
+            error.InvalidMagic => std.debug.print("pending.bin: unrecognized magic, discarding and re-baselining from meta\n", .{}),
             else => return err,
         };
         return ring;
@@ -69,6 +75,7 @@ pub const PendingRing = struct {
     pub fn insert(
         self: *PendingRing,
         block_number: u64,
+        timestamp: u32,
         hash: [HASH_SIZE]u8,
         topic_bloom: *const [bloom.BLOOM_SIZE]u8,
         addr_bloom: *const [bloom.ADDR_BLOOM_SIZE]u8,
@@ -81,6 +88,7 @@ pub const PendingRing = struct {
         @memcpy(owned, lz4_entry);
         try self.entries.append(self.alloc, .{
             .block_number = block_number,
+            .timestamp = timestamp,
             .hash = hash,
             .topic_bloom = topic_bloom.*,
             .addr_bloom = addr_bloom.*,
@@ -196,6 +204,7 @@ pub const PendingRing = struct {
             const owned = try self.alloc.dupe(u8, p.lz4_entry);
             self.entries.appendAssumeCapacity(.{
                 .block_number = p.block_number,
+                .timestamp = p.timestamp,
                 .hash = p.hash,
                 .topic_bloom = p.topic_bloom,
                 .addr_bloom = p.addr_bloom,
@@ -219,7 +228,7 @@ test "insert and read back hash" {
     var ring = try PendingRing.open(tmp.dir, testing.allocator);
     defer ring.deinit();
 
-    try ring.insert(100, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+    try ring.insert(100, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
 
     const hash = ring.getHash(100).?;
     try testing.expectEqualSlices(u8, &dummy_hash, &hash);
@@ -235,9 +244,9 @@ test "oldest and latest track correctly" {
     try testing.expect(ring.oldestBlock() == null);
     try testing.expect(ring.latestBlock() == null);
 
-    try ring.insert(100, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
-    try ring.insert(101, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
-    try ring.insert(102, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+    try ring.insert(100, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+    try ring.insert(101, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+    try ring.insert(102, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
 
     try testing.expectEqual(@as(u64, 100), ring.oldestBlock().?);
     try testing.expectEqual(@as(u64, 102), ring.latestBlock().?);
@@ -250,8 +259,8 @@ test "popOldest removes and returns first entry" {
     var ring = try PendingRing.open(tmp.dir, testing.allocator);
     defer ring.deinit();
 
-    try ring.insert(100, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
-    try ring.insert(101, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+    try ring.insert(100, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+    try ring.insert(101, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
 
     const oldest = (ring.popOldest()).?;
     defer ring.alloc.free(oldest.lz4_entry);
@@ -272,7 +281,7 @@ test "truncateFrom removes blocks at and above fork point" {
     defer ring.deinit();
 
     for (100..110) |i| {
-        try ring.insert(i, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+        try ring.insert(i, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
     }
     try testing.expectEqual(@as(usize, 10), ring.count());
 
@@ -290,7 +299,7 @@ test "canFinalize respects finality depth" {
     var ring = try PendingRing.open(tmp.dir, testing.allocator);
     defer ring.deinit();
 
-    try ring.insert(100, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+    try ring.insert(100, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
 
     try testing.expect(!ring.canFinalize(163)); // 63 confirmations
     try testing.expect(ring.canFinalize(164)); // 64 confirmations
@@ -306,8 +315,8 @@ test "persists across reopen" {
         defer ring.deinit();
         const hash = [_]u8{0xBB} ** 32;
         const entry = [_]u8{ 3, 0, 0, 0, 0xDE, 0xAD, 0xBE };
-        try ring.insert(42, hash, &dummy_topic, &dummy_addr, &entry);
-        try ring.insert(43, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+        try ring.insert(42, 1_700_000_042, hash, &dummy_topic, &dummy_addr, &entry);
+        try ring.insert(43, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
     }
 
     // Reopen and verify
@@ -318,6 +327,7 @@ test "persists across reopen" {
         try testing.expectEqual(@as(u64, 42), ring.oldestBlock().?);
         const hash = ring.getHash(42).?;
         try testing.expectEqual(@as(u8, 0xBB), hash[0]);
+        try testing.expectEqual(@as(u32, 1_700_000_042), ring.entries.items[0].timestamp);
     }
 }
 
@@ -329,7 +339,7 @@ test "reorg scenario: insert, truncate, re-insert" {
 
     const hash_a = [_]u8{0xAA} ** 32;
     for (100..110) |i| {
-        try ring.insert(i, hash_a, &dummy_topic, &dummy_addr, &dummy_entry);
+        try ring.insert(i, 0, hash_a, &dummy_topic, &dummy_addr, &dummy_entry);
     }
 
     // Reorg at 107
@@ -338,7 +348,7 @@ test "reorg scenario: insert, truncate, re-insert" {
     // Re-insert canonical
     const hash_b = [_]u8{0xBB} ** 32;
     for (107..110) |i| {
-        try ring.insert(i, hash_b, &dummy_topic, &dummy_addr, &dummy_entry);
+        try ring.insert(i, 0, hash_b, &dummy_topic, &dummy_addr, &dummy_entry);
     }
 
     try testing.expectEqual(@as(usize, 10), ring.count());
@@ -354,8 +364,8 @@ test "truncate everything leaves empty ring" {
     var ring = try PendingRing.open(tmp.dir, testing.allocator);
     defer ring.deinit();
 
-    try ring.insert(100, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
-    try ring.insert(101, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+    try ring.insert(100, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+    try ring.insert(101, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
 
     _ = try ring.truncateFrom(100);
     try testing.expectEqual(@as(usize, 0), ring.count());
@@ -370,7 +380,7 @@ test "findForkPoint walks back to matching hash" {
 
     const hash_a = [_]u8{0xAA} ** 32;
     for (100..110) |i| {
-        try ring.insert(i, hash_a, &dummy_topic, &dummy_addr, &dummy_entry);
+        try ring.insert(i, 0, hash_a, &dummy_topic, &dummy_addr, &dummy_entry);
     }
 
     // Canonical matches at 105, diverges above
@@ -388,7 +398,7 @@ test "findForkPoint returns from when all match" {
 
     const hash_a = [_]u8{0xAA} ** 32;
     for (100..105) |i| {
-        try ring.insert(i, hash_a, &dummy_topic, &dummy_addr, &dummy_entry);
+        try ring.insert(i, 0, hash_a, &dummy_topic, &dummy_addr, &dummy_entry);
     }
 
     // First canonical hash matches immediately (no reorg)
@@ -418,7 +428,7 @@ test "truncate + re-insert restores dense ring with canonical hashes" {
 
     const hash_a = [_]u8{0xAA} ** 32;
     for (100..106) |i| {
-        try ring.insert(i, hash_a, &dummy_topic, &dummy_addr, &dummy_entry);
+        try ring.insert(i, 0, hash_a, &dummy_topic, &dummy_addr, &dummy_entry);
     }
     try testing.expectEqual(@as(usize, 6), ring.count());
 
@@ -430,7 +440,7 @@ test "truncate + re-insert restores dense ring with canonical hashes" {
     // Recovery re-inserts canonical 103, 104, 105 with hash B.
     const hash_b = [_]u8{0xBB} ** 32;
     for (103..106) |i| {
-        try ring.insert(i, hash_b, &dummy_topic, &dummy_addr, &dummy_entry);
+        try ring.insert(i, 0, hash_b, &dummy_topic, &dummy_addr, &dummy_entry);
     }
     try testing.expectEqual(@as(usize, 6), ring.count());
     try testing.expectEqual(@as(u64, 105), ring.latestBlock().?);

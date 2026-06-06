@@ -107,8 +107,8 @@ Five files written to `--data-dir`:
 | `blooms.bin` | Per-block topic + address blooms (1280 B/block) | Immutable after write |
 | `blocks.idx` | `block_number → (offset u64, length u32)` dense array | Immutable after write |
 | `meta.bin` | Checkpoint: `(first_block, latest_block, total_logs, file_sizes, crc32)` | Atomic rename per commit |
-| `pending.bin` | Last 64 pre-finality blocks, reorg buffer | Atomic rename per write |
-| `timestamps.bin` | Exact per-block Unix timestamp (`u32 LE`, dense by block), backfilled from the `headers` DB during import | Advisory; absent ⇒ formula fallback |
+| `pending.bin` | Last 64 pre-finality blocks + per-block timestamp, reorg buffer (`EMITPEND` magic) | Atomic rename per write |
+| `timestamps.bin` | Exact per-block Unix timestamp (`u32 LE`, dense by block), backfilled from the `headers` DB during import and extended by the follower on finalization | Advisory; absent ⇒ formula fallback |
 
 Total at mainnet chain tip: ~249 GB.
 

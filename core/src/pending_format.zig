@@ -5,14 +5,22 @@
 /// two never drift.
 ///
 /// Layout:
+///   magic "EMITPEND" (8 bytes)
 ///   count(u32 LE)
 ///   [count × Entry]:
 ///     block_number(u64 BE)
+///     timestamp(u32 LE)      — exact block time, 0 when unknown
 ///     hash(32)
 ///     topic_bloom(BLOOM_SIZE = 256)
 ///     addr_bloom(ADDR_BLOOM_SIZE = 1024)
 ///     lz4_len(u32 LE)
 ///     lz4_data(lz4_len)
+///
+/// The magic lets a reader distinguish a pre-magic (old-format) or foreign
+/// file from a genuinely corrupt one: a magic mismatch surfaces
+/// `error.InvalidMagic`, which engine/SDK treat as "no usable ring" (the
+/// follower re-baselines from meta), while a matching magic with a short body
+/// is a real `error.Truncated`.
 const std = @import("std");
 
 const bloom = @import("bloom.zig");
@@ -20,20 +28,23 @@ const types = @import("types.zig");
 
 pub const FINALITY_DEPTH = types.FINALITY_DEPTH;
 pub const HASH_SIZE: usize = 32;
+pub const MAGIC: [8]u8 = "EMITPEND".*;
+pub const HEADER_SIZE: usize = MAGIC.len + 4; // magic(8) + count(u32 LE)
 pub const FIXED_ENTRY_SIZE: usize =
-    8 + HASH_SIZE + bloom.BLOOM_SIZE + bloom.ADDR_BLOOM_SIZE + 4;
+    8 + 4 + HASH_SIZE + bloom.BLOOM_SIZE + bloom.ADDR_BLOOM_SIZE + 4;
 
 /// A parsed entry. `lz4_entry` is a non-owning slice into the source buffer
 /// passed to `parse` — callers must keep that buffer alive while reading.
 pub const Entry = struct {
     block_number: u64,
+    timestamp: u32 = 0,
     hash: [HASH_SIZE]u8,
     topic_bloom: [bloom.BLOOM_SIZE]u8,
     addr_bloom: [bloom.ADDR_BLOOM_SIZE]u8,
     lz4_entry: []const u8,
 };
 
-pub const ParseError = error{ Truncated, OutOfMemory };
+pub const ParseError = error{ Truncated, InvalidMagic, OutOfMemory };
 pub const ValidateError = ParseError || error{ NonDense, Oversized };
 
 /// Serialize a slice of entries into a freshly-allocated `pending.bin`
@@ -41,19 +52,21 @@ pub const ValidateError = ParseError || error{ NonDense, Oversized };
 /// `anytype` to accept both `pending_format.Entry` (zero-copy view) and
 /// engine-side owning variants of the same shape.
 pub fn serialize(allocator: std.mem.Allocator, entries: anytype) ![]u8 {
-    var total_size: usize = 4;
+    var total_size: usize = HEADER_SIZE;
     for (entries) |e| total_size += FIXED_ENTRY_SIZE + e.lz4_entry.len;
 
     const buf = try allocator.alloc(u8, total_size);
     errdefer allocator.free(buf);
 
-    var pos: usize = 0;
-    std.mem.writeInt(u32, buf[pos..][0..4], @intCast(entries.len), .little);
-    pos += 4;
+    @memcpy(buf[0..MAGIC.len], &MAGIC);
+    std.mem.writeInt(u32, buf[MAGIC.len..][0..4], @intCast(entries.len), .little);
+    var pos: usize = HEADER_SIZE;
 
     for (entries) |e| {
         std.mem.writeInt(u64, buf[pos..][0..8], e.block_number, .big);
         pos += 8;
+        std.mem.writeInt(u32, buf[pos..][0..4], e.timestamp, .little);
+        pos += 4;
         @memcpy(buf[pos..][0..HASH_SIZE], &e.hash);
         pos += HASH_SIZE;
         @memcpy(buf[pos..][0..bloom.BLOOM_SIZE], &e.topic_bloom);
@@ -72,18 +85,21 @@ pub fn serialize(allocator: std.mem.Allocator, entries: anytype) ![]u8 {
 /// zero-copy views into `buf`; the returned slice itself is owned by
 /// `allocator` and freed with `allocator.free`.
 pub fn parse(allocator: std.mem.Allocator, buf: []const u8) ParseError![]Entry {
-    if (buf.len < 4) return try allocator.alloc(Entry, 0);
-    const entry_count: usize = std.mem.readInt(u32, buf[0..4], .little);
+    if (buf.len < HEADER_SIZE) return try allocator.alloc(Entry, 0);
+    if (!std.mem.eql(u8, buf[0..MAGIC.len], &MAGIC)) return error.InvalidMagic;
+    const entry_count: usize = std.mem.readInt(u32, buf[MAGIC.len..][0..4], .little);
     if (entry_count == 0) return try allocator.alloc(Entry, 0);
 
     const entries = try allocator.alloc(Entry, entry_count);
     errdefer allocator.free(entries);
 
-    var pos: usize = 4;
+    var pos: usize = HEADER_SIZE;
     for (entries) |*e| {
         if (pos + FIXED_ENTRY_SIZE > buf.len) return error.Truncated;
         e.block_number = std.mem.readInt(u64, buf[pos..][0..8], .big);
         pos += 8;
+        e.timestamp = std.mem.readInt(u32, buf[pos..][0..4], .little);
+        pos += 4;
         e.hash = buf[pos..][0..HASH_SIZE].*;
         pos += HASH_SIZE;
         e.topic_bloom = buf[pos..][0..bloom.BLOOM_SIZE].*;
@@ -105,8 +121,8 @@ pub fn parse(allocator: std.mem.Allocator, buf: []const u8) ParseError![]Entry {
 /// engine's reorg recovery indexes the ring as a dense array and would
 /// silently mis-report block presence on a non-dense ring.
 pub fn parseValidated(allocator: std.mem.Allocator, buf: []const u8) ValidateError![]Entry {
-    if (buf.len >= 4) {
-        const declared: usize = std.mem.readInt(u32, buf[0..4], .little);
+    if (buf.len >= HEADER_SIZE and std.mem.eql(u8, buf[0..MAGIC.len], &MAGIC)) {
+        const declared: usize = std.mem.readInt(u32, buf[MAGIC.len..][0..4], .little);
         if (declared > FINALITY_DEPTH) return error.Oversized;
     }
     const entries = try parse(allocator, buf);
@@ -129,12 +145,20 @@ test "parse empty buffer returns empty slice" {
     try testing.expectEqual(@as(usize, 0), empty.len);
 }
 
-test "parse count=0 returns empty slice" {
-    var buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &buf, 0, .little);
+test "parse magic + count=0 returns empty slice" {
+    var buf: [HEADER_SIZE]u8 = undefined;
+    @memcpy(buf[0..MAGIC.len], &MAGIC);
+    std.mem.writeInt(u32, buf[MAGIC.len..][0..4], 0, .little);
     const parsed = try parse(testing.allocator, &buf);
     defer testing.allocator.free(parsed);
     try testing.expectEqual(@as(usize, 0), parsed.len);
+}
+
+test "parse rejects a buffer without the magic (old/foreign format)" {
+    var buf: [HEADER_SIZE]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], 1, .little); // old format started with the count
+    @memset(buf[4..], 0);
+    try testing.expectError(error.InvalidMagic, parse(testing.allocator, &buf));
 }
 
 test "serialize + parse round-trip preserves every field" {
@@ -145,6 +169,7 @@ test "serialize + parse round-trip preserves every field" {
 
     const original = [_]Entry{.{
         .block_number = 12345,
+        .timestamp = 1_700_000_000,
         .hash = hash,
         .topic_bloom = topic,
         .addr_bloom = addr,
@@ -153,28 +178,32 @@ test "serialize + parse round-trip preserves every field" {
 
     const buf = try serialize(testing.allocator, &original);
     defer testing.allocator.free(buf);
+    try testing.expectEqualSlices(u8, &MAGIC, buf[0..MAGIC.len]);
 
     const parsed = try parse(testing.allocator, buf);
     defer testing.allocator.free(parsed);
 
     try testing.expectEqual(@as(usize, 1), parsed.len);
     try testing.expectEqual(@as(u64, 12345), parsed[0].block_number);
+    try testing.expectEqual(@as(u32, 1_700_000_000), parsed[0].timestamp);
     try testing.expectEqualSlices(u8, &hash, &parsed[0].hash);
     try testing.expectEqualSlices(u8, &topic, &parsed[0].topic_bloom);
     try testing.expectEqualSlices(u8, &addr, &parsed[0].addr_bloom);
     try testing.expectEqualSlices(u8, &lz4, parsed[0].lz4_entry);
 }
 
-test "serialize empty slice produces just the count header" {
+test "serialize empty slice produces just the magic + count header" {
     const buf = try serialize(testing.allocator, &[_]Entry{});
     defer testing.allocator.free(buf);
-    try testing.expectEqual(@as(usize, 4), buf.len);
-    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, buf[0..4], .little));
+    try testing.expectEqual(HEADER_SIZE, buf.len);
+    try testing.expectEqualSlices(u8, &MAGIC, buf[0..MAGIC.len]);
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, buf[MAGIC.len..][0..4], .little));
 }
 
 test "parse rejects truncated entry header" {
-    var buf: [4 + 10]u8 = undefined;
-    std.mem.writeInt(u32, buf[0..4], 1, .little);
+    var buf: [HEADER_SIZE + 10]u8 = undefined;
+    @memcpy(buf[0..MAGIC.len], &MAGIC);
+    std.mem.writeInt(u32, buf[MAGIC.len..][0..4], 1, .little);
     try testing.expectError(error.Truncated, parse(testing.allocator, &buf));
 }
 
@@ -219,8 +248,9 @@ test "parseValidated rejects a gap" {
 }
 
 test "parseValidated rejects ring larger than FINALITY_DEPTH" {
-    var buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &buf, FINALITY_DEPTH + 1, .little);
+    var buf: [HEADER_SIZE]u8 = undefined;
+    @memcpy(buf[0..MAGIC.len], &MAGIC);
+    std.mem.writeInt(u32, buf[MAGIC.len..][0..4], FINALITY_DEPTH + 1, .little);
     try testing.expectError(error.Oversized, parseValidated(testing.allocator, &buf));
 }
 
@@ -229,11 +259,14 @@ test "parse rejects truncated lz4 payload" {
     const topic = [_]u8{0} ** bloom.BLOOM_SIZE;
     const addr = [_]u8{0} ** bloom.ADDR_BLOOM_SIZE;
 
-    var buf: [4 + FIXED_ENTRY_SIZE + 2]u8 = undefined;
-    std.mem.writeInt(u32, buf[0..4], 1, .little);
-    var pos: usize = 4;
+    var buf: [HEADER_SIZE + FIXED_ENTRY_SIZE + 2]u8 = undefined;
+    @memcpy(buf[0..MAGIC.len], &MAGIC);
+    std.mem.writeInt(u32, buf[MAGIC.len..][0..4], 1, .little);
+    var pos: usize = HEADER_SIZE;
     std.mem.writeInt(u64, buf[pos..][0..8], 1, .big);
     pos += 8;
+    std.mem.writeInt(u32, buf[pos..][0..4], 0, .little); // timestamp
+    pos += 4;
     @memcpy(buf[pos..][0..32], &hash);
     pos += 32;
     @memcpy(buf[pos..][0..bloom.BLOOM_SIZE], &topic);

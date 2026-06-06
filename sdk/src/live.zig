@@ -60,7 +60,16 @@ fn readPending(allocator: std.mem.Allocator, engine_data_dir: []const u8) !Pendi
     errdefer allocator.free(buf);
     _ = try file.readAll(buf);
 
-    const entries = try pending_format.parse(allocator, buf);
+    const entries = pending_format.parse(allocator, buf) catch |err| switch (err) {
+        // An old (pre-magic) or unrecognized pending.bin reads as empty; the
+        // engine rewrites it in the current format on its next ingest. Genuine
+        // truncation of a current-format file still surfaces.
+        error.InvalidMagic => {
+            allocator.free(buf);
+            return PendingSnapshot{ .buf = &.{}, .entries = &.{} };
+        },
+        else => return err,
+    };
     return .{ .buf = buf, .entries = entries };
 }
 
@@ -311,7 +320,14 @@ const LiveSession = struct {
         try self.maybePrefetchBlock(m, ctx, self.log_buf[0..keep]);
 
         ctx.block_number = entry.block_number;
-        ctx.timestamp = humanize.timestampOf(ctx, entry.block_number);
+        // The follower carries the exact header timestamp in pending.bin; use it
+        // directly. timestamps.bin (mmap'd at init) can't see blocks appended
+        // past the import cutoff, so the formula fallback would otherwise drift
+        // for live blocks. 0 = unknown (pre-magic engine) → derive as before.
+        ctx.timestamp = if (entry.timestamp != 0)
+            entry.timestamp
+        else
+            humanize.timestampOf(ctx, entry.block_number);
 
         for (self.log_buf[0..keep]) |log| {
             try handler_mod.dispatchLog(m, Handler, ctx, log);
@@ -1265,7 +1281,6 @@ test "finalized blocks commit to state.snap and advance the cursor" {
     }
 }
 
-
 test "tick is a no-op when pending is unchanged" {
     var engine_tmp = testing.tmpDir(.{});
     defer engine_tmp.cleanup();
@@ -1289,6 +1304,55 @@ test "tick is a no-op when pending is unchanged" {
 
     try session.tick(TestManifest, TestRunner, &runner, 100);
     try testing.expectEqual(@as(u32, 1), runner.transfers);
+}
+
+test "live dispatch uses the exact pending.bin timestamp, not the slot formula" {
+    var engine_tmp = testing.tmpDir(.{});
+    defer engine_tmp.cleanup();
+    var fake = fake_engine.FakeEngine.init(engine_tmp.dir, testing.allocator);
+    defer fake.deinit();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const engine_path = try engine_tmp.dir.realpath(".", &path_buf);
+
+    var session = try LiveSession.init(testing.allocator, engine_path);
+    defer session.deinit();
+
+    const ALICE: [20]u8 = [_]u8{0xA1} ** 20;
+    var data_buf: [32]u8 = undefined;
+    // An exact header time the slot formula would never produce for block 100.
+    const exact_ts: u32 = 1_700_000_123;
+    try fake.ingestAt(100, exact_ts, [_]u8{0xAA} ** 32, &.{makeTransferLog([_]u8{0} ** 20, ALICE, 1, &data_buf)});
+
+    var runner = TestRunner{ ._allocator = testing.allocator };
+    try session.tick(TestManifest, TestRunner, &runner, 100);
+
+    try testing.expectEqual(@as(u32, 1), runner.transfers);
+    try testing.expectEqual(@as(u64, exact_ts), runner.timestamp);
+    try testing.expect(runner.timestamp != humanize.blockTimestamp(100));
+}
+
+test "live dispatch falls back to the formula when pending carries no timestamp" {
+    var engine_tmp = testing.tmpDir(.{});
+    defer engine_tmp.cleanup();
+    var fake = fake_engine.FakeEngine.init(engine_tmp.dir, testing.allocator);
+    defer fake.deinit();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const engine_path = try engine_tmp.dir.realpath(".", &path_buf);
+
+    var session = try LiveSession.init(testing.allocator, engine_path);
+    defer session.deinit();
+
+    const ALICE: [20]u8 = [_]u8{0xA1} ** 20;
+    var data_buf: [32]u8 = undefined;
+    // Plain ingest leaves timestamp 0 (a pre-magic engine) → formula fallback.
+    try fake.ingest(100, [_]u8{0xAA} ** 32, &.{makeTransferLog([_]u8{0} ** 20, ALICE, 1, &data_buf)});
+
+    var runner = TestRunner{ ._allocator = testing.allocator };
+    try session.tick(TestManifest, TestRunner, &runner, 100);
+
+    try testing.expectEqual(@as(u64, humanize.blockTimestamp(100)), runner.timestamp);
 }
 
 test "readPending + readMeta against a FakeEngine snapshot" {
