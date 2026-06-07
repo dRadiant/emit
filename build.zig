@@ -91,6 +91,7 @@ pub fn build(b: *std.Build) void {
         .{ .path = "test/compile_fail/prefetch_param_wrong_type.zig", .expected = "references parameter `allPairsLength` of type `uint256`, expected `address`" },
         .{ .path = "test/compile_fail/prefetch_method_empty.zig", .expected = "has an empty method string" },
         .{ .path = "test/compile_fail/static_prefetch_method_empty.zig", .expected = "static_prefetch entry has an empty method string" },
+        .{ .path = "test/compile_fail/event_nested_dynamic.zig", .expected = "is a tuple with a dynamic component; nested dynamics are not yet supported" },
     };
     for (compile_fail) |s| {
         const obj = b.addObject(.{
