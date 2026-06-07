@@ -116,23 +116,32 @@ pub const Register = struct {
 
 // ── PUSH (engine → client) ───────────────────────────────────────────────────
 // block_number(u64 LE) ‖ timestamp(u32 LE) ‖ lz4_entry. The lz4 is a
-// `primary.dat` entry verbatim; the timestamp lets the remote client rebuild a
-// local `timestamps.bin` so `ctx.timestamp` is exact off-engine too. Used for
-// both backfill and live (live blocks are pending until `last_finalized` passes
-// them; a reorg is signalled out-of-band via REORG).
+// `primary.dat` entry verbatim; the timestamp rides in the entry the client
+// persists (its FilteredStore), so `ctx.timestamp` is exact off-engine.
+// Used for both backfill and live (live blocks are pending until `last_finalized`
+// passes them; a reorg is signalled out-of-band via REORG).
 
 pub const Push = struct {
-    const PREFIX = 8 + 4;
+    pub const PREFIX = 8 + 4;
     block_number: u64,
     timestamp: u32,
     lz4_entry: []const u8, // borrowed from the payload
 
+    /// The fixed 12-byte head of a PUSH payload (block ‖ timestamp), written
+    /// before the lz4 entry. Lets a streaming server emit `header ‖ prefix ‖
+    /// entry` straight from its block buffer — no copy into a payload buffer.
+    pub fn prefix(block_number: u64, timestamp: u32) [PREFIX]u8 {
+        var b: [PREFIX]u8 = undefined;
+        std.mem.writeInt(u64, b[0..8], block_number, .little);
+        std.mem.writeInt(u32, b[8..12], timestamp, .little);
+        return b;
+    }
+
     pub fn encode(self: Push, alloc: std.mem.Allocator) ![]u8 {
         const buf = try alloc.alloc(u8, PREFIX + self.lz4_entry.len);
         errdefer alloc.free(buf);
-        std.mem.writeInt(u64, buf[0..8], self.block_number, .little);
-        std.mem.writeInt(u32, buf[8..12], self.timestamp, .little);
-        @memcpy(buf[12..], self.lz4_entry);
+        @memcpy(buf[0..PREFIX], &prefix(self.block_number, self.timestamp));
+        @memcpy(buf[PREFIX..], self.lz4_entry);
         return buf;
     }
 
