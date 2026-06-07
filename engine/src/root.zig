@@ -10,6 +10,7 @@ pub const pending_ring = @import("pending_ring.zig");
 pub const receipt_decoder = @import("receipt_decoder.zig");
 pub const head_follower = @import("head_follower.zig");
 pub const rpc_import = @import("rpc_import.zig");
+pub const tcp_server = @import("tcp_server.zig");
 
 // rocksdb_import is not included here — it depends on the rocksdb lazy dep
 // and is compiled separately via `zig build import`. Tests for its decode
@@ -22,4 +23,5 @@ test {
     _ = receipt_decoder;
     _ = head_follower;
     _ = rpc_import;
+    _ = tcp_server;
 }
