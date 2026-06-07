@@ -50,14 +50,10 @@ pub const BuildResult = struct {
     elapsed_ns: u64 = 0,
 };
 
-/// Per-log keep predicate. `match_addrs` and `match_topics` are positive
-/// match sets; `exclude_addrs` is a negative filter applied after positives
-/// pass. Used by both `build` (phase 1) and `appendChildren` (phase 3).
-const Filter = struct {
-    match_addrs: []const [20]u8,
-    match_topics: []const [32]u8,
-    exclude_addrs: []const [20]u8,
-};
+/// Per-log keep predicate, shared with the engine via `core.filter`. Used by
+/// both `build` (phase 1) and `appendChildren` (phase 3): phase 1 leaves
+/// `exclude_addrs` empty; phase 3 sets it to static∪factory.
+const Filter = core.filter.Filter;
 
 /// Phase 1: build the `primary` filtered-store pair under `dir` from the
 /// manifest's static and factory addresses. Caller owns `reader` and `dir`.
@@ -271,13 +267,13 @@ fn collectAllTopics(comptime m: sdk_manifest.Manifest) []const [32]u8 {
         for (m.contracts) |c| {
             for (c.events) |E| {
                 const t = sdk_manifest.eventTopic0(E);
-                if (containsTopic(out, &t)) continue;
+                if (core.filter.containsTopic(out, &t)) continue;
                 out = out ++ &[_][32]u8{t};
             }
         }
         for (m.factories) |f| {
             const t = sdk_manifest.eventTopic0(f.create_event);
-            if (!containsTopic(out, &t)) out = out ++ &[_][32]u8{t};
+            if (!core.filter.containsTopic(out, &t)) out = out ++ &[_][32]u8{t};
         }
         return out;
     }
@@ -289,24 +285,11 @@ fn collectChildTopics(comptime m: sdk_manifest.Manifest) []const [32]u8 {
         for (m.factories) |f| {
             for (f.child_events) |E| {
                 const t = sdk_manifest.eventTopic0(E);
-                if (!containsTopic(out, &t)) out = out ++ &[_][32]u8{t};
+                if (!core.filter.containsTopic(out, &t)) out = out ++ &[_][32]u8{t};
             }
         }
         return out;
     }
-}
-
-inline fn contains(comptime N: usize, haystack: []const [N]u8, needle: *const [N]u8) bool {
-    for (haystack) |h| if (std.mem.eql(u8, &h, needle)) return true;
-    return false;
-}
-
-inline fn containsTopic(haystack: []const [32]u8, needle: *const [32]u8) bool {
-    return contains(32, haystack, needle);
-}
-
-inline fn containsAddress(haystack: []const [20]u8, needle: *const [20]u8) bool {
-    return contains(20, haystack, needle);
 }
 
 // ── Worker ───────────────────────────────────────────────────────────────
@@ -429,57 +412,25 @@ fn processBlockEntry(
         return;
     };
 
-    // Zero-copy walk: iterate logs in place, check the filter against raw
-    // bytes at known offsets, memcpy whole-log byte ranges of keepers into
-    // serialize_buf. Skips both `deserializeLogs` and the
-    // per-log `RawLog` materialization for rejected logs
-    var pos: usize = 0;
-    const log_count: usize = std.mem.readInt(u32, decompressed[pos..][0..4], .little);
-    pos += 4;
-
-    var out_pos: usize = 4;
-    var kept: u32 = 0;
-
-    for (0..log_count) |_| {
-        const log_start = pos;
-        const address: *const [20]u8 = @ptrCast(decompressed[pos + 4 ..][0..20]);
-        const topic_count = decompressed[pos + 24];
-        const topics_end = pos + 25 + @as(usize, topic_count) * 32;
-        const data_len: usize = std.mem.readInt(u32, decompressed[topics_end..][0..4], .little);
-        const log_end = topics_end + 4 + data_len + 32;
-        pos = log_end;
-
-        if (topic_count == 0) continue;
-        if (!containsAddress(args.filter.match_addrs, address)) continue;
-        const topic0: *const [32]u8 = @ptrCast(decompressed[log_start + 25 ..][0..32]);
-        if (!containsTopic(args.filter.match_topics, topic0)) continue;
-        if (containsAddress(args.filter.exclude_addrs, address)) continue;
-
-        const len = log_end - log_start;
-        @memcpy(serialize_buf[out_pos..][0..len], decompressed[log_start..log_end]);
-        out_pos += len;
-        kept += 1;
-    }
-
-    if (kept == 0) return;
-
-    std.mem.writeInt(u32, serialize_buf[0..4], kept, .little);
-
-    const entry_len = log_serial.compressEntry(serialize_buf[0..out_pos], compress_buf) catch {
+    // Precision filter (shared with the engine's TCP server via core): keep
+    // only matching logs and recompress into `compress_buf`. A compress
+    // failure on an oversize block counts as a drop; `null` = no match.
+    const maybe = core.filter.filterBlockEntry(decompressed, args.filter, serialize_buf, compress_buf) catch {
         args.dropped_blocks += 1;
         return;
     };
+    const filtered = maybe orelse return;
 
-    const owned = args.allocator.alloc(u8, entry_len) catch {
+    const owned = args.allocator.alloc(u8, filtered.entry.len) catch {
         args.dropped_blocks += 1;
         return;
     };
-    @memcpy(owned, compress_buf[0..entry_len]);
+    @memcpy(owned, filtered.entry);
 
     args.results.append(args.allocator, .{
         .block_number = block_number,
         .entry = owned,
-        .log_count = kept,
+        .log_count = filtered.log_count,
     }) catch {
         args.dropped_blocks += 1;
     };
@@ -1106,4 +1057,3 @@ test "processBlockEntry: corrupt entry counts as dropped_block (fail-loud safety
     try testing.expectEqual(@as(u64, 1), args.dropped_blocks);
     try testing.expectEqual(@as(usize, 0), results.items.len);
 }
-
