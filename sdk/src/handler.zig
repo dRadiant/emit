@@ -85,30 +85,40 @@ pub const DecodedLog = struct {
         return self.data[start + 12 ..][0..20].*;
     }
 
-    /// Read a named parameter from `E.signature`. The return type is
-    /// derived at comptime from the parsed type — `address` → `[20]u8`,
-    /// `uintN` → `uN`, `intN` → `iN`, `bool` → `bool`, `bytesN` → `[N]u8`.
-    /// Wrong parameter name lists the available params; dynamic types
-    /// (`bytes`, `string`) are rejected with a pointer at the slot-positional
-    /// helpers.
+    /// Read a named parameter from `E.signature`. The return type is derived at
+    /// comptime — `address`→`[20]u8`, `uintN`→`uN`, `intN`→`iN`, `bool`→`bool`,
+    /// `bytesN`→`[N]u8`, `T[N]`→`[N]…`, `(t1,…)`→a Zig tuple, and `T[]`→a
+    /// zero-copy `Array(T)` view borrowing `log.data`. Wrong names list the
+    /// available params. An indexed array/tuple/`bytes`/`string` stores
+    /// `keccak(value)`, not the value — those error with a pointer at the raw
+    /// `log.topics[i]`.
     pub fn param(self: DecodedLog, comptime E: type, comptime param_name: []const u8) TypeFor(resolveParam(E, param_name).type_str) {
         const p = comptime resolveParam(E, param_name);
-        const word = abi_parse.wordAt(p, &self.topics, self.data);
-        return decodeWord(TypeFor(p.type_str), p.type_str, &word);
+        if (comptime p.slot_kind == .topic) {
+            if (comptime !isTopicPrimitive(p.type_str)) @compileError("DecodedLog.param: indexed `" ++ p.type_str ++ "` stores keccak(value), not the value — read `log.topics[" ++ std.fmt.comptimePrint("{d}", .{p.slot_index}) ++ "]` directly");
+            const word = abi_parse.wordAt(p, &self.topics, self.data);
+            return decodeWord(TypeFor(p.type_str), p.type_str, &word);
+        }
+        return decodeValue(p.type_str, self.data, p.slot_index);
     }
 
     /// Decode every named parameter of `E.signature` into one struct.
     /// `ParamsOf(E)` has one field per named parameter with the right Zig
-    /// type (see `param` for the type mapping). Unnamed parameters are
-    /// skipped. Data slots beyond `self.data.len` are zero-filled (matches
-    /// the ABI's zero-padding convention; keeps the dispatcher safe against
-    /// malformed RPC responses or test fixtures with short payloads).
+    /// type (see `param`). Unnamed parameters are skipped. Data slots beyond
+    /// `self.data.len` are zero-filled (the ABI's zero-padding convention;
+    /// keeps the dispatcher safe against malformed RPC responses or short test
+    /// fixtures). Errors if any named param is an indexed non-primitive.
     pub fn decode(self: DecodedLog, comptime E: type) ParamsOf(E) {
         var out: ParamsOf(E) = undefined;
         inline for (comptime manifest.parsedEvent(E).params) |p| {
             if (comptime p.name.len == 0) continue;
-            const word = abi_parse.wordAt(p, &self.topics, self.data);
-            @field(out, p.name) = decodeWord(TypeFor(p.type_str), p.type_str, &word);
+            if (comptime p.slot_kind == .topic) {
+                if (comptime !isTopicPrimitive(p.type_str)) @compileError("DecodedLog.decode: indexed `" ++ p.type_str ++ "` stores keccak(value); read `log.topics` for it or leave it unnamed");
+                const word = abi_parse.wordAt(p, &self.topics, self.data);
+                @field(out, p.name) = decodeWord(TypeFor(p.type_str), p.type_str, &word);
+            } else {
+                @field(out, p.name) = decodeValue(p.type_str, self.data, p.slot_index);
+            }
         }
         return out;
     }
@@ -166,10 +176,23 @@ fn resolveParam(comptime E: type, comptime param_name: []const u8) abi_parse.Par
     return comptime abi_parse.paramByName(manifest.parsedEvent(E), param_name);
 }
 
-/// Map a Solidity type string to the Zig type the decoder returns:
-/// `address`→`[20]u8`, `uintN`→`uN`, `intN`→`iN`, `bytesN`→`[N]u8`,
-/// `bool`→`bool`. Dynamic types (`bytes`, `string`) are rejected.
+/// Zig type the decoder returns for an ABI type string. Recurses over the
+/// `abi_parse.typeShape` structure: `T[N]`→`[N]TypeFor(T)`, `(t1,…)`→a Zig
+/// tuple, `T[]`→an `Array(T)` view; primitives map via `PrimType`.
 fn TypeFor(comptime t: []const u8) type {
+    const s = abi_parse.typeShape(t);
+    return switch (s.tag) {
+        .primitive => PrimType(t),
+        .fixed_array => [s.len]TypeFor(s.elem),
+        .dynamic_array => Array(s.elem),
+        .tuple => TupleType(s.components),
+    };
+}
+
+/// Primitive Solidity type → Zig type. `address`→`[20]u8`, `uintN`→`uN`,
+/// `intN`→`iN`, `bytesN`→`[N]u8`, `bool`→`bool`. Dynamic `bytes`/`string`
+/// values are rejected (their storage lands with v1.2 blobs).
+fn PrimType(comptime t: []const u8) type {
     if (comptime std.mem.eql(u8, t, "address")) return [20]u8;
     if (comptime std.mem.eql(u8, t, "bool")) return bool;
     if (comptime std.mem.startsWith(u8, t, "uint")) return std.meta.Int(.unsigned, parseBits(t["uint".len..]));
@@ -177,7 +200,91 @@ fn TypeFor(comptime t: []const u8) type {
     if (comptime std.mem.startsWith(u8, t, "bytes") and t.len > "bytes".len) {
         return [parseBits(t["bytes".len..])]u8;
     }
-    @compileError("DecodedLog: type `" ++ t ++ "` not supported by auto-decoder. Use slot-positional helpers.");
+    @compileError("DecodedLog: type `" ++ t ++ "` not auto-decodable (dynamic `bytes`/`string` land with v1.2 blobs). Use slot-positional helpers.");
+}
+
+fn TupleType(comptime components: []const []const u8) type {
+    comptime var types: [components.len]type = undefined;
+    inline for (components, 0..) |c, i| types[i] = TypeFor(c);
+    return std.meta.Tuple(&types);
+}
+
+/// Zero-copy view over a dynamic array `elem[]` in `log.data`. Borrows the log
+/// data — valid only while the source `DecodedLog`/`Log(E)` is. Iterate with
+/// `arr.len` and `arr.at(i)`; element `i` is decoded on access.
+pub fn Array(comptime elem: []const u8) type {
+    return struct {
+        const Self = @This();
+        pub const Elem = TypeFor(elem);
+        /// The full `log.data` the offsets are relative to.
+        data: []const u8,
+        /// Byte offset of the array's length word within `data`.
+        tail: usize,
+        len: usize,
+
+        pub fn at(self: Self, i: usize) Elem {
+            const stride = comptime abi_parse.headWords(elem) * 32;
+            return decodeValue(elem, self.data, self.tail + 32 + i * stride);
+        }
+    };
+}
+
+/// True if `t` is a static primitive — the only thing an indexed (topic) slot
+/// can hold as its actual value. Indexed arrays/tuples/`bytes`/`string` hold
+/// `keccak(value)` instead.
+fn isTopicPrimitive(comptime t: []const u8) bool {
+    return abi_parse.typeShape(t).tag == .primitive and !abi_parse.isDynamicType(t);
+}
+
+/// Recursively decode an ABI value of canonical type `t` from `data` whose head
+/// word starts at byte `head_off`. Supports any fully-static type (nested
+/// arrays/tuples/primitives) and a top-level dynamic array of a static element;
+/// deeper dynamic nesting and `bytes`/`string` values are `@compileError`.
+fn decodeValue(comptime t: []const u8, data: []const u8, head_off: usize) TypeFor(t) {
+    const s = comptime abi_parse.typeShape(t);
+    switch (comptime s.tag) {
+        .primitive => {
+            if (comptime abi_parse.isDynamicType(t)) @compileError("DecodedLog: decode of `" ++ t ++ "` not yet supported (v1.2 blobs)"); // You can read it slot-positionally
+            const w = wordOf(data, head_off);
+            return decodeWord(PrimType(t), t, &w);
+        },
+        .fixed_array => {
+            if (comptime abi_parse.isDynamicType(t)) @compileError("DecodedLog: static array of dynamic elements (`" ++ t ++ "`) not yet supported");
+            var out: TypeFor(t) = undefined;
+            const stride = comptime abi_parse.headWords(s.elem) * 32;
+            inline for (0..s.len) |i| out[i] = decodeValue(s.elem, data, head_off + i * stride);
+            return out;
+        },
+        .tuple => {
+            if (comptime abi_parse.isDynamicType(t)) @compileError("DecodedLog: `" ++ t ++ "` is a tuple with a dynamic component; nested dynamics are not yet supported"); // You can read it slot-positionally
+            var out: TypeFor(t) = undefined;
+            comptime var off: usize = 0;
+            inline for (s.components, 0..) |c, i| {
+                out[i] = decodeValue(c, data, head_off + off);
+                off += comptime abi_parse.headWords(c) * 32;
+            }
+            return out;
+        },
+        .dynamic_array => {
+            if (comptime abi_parse.isDynamicType(s.elem)) @compileError("DecodedLog: dynamic array of dynamic elements (`" ++ t ++ "`) not yet supported");
+            // Head word holds the tail offset (relative to `data`); the word at
+            // that offset is the length, then the elements follow.
+            const tail = readOffset(data, head_off);
+            return TypeFor(t){ .data = data, .tail = tail, .len = readOffset(data, tail) };
+        },
+    }
+}
+
+/// 32-byte word at `off`, zero-filled when `data` is short (ABI zero-padding
+/// and the guard against truncated/malformed payloads).
+fn wordOf(data: []const u8, off: usize) [32]u8 {
+    return if (data.len < off + 32) std.mem.zeroes([32]u8) else data[off..][0..32].*;
+}
+
+/// Read the big-endian word at `off` as a byte offset/length (truncated to usize).
+fn readOffset(data: []const u8, off: usize) usize {
+    const w = wordOf(data, off);
+    return @truncate(std.mem.readInt(u256, &w, .big));
 }
 
 /// Comptime struct synthesized from `E.signature`: one field per named
@@ -618,4 +725,109 @@ test "EventId pack/unpack round-trips and lays out big-endian" {
     try std.testing.expectEqual(@as(u64, 100), ev.block_number);
     try std.testing.expectEqual(@as(u32, 5), ev.tx_index);
     try std.testing.expectEqual(@as(u32, 9), ev.log_index);
+}
+
+// ── Array / tuple decode tests ───────────────────────────────────────────
+
+fn dataLog(data: []const u8) DecodedLog {
+    return .{
+        .block_number = 1,
+        .tx_index = 0,
+        .log_index = 0,
+        .tx_hash = [_]u8{0} ** 32,
+        .address = [_]u8{0} ** 20,
+        .topics = std.mem.zeroes([4][32]u8),
+        .topic_count = 1,
+        .data = data,
+    };
+}
+
+fn wU256(buf: *[32]u8, v: u256) void {
+    std.mem.writeInt(u256, buf, v, .big);
+}
+
+test "decode a static tuple of (address, uint256)" {
+    const E = struct {
+        pub const signature = "E((address,uint256) pair)";
+    };
+    var data: [64]u8 = std.mem.zeroes([64]u8);
+    const ADDR = [_]u8{0xAB} ** 20;
+    @memcpy(data[12..32], &ADDR); // address left-padded in word 0
+    wU256(data[32..64], 0xDEAD);
+    const log = dataLog(&data);
+
+    const pair = log.param(E, "pair");
+    try std.testing.expectEqualSlices(u8, &ADDR, &pair[0]);
+    try std.testing.expectEqual(@as(u256, 0xDEAD), pair[1]);
+}
+
+test "decode a static array uint256[3]" {
+    const E = struct {
+        pub const signature = "E(uint256[3] arr)";
+    };
+    var data: [96]u8 = std.mem.zeroes([96]u8);
+    wU256(data[0..32], 10);
+    wU256(data[32..64], 20);
+    wU256(data[64..96], 30);
+
+    const arr = dataLog(&data).param(E, "arr");
+    try std.testing.expectEqual([3]u256{ 10, 20, 30 }, arr);
+}
+
+test "decode a dynamic array uint256[] via the Array view" {
+    const E = struct {
+        pub const signature = "E(uint256[] amounts)";
+    };
+    // head: offset 0x20 → tail; tail: len=3, then 3 elements.
+    var data: [160]u8 = std.mem.zeroes([160]u8);
+    wU256(data[0..32], 0x20);
+    wU256(data[32..64], 3);
+    wU256(data[64..96], 100);
+    wU256(data[96..128], 200);
+    wU256(data[128..160], 300);
+
+    const amounts = dataLog(&data).param(E, "amounts");
+    try std.testing.expectEqual(@as(usize, 3), amounts.len);
+    try std.testing.expectEqual(@as(u256, 100), amounts.at(0));
+    try std.testing.expectEqual(@as(u256, 200), amounts.at(1));
+    try std.testing.expectEqual(@as(u256, 300), amounts.at(2));
+}
+
+test "decode a dynamic array address[] (governance-style)" {
+    const E = struct {
+        pub const signature = "E(address[] voters)";
+    };
+    const A1 = [_]u8{0x11} ** 20;
+    const A2 = [_]u8{0x22} ** 20;
+    var data: [128]u8 = std.mem.zeroes([128]u8);
+    wU256(data[0..32], 0x20);
+    wU256(data[32..64], 2);
+    @memcpy(data[64 + 12 .. 64 + 32], &A1);
+    @memcpy(data[96 + 12 .. 96 + 32], &A2);
+
+    const voters = dataLog(&data).param(E, "voters");
+    try std.testing.expectEqual(@as(usize, 2), voters.len);
+    try std.testing.expectEqualSlices(u8, &A1, &voters.at(0));
+    try std.testing.expectEqualSlices(u8, &A2, &voters.at(1));
+}
+
+test "mixed: primitive, dynamic array, primitive — slot offsets + tail" {
+    const E = struct {
+        pub const signature = "E(uint256 a, uint256[] arr, uint256 b)";
+    };
+    // head: a (off 0), arr offset = 0x60 (off 32), b (off 64); tail at 0x60.
+    var data: [192]u8 = std.mem.zeroes([192]u8);
+    wU256(data[0..32], 11);
+    wU256(data[32..64], 0x60);
+    wU256(data[64..96], 22);
+    wU256(data[96..128], 2); // arr length
+    wU256(data[128..160], 7);
+    wU256(data[160..192], 8);
+
+    const d = dataLog(&data).decode(E);
+    try std.testing.expectEqual(@as(u256, 11), d.a);
+    try std.testing.expectEqual(@as(u256, 22), d.b);
+    try std.testing.expectEqual(@as(usize, 2), d.arr.len);
+    try std.testing.expectEqual(@as(u256, 7), d.arr.at(0));
+    try std.testing.expectEqual(@as(u256, 8), d.arr.at(1));
 }

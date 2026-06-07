@@ -38,6 +38,8 @@ pub const ContractDef = manifest.ContractDef;
 pub const DecodedLog = handler.DecodedLog;
 pub const EventId = handler.EventId;
 pub const Log = handler.Log;
+/// Zero-copy view over a decoded dynamic array `T[]` (`.len` / `.at(i)`).
+pub const Array = handler.Array;
 pub const FactoryDef = manifest.FactoryDef;
 pub const init = entry.init;
 pub const Manifest = manifest.Manifest;
