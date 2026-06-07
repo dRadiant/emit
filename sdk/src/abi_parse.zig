@@ -90,14 +90,6 @@ fn parseEventInner(comptime sig: []const u8) ParsedEvent {
     if (sig[sig.len - 1] != ')') err(sig, "must end with ')'");
     const close = sig.len - 1;
 
-    // Tuple/array support is rejected here so the slot-assignment logic
-    // stays flat. Add when a real-world event needs it.
-    for (sig[open + 1 .. close]) |c| switch (c) {
-        '(', ')' => err(sig, "nested parens (tuple types) not yet supported"),
-        '[', ']' => err(sig, "array types not yet supported"),
-        else => {},
-    };
-
     const event_name = trim(sig[0..open]);
     if (event_name.len == 0) err(sig, "missing event name before '('");
     if (!isIdent(event_name)) err(sig, "event name `" ++ event_name ++ "` is not a valid identifier");
@@ -110,17 +102,10 @@ fn parseEventInner(comptime sig: []const u8) ParsedEvent {
     var indexed_count: usize = 0;
 
     const inner = sig[open + 1 .. close];
-    var start: usize = 0;
-    var pos: usize = 0;
-    while (true) : (pos += 1) {
-        const at_end = pos == inner.len;
-        if (!at_end and inner[pos] != ',') continue;
-
-        const part = trim(inner[start..pos]);
-        if (part.len == 0) {
-            if (at_end and start == 0) break; // `Name()` — no params.
-            err(sig, "empty param (stray or trailing comma?)");
-        }
+    const parts: []const []const u8 = if (trim(inner).len == 0) &.{} else splitTopLevel(inner);
+    for (parts) |raw_part| {
+        const part = trim(raw_part);
+        if (part.len == 0) err(sig, "empty param (stray or trailing comma?)");
 
         var p = parseParam(sig, part);
 
@@ -138,15 +123,14 @@ fn parseEventInner(comptime sig: []const u8) ParsedEvent {
         } else {
             p.slot_kind = .data;
             p.slot_index = data_word * 32;
-            data_word += 1;
+            // Static arrays/tuples occupy several head words; dynamic types one
+            // (the tail offset). `headWords` advances the cursor accordingly.
+            data_word += headWords(p.type_str);
         }
 
         params = params ++ &[_]ParsedParam{p};
         if (canonical_types.len > 0) canonical_types = canonical_types ++ ",";
         canonical_types = canonical_types ++ p.type_str;
-
-        if (at_end) break;
-        start = pos + 1;
     }
 
     return .{
@@ -157,33 +141,57 @@ fn parseEventInner(comptime sig: []const u8) ParsedEvent {
 }
 
 fn parseParam(comptime sig: []const u8, comptime part: []const u8) ParsedParam {
-    // Tokenize by ASCII whitespace: 1..3 tokens of the form `TYPE [indexed] [NAME]`.
-    var tokens: []const []const u8 = &.{};
+    // The type span comes first: a tuple `(...)` (balanced parens) or a bare
+    // base token, then any `[..]` array suffixes. Tuples carry internal commas
+    // and spaces, so a flat whitespace tokenizer can't be used for the type.
     var i: usize = 0;
+    while (i < part.len and isWs(part[i])) i += 1;
+    const type_start = i;
+    if (i < part.len and part[i] == '(') {
+        var depth: usize = 0;
+        while (i < part.len) : (i += 1) {
+            if (part[i] == '(') depth += 1 else if (part[i] == ')') {
+                depth -= 1;
+                if (depth == 0) {
+                    i += 1;
+                    break;
+                }
+            }
+        }
+    } else {
+        while (i < part.len and !isWs(part[i]) and part[i] != '[') i += 1;
+    }
+    while (i < part.len and part[i] == '[') {
+        while (i < part.len and part[i] != ']') i += 1;
+        if (i < part.len) i += 1; // consume ']'
+    }
+    const type_tok = part[type_start..i];
+    if (type_tok.len == 0) err(sig, "empty param");
+
+    // Remainder: whitespace-separated optional `indexed` and arg name.
+    var rest: []const []const u8 = &.{};
     while (i < part.len) {
         while (i < part.len and isWs(part[i])) i += 1;
         if (i >= part.len) break;
-        const tok_start = i;
+        const ts = i;
         while (i < part.len and !isWs(part[i])) i += 1;
-        tokens = tokens ++ &[_][]const u8{part[tok_start..i]};
+        rest = rest ++ &[_][]const u8{part[ts..i]};
     }
-
-    if (tokens.len == 0) err(sig, "empty param");
-    if (tokens.len > 3) err(sig, "param `" ++ part ++ "` has too many tokens (expected `TYPE [indexed] [NAME]`)");
+    if (rest.len > 2) err(sig, "param `" ++ part ++ "` has too many tokens (expected `TYPE [indexed] [NAME]`)");
 
     var indexed = false;
     var name_tok: []const u8 = "";
-    if (tokens.len == 2) {
-        if (std.mem.eql(u8, tokens[1], "indexed")) indexed = true else name_tok = tokens[1];
-    } else if (tokens.len == 3) {
-        if (!std.mem.eql(u8, tokens[1], "indexed")) err(sig, "expected `indexed` after the type in param `" ++ part ++ "`");
+    if (rest.len == 1) {
+        if (std.mem.eql(u8, rest[0], "indexed")) indexed = true else name_tok = rest[0];
+    } else if (rest.len == 2) {
+        if (!std.mem.eql(u8, rest[0], "indexed")) err(sig, "expected `indexed` after the type in param `" ++ part ++ "`");
         indexed = true;
-        name_tok = tokens[2];
+        name_tok = rest[1];
     }
 
     if (name_tok.len > 0 and !isIdent(name_tok)) err(sig, "arg name `" ++ name_tok ++ "` is not a valid identifier");
 
-    const canonical_type = canonicalizeType(tokens[0]) orelse err(sig, "unsupported type `" ++ tokens[0] ++ "` (supported: address, bool, uintN/intN where N%8==0 and 8≤N≤256, bytesN where 1≤N≤32, bytes, string)");
+    const canonical_type = canonicalizeType(type_tok) orelse err(sig, "unsupported type `" ++ type_tok ++ "` (supported: address, bool, uintN, intN, bytesN, bytes, string, and arrays/tuples of these)");
 
     return .{
         .name = name_tok,
@@ -194,7 +202,118 @@ fn parseParam(comptime sig: []const u8, comptime part: []const u8) ParsedParam {
     };
 }
 
+pub const ShapeTag = enum { primitive, fixed_array, dynamic_array, tuple };
+
+pub const TypeShape = struct {
+    tag: ShapeTag,
+    elem: []const u8 = "", // array element type
+    len: usize = 0, // fixed-array length
+    components: []const []const u8 = &.{}, // tuple component types
+};
+
+/// One-level structural view of a type string; recurse by calling `typeShape`
+/// again on `elem`/`components`. A trailing `[..]` suffix takes precedence over
+/// a leading tuple paren, so `(a,b)[]` is an array of the tuple `(a,b)`. The
+/// handler decoder drives off this so type structure has a single source.
+pub fn typeShape(comptime t: []const u8) TypeShape {
+    if (t.len == 0) return .{ .tag = .primitive };
+    if (t[t.len - 1] == ']') {
+        // Match the '[' of the trailing suffix (brackets don't nest in types).
+        var depth: usize = 0;
+        var i: usize = t.len;
+        while (i > 0) {
+            i -= 1;
+            if (t[i] == ']') depth += 1 else if (t[i] == '[') {
+                depth -= 1;
+                if (depth == 0) break;
+            }
+        }
+        const elem = t[0..i];
+        const inside = t[i + 1 .. t.len - 1];
+        if (inside.len == 0) return .{ .tag = .dynamic_array, .elem = elem };
+        const n = std.fmt.parseInt(usize, inside, 10) catch return .{ .tag = .primitive };
+        return .{ .tag = .fixed_array, .elem = elem, .len = n };
+    }
+    if (t[0] == '(' and t[t.len - 1] == ')') {
+        return .{ .tag = .tuple, .components = splitTopLevel(t[1 .. t.len - 1]) };
+    }
+    return .{ .tag = .primitive };
+}
+
+/// Split on top-level commas, ignoring those inside `()` / `[]`. Always returns
+/// at least one part; a trailing comma yields a trailing empty part (rejected
+/// upstream as an empty param / component).
+fn splitTopLevel(comptime s: []const u8) []const []const u8 {
+    var parts: []const []const u8 = &.{};
+    var depth: usize = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (c == '(' or c == '[') depth += 1 else if (c == ')' or c == ']') {
+            if (depth > 0) depth -= 1;
+        } else if (c == ',' and depth == 0) {
+            parts = parts ++ &[_][]const u8{s[start..i]};
+            start = i + 1;
+        }
+    }
+    return parts ++ &[_][]const u8{s[start..]};
+}
+
+/// True if the ABI type is dynamically sized (its head is a single tail
+/// offset): `bytes`, `string`, any `T[]`, a fixed array of a dynamic element,
+/// or a tuple with any dynamic component.
+pub fn isDynamicType(comptime t: []const u8) bool {
+    const s = typeShape(t);
+    return switch (s.tag) {
+        .dynamic_array => true,
+        .fixed_array => isDynamicType(s.elem),
+        .tuple => blk: {
+            for (s.components) |c| if (isDynamicType(trim(c))) break :blk true;
+            break :blk false;
+        },
+        .primitive => std.mem.eql(u8, t, "bytes") or std.mem.eql(u8, t, "string"),
+    };
+}
+
+/// Number of 32-byte words the type occupies in the ABI head. Dynamic types
+/// take one (the tail offset); a static fixed array takes `len × elem`; a
+/// static tuple takes the sum over its components; a primitive takes one.
+pub fn headWords(comptime t: []const u8) usize {
+    if (isDynamicType(t)) return 1;
+    const s = typeShape(t);
+    return switch (s.tag) {
+        .dynamic_array => 1, // unreachable (caught above); keeps the switch total
+        .fixed_array => s.len * headWords(s.elem),
+        .tuple => blk: {
+            var n: usize = 0;
+            for (s.components) |c| n += headWords(trim(c));
+            break :blk n;
+        },
+        .primitive => 1,
+    };
+}
+
+/// Canonicalize a type to its solc form (aliases resolved, recursively through
+/// arrays and tuples) so topic0 = keccak(canonical) matches the compiler.
 fn canonicalizeType(comptime t: []const u8) ?[]const u8 {
+    const s = typeShape(t);
+    switch (s.tag) {
+        .dynamic_array => return (canonicalizeType(s.elem) orelse return null) ++ "[]",
+        .fixed_array => return (canonicalizeType(s.elem) orelse return null) ++ "[" ++ std.fmt.comptimePrint("{d}", .{s.len}) ++ "]",
+        .tuple => {
+            var out: []const u8 = "(";
+            for (s.components, 0..) |c, i| {
+                if (i > 0) out = out ++ ",";
+                out = out ++ (canonicalizeType(trim(c)) orelse return null);
+            }
+            return out ++ ")";
+        },
+        .primitive => return canonicalizePrimitive(t),
+    }
+}
+
+fn canonicalizePrimitive(comptime t: []const u8) ?[]const u8 {
     // Aliases first so the prefix branches don't claim them.
     if (std.mem.eql(u8, t, "address")) return "address";
     if (std.mem.eql(u8, t, "bool")) return "bool";
@@ -382,4 +501,48 @@ test "paramByName resolves" {
     const to = comptime paramByName(p, "to");
     try std.testing.expectEqual(.topic, to.slot_kind);
     try std.testing.expectEqual(@as(usize, 2), to.slot_index);
+}
+
+test "array suffixes canonicalize and resolve element aliases" {
+    const p = comptime parseEvent("E(uint[] amounts, address[3] who, bytes32[] roots)");
+    try std.testing.expectEqualStrings("E(uint256[],address[3],bytes32[])", p.canonical);
+}
+
+test "tuple canonicalizes with element aliases and whitespace" {
+    const p = comptime parseEvent("E( (address, uint) pair, (uint24,int24,address) key )");
+    try std.testing.expectEqualStrings("E((address,uint256),(uint24,int24,address))", p.canonical);
+}
+
+test "array of tuple canonicalizes (parse only; decode deferred)" {
+    const p = comptime parseEvent("E((address,uint256)[] items)");
+    try std.testing.expectEqualStrings("E((address,uint256)[])", p.canonical);
+}
+
+test "dynamic array occupies one head word" {
+    const p = comptime parseEvent("E(address indexed a, uint256[] amounts, uint256 total)");
+    try std.testing.expectEqual(@as(usize, 0), (comptime paramByName(p, "amounts")).slot_index);
+    try std.testing.expectEqual(@as(usize, 32), (comptime paramByName(p, "total")).slot_index);
+}
+
+test "static array occupies N head words" {
+    const p = comptime parseEvent("E(uint256[3] arr, address who)");
+    try std.testing.expectEqual(@as(usize, 96), (comptime paramByName(p, "who")).slot_index);
+}
+
+test "static tuple occupies the sum of its components" {
+    const p = comptime parseEvent("E((address,uint256) pair, bool flag)");
+    try std.testing.expectEqual(@as(usize, 64), (comptime paramByName(p, "flag")).slot_index);
+}
+
+test "headWords and isDynamicType for arrays and tuples" {
+    try std.testing.expectEqual(@as(usize, 1), comptime headWords("uint256"));
+    try std.testing.expectEqual(@as(usize, 1), comptime headWords("uint256[]")); // dynamic → 1
+    try std.testing.expectEqual(@as(usize, 3), comptime headWords("uint256[3]")); // static → 3
+    try std.testing.expectEqual(@as(usize, 2), comptime headWords("(address,uint256)"));
+    try std.testing.expectEqual(@as(usize, 1), comptime headWords("(address,uint256)[]"));
+    try std.testing.expect(comptime isDynamicType("bytes"));
+    try std.testing.expect(comptime isDynamicType("uint256[]"));
+    try std.testing.expect(comptime !isDynamicType("uint256[3]"));
+    try std.testing.expect(comptime !isDynamicType("(address,uint256)"));
+    try std.testing.expect(comptime isDynamicType("(address,bytes)")); // tuple w/ dynamic component
 }
