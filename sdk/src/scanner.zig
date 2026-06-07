@@ -153,9 +153,11 @@ pub fn replay(
         if (next_p == null and next_c == null) break;
 
         const block_number = pickMin(next_p, next_c);
+        var block_ts: u32 = 0;
 
         var merge_count: usize = 0;
         if (primary) |p| if (next_p) |bn| if (bn == block_number) {
+            block_ts = p.peekedTimestamp();
             const logs = try p.consume(block_number, decompress_primary, log_buf_primary);
             for (logs) |log| {
                 merge_buf[merge_count] = log;
@@ -164,6 +166,7 @@ pub fn replay(
         };
         if (children) |c| {
             if (next_c) |bn| if (bn == block_number) {
+                if (block_ts == 0) block_ts = c.peekedTimestamp();
                 const logs = try c.consume(block_number, decompress_children, log_buf_children);
                 for (logs) |log| {
                     merge_buf[merge_count] = log;
@@ -175,10 +178,11 @@ pub fn replay(
         if (merge_count == 0) continue;
         std.mem.sort(RawLog, merge_buf[0..merge_count], {}, lessByTxLog);
 
-        // Update ctx for this block. Handlers that want timestamp can read
-        // it from ctx; we set it once per block to avoid recomputing.
+        // Update ctx for this block. Prefer the exact time carried in the
+        // FilteredStore entry — the remote stream fills it from the PUSH frame;
+        // 0 means a local build, so fall back to the engine's timestamps.bin.
         ctx.block_number = block_number;
-        ctx.timestamp = humanize.timestampOf(ctx, block_number);
+        ctx.timestamp = if (block_ts != 0) @as(u64, block_ts) else humanize.timestampOf(ctx, block_number);
         result.blocks_dispatched += 1;
 
         for (merge_buf[0..merge_count]) |log| {
@@ -280,6 +284,12 @@ const CursorWalker = struct {
             self.peeked = self.store.readEntry(self.next_index) catch return null;
         }
         return self.peeked.?.block_number;
+    }
+
+    /// Exact block time of the peeked entry (0 = unknown). Valid only after
+    /// `peek` cached the entry; the merge loop reads it before `consume`.
+    fn peekedTimestamp(self: *const CursorWalker) u32 {
+        return if (self.peeked) |e| e.timestamp else 0;
     }
 
     fn consume(
@@ -537,10 +547,7 @@ test "scanCreations: extracts spawned addresses from factory creation events" {
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
 
-
-
     _ = try filter_builder.build(&reader, FactoryManifest, dst_tmp.dir, allocator);
-
 
     var discovered = try scanCreations(dst_tmp.dir, FactoryManifest, allocator);
     defer discovered.deinit();
@@ -585,10 +592,7 @@ test "replay: dispatches logs in canonical (block, tx, log_index) order across o
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
 
-
-
     _ = try filter_builder.build(&reader, Manifest, dst_tmp.dir, allocator);
-
 
     var counter = Counter{ .allocator = allocator };
     defer counter.deinit();
@@ -640,10 +644,7 @@ test "replay seeks past start_block so already-dispatched range is skipped" {
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
 
-
-
     _ = try filter_builder.build(&reader, Manifest, dst_tmp.dir, allocator);
-
 
     var counter = Counter{ .allocator = allocator };
     defer counter.deinit();
@@ -707,8 +708,6 @@ test "replay: k-way merge across BLOCKS_PRIMARY and BLOCKS_CHILDREN preserves bl
 
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
-
-
 
     _ = try filter_builder.build(&reader, FactoryManifest, dst_tmp.dir, allocator);
     const child_addrs = [_][20]u8{ CHILD_1, CHILD_2 };
@@ -843,8 +842,6 @@ test "factory orchestration: build → scanCreations → appendChildren → repl
 
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
-
-
 
     _ = try filter_builder.build(&reader, FactoryManifest, dst_tmp.dir, allocator);
 

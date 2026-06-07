@@ -3,7 +3,7 @@
 ///
 /// Layout per pair (base = "primary" or "children", etc.):
 ///   <base>.dat    magic "EMITFDAT" + LZ4-compressed log entries appended sequentially
-///   <base>.idx    magic "EMITFIDX" + dense [(block_number u64 BE, offset u64 LE, length u32 LE)]
+///   <base>.idx    magic "EMITFIDX" + dense [(block_number u64 BE, timestamp u32 LE, offset u64 LE, length u32 LE)]
 ///
 /// The idx file's authoritative entry count is `(idx_size - MAGIC_SIZE) / ENTRY_SIZE`.
 /// A crashed append may leave the dat file longer than the idx claims; the
@@ -20,7 +20,7 @@ const std = @import("std");
 
 const core = @import("core");
 
-pub const ENTRY_SIZE: usize = 8 + 8 + 4;
+pub const ENTRY_SIZE: usize = 8 + 4 + 8 + 4; // block(BE) + timestamp(LE) + offset(LE) + length(LE)
 const MAGIC_DAT: core.flat_format.Magic = "EMITFDAT".*;
 const MAGIC_IDX: core.flat_format.Magic = "EMITFIDX".*;
 const HEADER_SIZE: usize = core.flat_format.MAGIC_SIZE;
@@ -29,6 +29,10 @@ pub const Error = error{ OutOfOrder, IndexInconsistent, Truncated, BufferTooSmal
 
 pub const IndexEntry = struct {
     block_number: u64,
+    /// Exact block time (u32 epoch-seconds). 0 = unknown: local builds leave it
+    /// 0 and the scanner falls back to the engine's `timestamps.bin`; the remote
+    /// client fills it from the PUSH frame so an off-engine store is self-timed.
+    timestamp: u32,
     offset: u64,
     length: u32,
 };
@@ -100,11 +104,15 @@ pub const FilteredStore = struct {
         self.idx_file.close();
     }
 
-    /// Append `(block_number, lz4_entry)`. Block numbers MUST be strictly
-    /// increasing (mirrors the engine's flat-store monotonic invariant).
+    /// Append `(block_number, timestamp, lz4_entry)`. Block numbers MUST be
+    /// strictly increasing (mirrors the engine's flat-store monotonic
+    /// invariant). `timestamp` is the exact block time, or 0 when unknown —
+    /// local builds pass 0 and the scanner falls back to `timestamps.bin`; the
+    /// remote client passes the PUSH timestamp so the store is self-timed.
     pub fn appendEntry(
         self: *Self,
         block_number: u64,
+        timestamp: u32,
         lz4_entry: []const u8,
     ) !void {
         if (self.entry_count > 0) {
@@ -116,8 +124,9 @@ pub const FilteredStore = struct {
 
         var entry_bytes: [ENTRY_SIZE]u8 = undefined;
         std.mem.writeInt(u64, entry_bytes[0..8], block_number, .big);
-        std.mem.writeInt(u64, entry_bytes[8..16], self.dat_size, .little);
-        std.mem.writeInt(u32, entry_bytes[16..20], @intCast(lz4_entry.len), .little);
+        std.mem.writeInt(u32, entry_bytes[8..12], timestamp, .little);
+        std.mem.writeInt(u64, entry_bytes[12..20], self.dat_size, .little);
+        std.mem.writeInt(u32, entry_bytes[20..24], @intCast(lz4_entry.len), .little);
         const idx_offset = HEADER_SIZE + self.entry_count * ENTRY_SIZE;
         try self.idx_file.pwriteAll(&entry_bytes, idx_offset);
 
@@ -173,8 +182,9 @@ fn readEntryAt(idx_file: std.fs.File, i: u64) !IndexEntry {
     if ((try idx_file.pread(&buf, offset)) != ENTRY_SIZE) return error.Truncated;
     return .{
         .block_number = std.mem.readInt(u64, buf[0..8], .big),
-        .offset = std.mem.readInt(u64, buf[8..16], .little),
-        .length = std.mem.readInt(u32, buf[16..20], .little),
+        .timestamp = std.mem.readInt(u32, buf[8..12], .little),
+        .offset = std.mem.readInt(u64, buf[12..20], .little),
+        .length = std.mem.readInt(u32, buf[20..24], .little),
     };
 }
 
@@ -200,8 +210,8 @@ test "append then read round-trips entries" {
 
     const payload_a = [_]u8{ 0xAA, 0xBB, 0xCC };
     const payload_b = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
-    try s.appendEntry(100, &payload_a);
-    try s.appendEntry(101, &payload_b);
+    try s.appendEntry(100, 0, &payload_a);
+    try s.appendEntry(101, 1_700_000_000, &payload_b);
 
     try testing.expectEqual(@as(u64, 2), s.count());
 
@@ -211,7 +221,11 @@ test "append then read round-trips entries" {
 
     const e0 = try s.readEntry(0);
     try testing.expectEqual(@as(u64, 100), e0.block_number);
+    try testing.expectEqual(@as(u32, 0), e0.timestamp);
     try testing.expectEqual(@as(u32, payload_a.len), e0.length);
+
+    const e1 = try s.readEntry(1);
+    try testing.expectEqual(@as(u32, 1_700_000_000), e1.timestamp);
 }
 
 test "out-of-order append is rejected" {
@@ -222,9 +236,9 @@ test "out-of-order append is rejected" {
     defer s.deinit();
 
     const payload = [_]u8{0xAA};
-    try s.appendEntry(100, &payload);
-    try testing.expectError(error.OutOfOrder, s.appendEntry(100, &payload));
-    try testing.expectError(error.OutOfOrder, s.appendEntry(99, &payload));
+    try s.appendEntry(100, 0, &payload);
+    try testing.expectError(error.OutOfOrder, s.appendEntry(100, 0, &payload));
+    try testing.expectError(error.OutOfOrder, s.appendEntry(99, 0, &payload));
 }
 
 test "seekPast finds the first entry past a cursor" {
@@ -235,7 +249,7 @@ test "seekPast finds the first entry past a cursor" {
     defer s.deinit();
 
     const p = [_]u8{0};
-    for ([_]u64{ 100, 200, 300, 400 }) |bn| try s.appendEntry(bn, &p);
+    for ([_]u64{ 100, 200, 300, 400 }) |bn| try s.appendEntry(bn, 0, &p);
 
     try testing.expectEqual(@as(u64, 0), try s.seekPast(0));
     try testing.expectEqual(@as(u64, 1), try s.seekPast(100));
@@ -253,7 +267,7 @@ test "persistence across close and re-open" {
     {
         var s = try FilteredStore.open(testing.allocator, tmp.dir, "primary");
         defer s.deinit();
-        try s.appendEntry(42, &payload);
+        try s.appendEntry(42, 0, &payload);
         try s.syncAll();
     }
 
@@ -272,7 +286,7 @@ test "trailing partial idx entry is truncated on open" {
     {
         var s = try FilteredStore.open(testing.allocator, tmp.dir, "primary");
         defer s.deinit();
-        try s.appendEntry(10, &payload);
+        try s.appendEntry(10, 0, &payload);
     }
 
     // Tack on a partial idx entry (fewer than 20 bytes).
@@ -288,7 +302,7 @@ test "trailing partial idx entry is truncated on open" {
     try testing.expectEqual(@as(u64, 1), s.count());
 
     // Next append works at the right offset.
-    try s.appendEntry(11, &payload);
+    try s.appendEntry(11, 0, &payload);
     try testing.expectEqual(@as(u64, 2), s.count());
 }
 
@@ -300,7 +314,7 @@ test "last idx entry referencing past-dat-end is dropped on open" {
     {
         var s = try FilteredStore.open(testing.allocator, tmp.dir, "primary");
         defer s.deinit();
-        try s.appendEntry(10, &payload);
+        try s.appendEntry(10, 0, &payload);
     }
 
     // Forge an idx entry whose offset+length exceeds the dat file.
@@ -308,9 +322,10 @@ test "last idx entry referencing past-dat-end is dropped on open" {
         const idx = try tmp.dir.openFile("primary.idx", .{ .mode = .read_write });
         defer idx.close();
         var forged: [ENTRY_SIZE]u8 = undefined;
-        std.mem.writeInt(u64, forged[0..8], 11, .big);
-        std.mem.writeInt(u64, forged[8..16], 9999, .little);
-        std.mem.writeInt(u32, forged[16..20], 100, .little);
+        std.mem.writeInt(u64, forged[0..8], 11, .big); // block_number
+        std.mem.writeInt(u32, forged[8..12], 0, .little); // timestamp
+        std.mem.writeInt(u64, forged[12..20], 9999, .little); // offset past dat end
+        std.mem.writeInt(u32, forged[20..24], 100, .little); // length
         const end = try idx.getEndPos();
         try idx.pwriteAll(&forged, end);
     }

@@ -238,7 +238,10 @@ fn runPhase(
 
     for (0..num_workers) |i| {
         for (worker_results[i].items) |fb| {
-            try store.appendEntry(fb.block_number, fb.entry);
+            // Local build leaves the FilteredStore timestamp 0; the scanner
+            // falls back to the engine's timestamps.bin via `timestampOf`. The
+            // remote client is the path that fills it (from the PUSH frame).
+            try store.appendEntry(fb.block_number, 0, fb.entry);
             result.blocks_matched += 1;
             result.total_logs += fb.log_count;
         }
