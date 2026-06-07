@@ -16,6 +16,7 @@ pub const pending_format = @import("pending_format.zig");
 pub const atomic_file = @import("atomic_file.zig");
 pub const flat_format = @import("flat_format.zig");
 pub const timestamps = @import("timestamps.zig");
+pub const tcp_frame = @import("tcp_frame.zig");
 
 // Re-export commonly used types at top level for convenience.
 pub const RawLog = types.RawLog;
@@ -37,4 +38,5 @@ test {
     _ = atomic_file;
     _ = flat_format;
     _ = timestamps;
+    _ = tcp_frame;
 }
