@@ -121,8 +121,8 @@ fn streamBackfill(
     };
 
     // One block's worth of scratch each, heap not stack (BLOCK_BUF_SIZE is 4 MB).
-    // Sequential pread per block. Network write dominates a remote client, so
-    // io_uring batching like the sdk builder buys little here.
+    // Sequential pread per block. A parallel read pipeline like the SDK build's
+    // would overlap read and filter, the dominant backfill cost (measured ~2x).
     const read_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
     defer allocator.free(read_buf);
     const decompress_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);

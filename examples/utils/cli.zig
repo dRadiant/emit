@@ -19,6 +19,9 @@ pub const StandardArgs = struct {
     /// Enter the live head-following loop after backfill + gap-fill.
     /// The process never returns under normal operation.
     follow: bool = false,
+    /// Stream the filtered backfill from a remote engine `serve` listener
+    /// (`host:port`) instead of reading a local flat store. Backfill only.
+    remote_engine: ?sdk.RemoteEngine = null,
 };
 
 /// Parse `--engine-data-dir`, `--data-dir`, `--commit-interval`,
@@ -33,6 +36,7 @@ pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8) !S
     var commit_interval: u32 = 100_000;
     var node_rpc: ?[]const u8 = null;
     var follow: bool = false;
+    var remote_engine: ?sdk.RemoteEngine = null;
 
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -49,19 +53,34 @@ pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8) !S
         } else if (std.mem.eql(u8, a, "--node-rpc") and i + 1 < argv.len) {
             node_rpc = try allocator.dupe(u8, argv[i + 1]);
             i += 1;
+        } else if (std.mem.eql(u8, a, "--remote-engine") and i + 1 < argv.len) {
+            const hp = argv[i + 1];
+            const colon = std.mem.lastIndexOfScalar(u8, hp, ':') orelse return error.BadRemoteEngine;
+            remote_engine = .{
+                .host = try allocator.dupe(u8, hp[0..colon]),
+                .port = try std.fmt.parseInt(u16, hp[colon + 1 ..], 10),
+            };
+            i += 1;
         } else if (std.mem.eql(u8, a, "--follow")) {
             follow = true;
         }
     }
 
+    // Remote mode reads no local store, so engine_data_dir is unused. Default
+    // it to data_dir to keep `Options.engine_data_dir` populated.
+    if (remote_engine != null and engine_data_dir == null) {
+        if (data_dir) |d| engine_data_dir = try allocator.dupe(u8, d);
+    }
+
     if (engine_data_dir == null or data_dir == null) {
         std.debug.print(
-            "usage: {s} --engine-data-dir <path> --data-dir <path> [--commit-interval N] [--node-rpc URL] [--follow]\n",
+            "usage: {s} --engine-data-dir <path> --data-dir <path> [--commit-interval N] [--node-rpc URL] [--remote-engine host:port] [--follow]\n",
             .{prog_name},
         );
         if (engine_data_dir) |s| allocator.free(s);
         if (data_dir) |s| allocator.free(s);
         if (node_rpc) |s| allocator.free(s);
+        if (remote_engine) |re| allocator.free(re.host);
         return error.MissingArgs;
     }
 
@@ -71,6 +90,7 @@ pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8) !S
         .commit_interval = commit_interval,
         .node_rpc = node_rpc,
         .follow = follow,
+        .remote_engine = remote_engine,
     };
 }
 
@@ -148,6 +168,7 @@ pub fn run(
     defer allocator.free(args.engine_data_dir);
     defer allocator.free(args.data_dir);
     defer if (args.node_rpc) |s| allocator.free(s);
+    defer if (args.remote_engine) |re| allocator.free(re.host);
 
     const stats = try sdk.run(manifest, handlers, entities, .{
         .engine_data_dir = args.engine_data_dir,
@@ -155,6 +176,7 @@ pub fn run(
         .commit_interval = args.commit_interval,
         .node_rpc = args.node_rpc,
         .follow = args.follow,
+        .remote_engine = args.remote_engine,
     }, allocator);
 
     // Unreachable under `--follow`. sdk.run enters the live loop and never
