@@ -22,6 +22,9 @@ pub const Filter = struct {
     cursor: u64,
     addresses: []const [20]u8,
     topics: []const [32]u8,
+    /// Negative filter. The children pass excludes static∪factory so an address
+    /// that is both a discovered child and a declared contract is not streamed twice.
+    exclude_addresses: []const [20]u8 = &.{},
 };
 
 pub const BackfillResult = struct {
@@ -50,6 +53,7 @@ pub fn backfill(
         .cursor = filter.cursor,
         .addresses = filter.addresses,
         .topics = filter.topics,
+        .exclude_addresses = filter.exclude_addresses,
     }).encode(allocator);
     defer allocator.free(reg_payload);
     try writeFrame(stream, .register, reg_payload);

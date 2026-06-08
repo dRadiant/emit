@@ -117,7 +117,7 @@ fn streamBackfill(
     const filter: core.filter.Filter = .{
         .match_addrs = reg.addresses,
         .match_topics = reg.topics,
-        .exclude_addrs = &.{},
+        .exclude_addrs = reg.exclude_addresses,
     };
 
     // One block's worth of scratch each, heap not stack (BLOCK_BUF_SIZE is 4 MB).
