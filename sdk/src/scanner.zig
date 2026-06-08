@@ -177,9 +177,9 @@ pub fn replay(
         if (merge_count == 0) continue;
         std.mem.sort(RawLog, merge_buf[0..merge_count], {}, lessByTxLog);
 
-        // Update ctx for this block. Prefer the exact time in the FilteredStore
-        // entry (remote stream fills it from the PUSH frame). 0 means a local
-        // build, so fall back to the engine's timestamps.bin.
+        // Prefer the exact time carried in the FilteredStore entry. The remote
+        // stream fills it from the PUSH frame. 0 means a local build, fall
+        // back to the engine's timestamps.bin via `timestampOf`.
         ctx.block_number = block_number;
         ctx.timestamp = if (block_ts != 0) @as(u64, block_ts) else humanize.timestampOf(ctx, block_number);
         result.blocks_dispatched += 1;
@@ -313,17 +313,8 @@ const CursorWalker = struct {
 const testing = std.testing;
 const FlatStoreReader = core.FlatStoreReader;
 
-const TestLog = struct {
-    tx_index: u16 = 0,
-    log_index: u16 = 0,
-    address: [20]u8,
-    topic0: [32]u8,
-};
-
-const TestBlock = struct {
-    block_number: u64,
-    logs: []const TestLog,
-};
+const TestLog = core.flat_reader.TestLog;
+const TestBlock = core.flat_reader.TestBlock;
 
 const Transfer = struct {
     pub const signature = "Transfer(address,address,uint256)";
@@ -345,68 +336,6 @@ const CHILD_2: [20]u8 = [_]u8{0xC2} ** 20;
 
 fn topicOf(comptime E: type) [32]u8 {
     return sdk_manifest.eventTopic0(E);
-}
-
-fn writeFlatStore(dir: std.fs.Dir, blocks: []const TestBlock, allocator: std.mem.Allocator) !void {
-    var blocks_file = try dir.createFile("blocks.dat", .{});
-    defer blocks_file.close();
-    var idx_file = try dir.createFile("blocks.idx", .{});
-    defer idx_file.close();
-    var blooms_file = try dir.createFile("blooms.bin", .{});
-    defer blooms_file.close();
-
-    const flat_reader = core.flat_reader;
-    const bloom = core.bloom;
-
-    var idx_hdr: [flat_reader.INDEX_HEADER_SIZE]u8 = undefined;
-    std.mem.writeInt(u64, idx_hdr[0..8], blocks[0].block_number, .little);
-    std.mem.writeInt(u64, idx_hdr[8..16], blocks.len, .little);
-    try idx_file.writeAll(&idx_hdr);
-
-    var blooms_hdr: [flat_reader.BLOOM_HEADER_SIZE]u8 = undefined;
-    std.mem.writeInt(u64, &blooms_hdr, blocks.len, .little);
-    try blooms_file.writeAll(&blooms_hdr);
-
-    const serialize_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
-    defer allocator.free(serialize_buf);
-    const compress_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
-    defer allocator.free(compress_buf);
-
-    var offset: u64 = 0;
-    for (blocks) |blk| {
-        const raw_logs = try allocator.alloc(RawLog, blk.logs.len);
-        defer allocator.free(raw_logs);
-        for (blk.logs, 0..) |tl, i| {
-            raw_logs[i] = .{
-                .block_number = blk.block_number,
-                .tx_index = tl.tx_index,
-                .log_index = tl.log_index,
-                .address = tl.address,
-                .topic_count = 1,
-                .topics = .{ tl.topic0, [_]u8{0} ** 32, [_]u8{0} ** 32, [_]u8{0} ** 32 },
-                .data = &.{},
-                .tx_hash = [_]u8{0xFE} ** 32,
-            };
-        }
-        const written = log_serial.serializeLogs(raw_logs, serialize_buf);
-        const entry_len = try log_serial.compressEntry(serialize_buf[0..written], compress_buf);
-        try blocks_file.writeAll(compress_buf[0..entry_len]);
-
-        var idx_entry: [flat_reader.INDEX_ENTRY_SIZE]u8 = undefined;
-        std.mem.writeInt(u64, idx_entry[0..8], offset, .little);
-        std.mem.writeInt(u32, idx_entry[8..12], @intCast(entry_len), .little);
-        try idx_file.writeAll(&idx_entry);
-
-        const tb = log_serial.buildTopicBloom(raw_logs);
-        const ab = log_serial.buildAddrBloom(raw_logs);
-        var bloom_entry: [flat_reader.BLOOM_ENTRY_SIZE]u8 = std.mem.zeroes([flat_reader.BLOOM_ENTRY_SIZE]u8);
-        std.mem.writeInt(u64, bloom_entry[0..8], blk.block_number, .big);
-        @memcpy(bloom_entry[flat_reader.TOPIC_BLOOM_OFFSET..][0..bloom.BLOOM_SIZE], &tb.bits);
-        @memcpy(bloom_entry[flat_reader.ADDR_BLOOM_OFFSET..][0..bloom.ADDR_BLOOM_SIZE], &ab.bits);
-        try blooms_file.writeAll(&bloom_entry);
-
-        offset += entry_len;
-    }
 }
 
 const Counter = struct {
@@ -468,7 +397,7 @@ test "scanCreations: extracts spawned addresses from factory creation events" {
 
     const create_topic = topicOf(PairCreated);
 
-    // writeFlatStore stores an empty `data` field, so craft a single block
+    // writeTestStore stores an empty `data` field, so craft a single block
     // manually with the spawned address in topic[1]. Exercises the indexed
     // slot path of extractFactoryAddress.
     const flat_reader = core.flat_reader;
@@ -557,7 +486,7 @@ test "scanCreations: extracts spawned addresses from factory creation events" {
 test "replay: dispatches logs in canonical (block, tx, log_index) order across one DBI" {
     const allocator = testing.allocator;
 
-    // Block 100 has logs at (tx=0, log=0) and (tx=0, log=1). writeFlatStore
+    // Block 100 has logs at (tx=0, log=0) and (tx=0, log=1). writeTestStore
     // preserves the given order, so plant them out of order to verify the
     // scanner sorts within a block.
     var src_tmp = testing.tmpDir(.{});
@@ -573,7 +502,7 @@ test "replay: dispatches logs in canonical (block, tx, log_index) order across o
             .{ .tx_index = 0, .log_index = 0, .address = ADDR_TOKEN, .topic0 = tt },
         } },
     };
-    try writeFlatStore(src_tmp.dir, &blocks, allocator);
+    try core.flat_reader.writeTestStore(src_tmp.dir, &blocks, allocator);
 
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
@@ -623,7 +552,7 @@ test "replay seeks past start_block so already-dispatched range is skipped" {
         .{ .block_number = 101, .logs = &.{.{ .address = ADDR_TOKEN, .topic0 = tt }} },
         .{ .block_number = 102, .logs = &.{.{ .address = ADDR_TOKEN, .topic0 = tt }} },
     };
-    try writeFlatStore(src_tmp.dir, &blocks, allocator);
+    try core.flat_reader.writeTestStore(src_tmp.dir, &blocks, allocator);
 
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
@@ -682,7 +611,7 @@ test "replay: k-way merge across BLOCKS_PRIMARY and BLOCKS_CHILDREN preserves bl
         .{ .block_number = 102, .logs = &.{.{ .address = FACTORY_ADDR, .topic0 = create_topic }} },
         .{ .block_number = 103, .logs = &.{.{ .address = CHILD_2, .topic0 = sync_topic }} },
     };
-    try writeFlatStore(src_tmp.dir, &blocks, allocator);
+    try core.flat_reader.writeTestStore(src_tmp.dir, &blocks, allocator);
 
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
@@ -738,7 +667,7 @@ test "factory orchestration: build → scanCreations → appendChildren → repl
     const create_topic = topicOf(PairCreated);
     const sync_topic = topicOf(Sync);
 
-    // Factory log needs data with the spawned address at offset 0. writeFlatStore
+    // Factory log needs data with the spawned address at offset 0. writeTestStore
     // plants empty data, so build a custom log with non-empty data.
     const flat_reader = core.flat_reader;
     const bloom = core.bloom;

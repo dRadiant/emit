@@ -63,8 +63,8 @@ pub fn run(opts: Options) !void {
 }
 
 /// Serve one client to completion: read REGISTER, stream the backfill, GOAWAY.
-/// `reader` is shared read-only. `ts_reader` supplies exact per-block times,
-/// null means the client falls back to its own formula.
+/// `reader` is shared read-only. `ts_reader` supplies exact per-block times.
+/// Null means the client falls back to its own formula.
 fn serveConnection(
     stream: std.net.Stream,
     reader: *const FlatStoreReader,
@@ -90,9 +90,9 @@ fn serveConnection(
 
 /// Bloom-scan `(cursor, tip]`, then PUSH every block whose logs match the
 /// precise filter. A bloom false positive (block hit the bloom but no log
-/// survives `filterBlockEntry`) is skipped silently, the expected 8% the dual
+/// survives `filterBlockEntry`) is skipped silently. The expected 8% the dual
 /// bloom lets through. A store read/decompress failure on a matched block is
-/// fatal: refuse to hand a client an index with a hole.
+/// fatal. Refuse to hand a client an index with a hole.
 fn streamBackfill(
     stream: std.net.Stream,
     reader: *const FlatStoreReader,
@@ -142,6 +142,7 @@ fn streamBackfill(
     }
 }
 
+/// Highest block number stored (the last dense index slot).
 fn tipOf(reader: *const FlatStoreReader) u64 {
     return reader.first_block + reader.index_count - 1;
 }
@@ -162,8 +163,8 @@ fn dedupAdjacent(list: *std.ArrayListUnmanaged(u64)) void {
 
 // ── Wire I/O ──────────────────────────────────────────────────────────────
 
-/// PUSH a block: `header ‖ prefix ‖ entry`. The 17-byte head goes in one write,
-/// the lz4 entry straight from the block buffer in the next. No payload copy, no
+/// PUSH a block: `header ‖ prefix ‖ entry`. The 17-byte head goes in one write.
+/// The lz4 entry follows straight from the block buffer. No payload copy, no
 /// per-block allocation.
 fn sendPush(stream: std.net.Stream, block_number: u64, timestamp: u32, entry: []const u8) !void {
     const h = tcp_frame.header(.push, @intCast(tcp_frame.Push.PREFIX + entry.len));
@@ -213,78 +214,14 @@ fn readExact(stream: std.net.Stream, buf: []u8) !void {
 // ── Tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-const bloom = core.bloom;
 const flat_reader = core.flat_reader;
 const RawLog = core.RawLog;
+const TestBlock = flat_reader.TestBlock;
 
 const ADDR_A: [20]u8 = [_]u8{0xAA} ** 20;
 const ADDR_B: [20]u8 = [_]u8{0xBB} ** 20;
 const TOPIC_T: [32]u8 = [_]u8{0x77} ** 32;
 const TOPIC_U: [32]u8 = [_]u8{0x88} ** 32;
-
-const PlantLog = struct { address: [20]u8, topic0: [32]u8 };
-const PlantBlock = struct { block_number: u64, ts: u32, log: PlantLog };
-
-/// Write a minimal flat store (one log per block) into `dir`, plus a
-/// timestamps.bin. Mirrors the on-disk format `FlatStoreReader` reads.
-fn plantStore(dir: std.fs.Dir, blocks: []const PlantBlock, allocator: std.mem.Allocator) !void {
-    var blocks_file = try dir.createFile("blocks.dat", .{});
-    defer blocks_file.close();
-    var idx_file = try dir.createFile("blocks.idx", .{});
-    defer idx_file.close();
-    var blooms_file = try dir.createFile("blooms.bin", .{});
-    defer blooms_file.close();
-
-    var idx_hdr: [flat_reader.INDEX_HEADER_SIZE]u8 = undefined;
-    std.mem.writeInt(u64, idx_hdr[0..8], blocks[0].block_number, .little);
-    std.mem.writeInt(u64, idx_hdr[8..16], blocks.len, .little);
-    try idx_file.writeAll(&idx_hdr);
-
-    var blooms_hdr: [flat_reader.BLOOM_HEADER_SIZE]u8 = undefined;
-    std.mem.writeInt(u64, &blooms_hdr, blocks.len, .little);
-    try blooms_file.writeAll(&blooms_hdr);
-
-    const serialize_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
-    defer allocator.free(serialize_buf);
-    const compress_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
-    defer allocator.free(compress_buf);
-
-    var ts_writer = try core.timestamps.TimestampWriter.open(dir, blocks[0].block_number);
-    defer ts_writer.deinit();
-
-    var offset: u64 = 0;
-    for (blocks) |blk| {
-        const log: RawLog = .{
-            .block_number = blk.block_number,
-            .tx_index = 0,
-            .log_index = 0,
-            .address = blk.log.address,
-            .topic_count = 1,
-            .topics = .{ blk.log.topic0, [_]u8{0} ** 32, [_]u8{0} ** 32, [_]u8{0} ** 32 },
-            .data = &.{},
-            .tx_hash = [_]u8{0xFE} ** 32,
-        };
-        const written = log_serial.serializeLogs(&[_]RawLog{log}, serialize_buf);
-        const entry_len = try log_serial.compressEntry(serialize_buf[0..written], compress_buf);
-        try blocks_file.writeAll(compress_buf[0..entry_len]);
-
-        var idx_entry: [flat_reader.INDEX_ENTRY_SIZE]u8 = undefined;
-        std.mem.writeInt(u64, idx_entry[0..8], offset, .little);
-        std.mem.writeInt(u32, idx_entry[8..12], @intCast(entry_len), .little);
-        try idx_file.writeAll(&idx_entry);
-
-        const tb = log_serial.buildTopicBloom(&[_]RawLog{log});
-        const ab = log_serial.buildAddrBloom(&[_]RawLog{log});
-        var bloom_entry: [flat_reader.BLOOM_ENTRY_SIZE]u8 = std.mem.zeroes([flat_reader.BLOOM_ENTRY_SIZE]u8);
-        std.mem.writeInt(u64, bloom_entry[0..8], blk.block_number, .big);
-        @memcpy(bloom_entry[flat_reader.TOPIC_BLOOM_OFFSET..][0..bloom.BLOOM_SIZE], &tb.bits);
-        @memcpy(bloom_entry[flat_reader.ADDR_BLOOM_OFFSET..][0..bloom.ADDR_BLOOM_SIZE], &ab.bits);
-        try blooms_file.writeAll(&bloom_entry);
-
-        try ts_writer.set(blk.block_number, blk.ts);
-        offset += entry_len;
-    }
-}
 
 /// One received frame: type + owned payload.
 const RecvFrame = struct { type: tcp_frame.FrameType, payload: []u8 };
@@ -319,13 +256,13 @@ test "serve streams the matching backfill blocks as PUSH, then GOAWAY" {
     defer tmp.cleanup();
 
     // Blocks 100 (A/T) and 102 (A/T) match. 101 (B/T) and 103 (A/U) do not.
-    const blocks = [_]PlantBlock{
-        .{ .block_number = 100, .ts = 1_700_000_000, .log = .{ .address = ADDR_A, .topic0 = TOPIC_T } },
-        .{ .block_number = 101, .ts = 1_700_000_012, .log = .{ .address = ADDR_B, .topic0 = TOPIC_T } },
-        .{ .block_number = 102, .ts = 1_700_000_024, .log = .{ .address = ADDR_A, .topic0 = TOPIC_T } },
-        .{ .block_number = 103, .ts = 1_700_000_036, .log = .{ .address = ADDR_A, .topic0 = TOPIC_U } },
+    const blocks = [_]TestBlock{
+        .{ .block_number = 100, .timestamp = 1_700_000_000, .logs = &.{.{ .address = ADDR_A, .topic0 = TOPIC_T }} },
+        .{ .block_number = 101, .timestamp = 1_700_000_012, .logs = &.{.{ .address = ADDR_B, .topic0 = TOPIC_T }} },
+        .{ .block_number = 102, .timestamp = 1_700_000_024, .logs = &.{.{ .address = ADDR_A, .topic0 = TOPIC_T }} },
+        .{ .block_number = 103, .timestamp = 1_700_000_036, .logs = &.{.{ .address = ADDR_A, .topic0 = TOPIC_U }} },
     };
-    try plantStore(tmp.dir, &blocks, allocator);
+    try flat_reader.writeTestStore(tmp.dir, &blocks, allocator);
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try tmp.dir.realpath(".", &path_buf);
@@ -407,8 +344,8 @@ test "serve rejects an empty filter with GOAWAY" {
     const allocator = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const blocks = [_]PlantBlock{.{ .block_number = 100, .ts = 1, .log = .{ .address = ADDR_A, .topic0 = TOPIC_T } }};
-    try plantStore(tmp.dir, &blocks, allocator);
+    const blocks = [_]TestBlock{.{ .block_number = 100, .timestamp = 1, .logs = &.{.{ .address = ADDR_A, .topic0 = TOPIC_T }} }};
+    try flat_reader.writeTestStore(tmp.dir, &blocks, allocator);
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try tmp.dir.realpath(".", &path_buf);

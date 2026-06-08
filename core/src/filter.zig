@@ -10,7 +10,7 @@
 /// `decompressed` comes from the importer-produced flat store (LZ4-validated
 /// upstream), so the in-place walk trusts the packed layout.
 ///
-/// Safe builds bounds-check the slice accesses, ReleaseFast does not.
+/// Safe builds bounds-check the slice accesses. ReleaseFast does not.
 const std = @import("std");
 
 const log_serial = @import("log_serial.zig");
@@ -52,8 +52,8 @@ pub inline fn containsTopic(haystack: []const [32]u8, needle: *const [32]u8) boo
 /// at known offsets, memcpies whole-log byte ranges of keepers into
 /// `serialize_buf`. Skips `deserializeLogs` and per-log `RawLog`
 /// materialization entirely. Both buffers must be at least `BLOCK_BUF_SIZE`.
-/// Propagates the compress error (`error.BufferTooSmall` on an oversize block),
-/// caller decides whether that is a recoverable drop or fatal.
+/// Propagates the compress error (`error.BufferTooSmall` on an oversize block).
+/// Caller decides whether that is a recoverable drop or fatal.
 pub fn filterBlockEntry(
     decompressed: []const u8,
     filter: Filter,

@@ -442,21 +442,10 @@ fn processBlockEntry(
 // ── Tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-const bloom = core.bloom;
 const flat_reader = core.flat_reader;
 
-const TestLog = struct {
-    tx_index: u16 = 0,
-    log_index: u16 = 0,
-    address: [20]u8,
-    topic0: [32]u8,
-    data: []const u8 = &.{},
-};
-
-const TestBlock = struct {
-    block_number: u64,
-    logs: []const TestLog,
-};
+const TestLog = flat_reader.TestLog;
+const TestBlock = flat_reader.TestBlock;
 
 const ContractA = struct {
     pub const signature = "EventA(uint256)";
@@ -474,67 +463,6 @@ const ADDR_C: [20]u8 = [_]u8{0xCC} ** 20;
 
 fn topicOf(comptime E: type) [32]u8 {
     return sdk_manifest.eventTopic0(E);
-}
-
-/// Write a synthetic flat store (blocks.dat + blocks.idx + blooms.bin) into
-/// `dir`. Caller opens via `FlatStoreReader.open(dir_path)`.
-fn writeFlatStore(dir: std.fs.Dir, blocks: []const TestBlock, allocator: std.mem.Allocator) !void {
-    var blocks_file = try dir.createFile("blocks.dat", .{});
-    defer blocks_file.close();
-    var idx_file = try dir.createFile("blocks.idx", .{});
-    defer idx_file.close();
-    var blooms_file = try dir.createFile("blooms.bin", .{});
-    defer blooms_file.close();
-
-    var idx_hdr: [flat_reader.INDEX_HEADER_SIZE]u8 = undefined;
-    std.mem.writeInt(u64, idx_hdr[0..8], blocks[0].block_number, .little);
-    std.mem.writeInt(u64, idx_hdr[8..16], blocks.len, .little);
-    try idx_file.writeAll(&idx_hdr);
-
-    var blooms_hdr: [flat_reader.BLOOM_HEADER_SIZE]u8 = undefined;
-    std.mem.writeInt(u64, &blooms_hdr, blocks.len, .little);
-    try blooms_file.writeAll(&blooms_hdr);
-
-    const serialize_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
-    defer allocator.free(serialize_buf);
-    const compress_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
-    defer allocator.free(compress_buf);
-
-    var offset: u64 = 0;
-    for (blocks) |blk| {
-        const raw_logs = try allocator.alloc(RawLog, blk.logs.len);
-        defer allocator.free(raw_logs);
-        for (blk.logs, 0..) |tl, i| {
-            raw_logs[i] = .{
-                .block_number = blk.block_number,
-                .tx_index = tl.tx_index,
-                .log_index = tl.log_index,
-                .address = tl.address,
-                .topic_count = 1,
-                .topics = .{ tl.topic0, [_]u8{0} ** 32, [_]u8{0} ** 32, [_]u8{0} ** 32 },
-                .data = tl.data,
-                .tx_hash = [_]u8{0xFE} ** 32,
-            };
-        }
-        const written = log_serial.serializeLogs(raw_logs, serialize_buf);
-        const entry_len = try log_serial.compressEntry(serialize_buf[0..written], compress_buf);
-        try blocks_file.writeAll(compress_buf[0..entry_len]);
-
-        var idx_entry: [flat_reader.INDEX_ENTRY_SIZE]u8 = undefined;
-        std.mem.writeInt(u64, idx_entry[0..8], offset, .little);
-        std.mem.writeInt(u32, idx_entry[8..12], @intCast(entry_len), .little);
-        try idx_file.writeAll(&idx_entry);
-
-        const tb = log_serial.buildTopicBloom(raw_logs);
-        const ab = log_serial.buildAddrBloom(raw_logs);
-        var bloom_entry: [flat_reader.BLOOM_ENTRY_SIZE]u8 = std.mem.zeroes([flat_reader.BLOOM_ENTRY_SIZE]u8);
-        std.mem.writeInt(u64, bloom_entry[0..8], blk.block_number, .big);
-        @memcpy(bloom_entry[flat_reader.TOPIC_BLOOM_OFFSET..][0..bloom.BLOOM_SIZE], &tb.bits);
-        @memcpy(bloom_entry[flat_reader.ADDR_BLOOM_OFFSET..][0..bloom.ADDR_BLOOM_SIZE], &ab.bits);
-        try blooms_file.writeAll(&bloom_entry);
-
-        offset += entry_len;
-    }
 }
 
 const SmallManifest: sdk_manifest.Manifest = .{
@@ -634,7 +562,7 @@ test "build: filters multi-contract flat store, primary contains exactly the mat
 
     var src_tmp = testing.tmpDir(.{});
     defer src_tmp.cleanup();
-    try writeFlatStore(src_tmp.dir, blocks_list.items, allocator);
+    try flat_reader.writeTestStore(src_tmp.dir, blocks_list.items, allocator);
 
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
@@ -682,7 +610,7 @@ test "build: rebuild produces decoded-identical output" {
 
     var src_tmp = testing.tmpDir(.{});
     defer src_tmp.cleanup();
-    try writeFlatStore(src_tmp.dir, blocks_list.items, allocator);
+    try flat_reader.writeTestStore(src_tmp.dir, blocks_list.items, allocator);
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
     var reader = try FlatStoreReader.open(src_path);
@@ -791,7 +719,7 @@ test "build + appendChildren: primary holds creations, children holds child even
 
     var src_tmp = testing.tmpDir(.{});
     defer src_tmp.cleanup();
-    try writeFlatStore(src_tmp.dir, blocks_list.items, allocator);
+    try flat_reader.writeTestStore(src_tmp.dir, blocks_list.items, allocator);
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
     var reader = try FlatStoreReader.open(src_path);
@@ -859,7 +787,7 @@ test "appendChildren: returns zero-result for empty discovered set" {
     defer src_tmp.cleanup();
     var blocks: [1]TestBlock = .{.{ .block_number = 100, .logs = &.{} }};
     blocks[0].logs = &[_]TestLog{.{ .address = FactoryAddr, .topic0 = topicOf(Create) }};
-    try writeFlatStore(src_tmp.dir, &blocks, allocator);
+    try flat_reader.writeTestStore(src_tmp.dir, &blocks, allocator);
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
     var reader = try FlatStoreReader.open(src_path);
@@ -894,7 +822,7 @@ test "build: end_block clamps the scan range to a fixed window" {
 
     var src_tmp = testing.tmpDir(.{});
     defer src_tmp.cleanup();
-    try writeFlatStore(src_tmp.dir, blocks_list.items, allocator);
+    try flat_reader.writeTestStore(src_tmp.dir, blocks_list.items, allocator);
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
     var reader = try FlatStoreReader.open(src_path);
@@ -941,7 +869,7 @@ test "appendBlocks extends a primary filter env over the new range" {
 
     var src_tmp = testing.tmpDir(.{});
     defer src_tmp.cleanup();
-    try writeFlatStore(src_tmp.dir, blocks_list.items, allocator);
+    try flat_reader.writeTestStore(src_tmp.dir, blocks_list.items, allocator);
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
     var reader = try FlatStoreReader.open(src_path);
@@ -1011,7 +939,7 @@ test "appendChildrenBlocks extends the children pair over a sub-range" {
 
     var src_tmp = testing.tmpDir(.{});
     defer src_tmp.cleanup();
-    try writeFlatStore(src_tmp.dir, blocks_list.items, allocator);
+    try flat_reader.writeTestStore(src_tmp.dir, blocks_list.items, allocator);
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
     var reader = try FlatStoreReader.open(src_path);
