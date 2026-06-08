@@ -44,6 +44,7 @@ pub const FactoryDef = manifest.FactoryDef;
 pub const init = entry.init;
 pub const Manifest = manifest.Manifest;
 pub const Options = entry.Options;
+pub const RemoteEngine = entry.RemoteEngine;
 pub const PrefetchCall = manifest.PrefetchCall;
 pub const PrefetchDef = manifest.PrefetchDef;
 pub const run = entry.run;

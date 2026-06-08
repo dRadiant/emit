@@ -31,6 +31,7 @@ const root = @import("root.zig");
 const scanner = @import("scanner.zig");
 const sdk_manifest = @import("manifest.zig");
 const state_snap_mod = @import("state_snap.zig");
+const tcp_client = @import("tcp_client.zig");
 
 pub const Options = struct {
     /// Directory containing the engine's flat store
@@ -53,13 +54,24 @@ pub const Options = struct {
     /// When true, `run` and `init` block after backfill and enter the
     /// live head-following loop. `init` never returns.
     follow: bool = false,
+    /// When set, stream the filtered backfill from a remote engine `serve`
+    /// listener instead of reading a local flat store at `engine_data_dir`.
+    /// Backfill only. Live following over the stream is a separate capability,
+    /// so remote with `follow` is rejected.
+    remote_engine: ?RemoteEngine = null,
+};
+
+/// Address of a remote engine `serve` listener. Reached over an SSH tunnel in
+/// production, so `host` is normally a localhost forward.
+pub const RemoteEngine = struct {
+    host: []const u8,
+    port: u16,
 };
 
 pub const CANONICAL_MULTICALL3: [20]u8 = .{
     0xca, 0x11, 0xbd, 0xe0, 0x59, 0x77, 0xb3, 0x63, 0x11, 0x67,
     0x02, 0x88, 0x62, 0xbe, 0x2a, 0x17, 0x39, 0x76, 0xca, 0x11,
 };
-
 
 /// Result of a backfill run, returned from `run` and embedded in `Context`.
 /// `elapsed_ns - (filter_build_ns + scan_creations_ns + append_children_ns +
@@ -393,6 +405,9 @@ pub fn init(
 ) !*Context(entities) {
     var timer = try std.time.Timer.start();
 
+    // The live loop reads the local pending ring, absent over a stream.
+    if (options.remote_engine != null and options.follow) return error.RemoteFollowUnsupported;
+
     // Derive and mkdir the entity / filter / ethcall subdirs under `data_dir`.
     const entity_dir = try std.fs.path.join(allocator, &.{ options.data_dir, "entity" });
     defer allocator.free(entity_dir);
@@ -404,8 +419,13 @@ pub fn init(
     try std.fs.cwd().makePath(filter_dir);
     try std.fs.cwd().makePath(ethcall_dir);
 
-    var reader = try core.FlatStoreReader.open(options.engine_data_dir);
-    defer reader.deinit();
+    // Local mode opens the engine flat store. Remote mode streams instead, so
+    // there is no local store to read.
+    var reader: ?core.FlatStoreReader = if (options.remote_engine == null)
+        try core.FlatStoreReader.open(options.engine_data_dir)
+    else
+        null;
+    defer if (reader) |*r| r.deinit();
 
     const C = Context(entities);
     const ctx = try allocator.create(C);
@@ -428,7 +448,9 @@ pub fn init(
     // Open the engine's per-block timestamp index if present. Absence (older
     // stores) or a corrupt file leaves it null, and `humanize.timestampOf`
     // falls back to the derivation formula. The mmap outlives the dir handle.
-    {
+    // Local mode reads the engine timestamps.bin for exact times. Remote mode
+    // carries each block's timestamp in its FilteredStore entry instead.
+    if (options.remote_engine == null) {
         var engine_dh = try std.fs.cwd().openDir(options.engine_data_dir, .{});
         defer engine_dh.close();
         ctx._timestamps = core.timestamps.TimestampReader.open(engine_dh) catch null;
@@ -456,7 +478,16 @@ pub fn init(
 
     const fp = comptime sdk_manifest.fingerprint(m);
 
-    if (shouldSkipFilterBuild(filter_dh, allocator, fp)) {
+    if (options.remote_engine) |re| {
+        // Remote streaming has no factory child pre-pass yet, so children would
+        // stay empty. Reject rather than silently drop child events.
+        if (comptime m.factories.len > 0) return error.RemoteFactoryUnsupported;
+        // A manifest change invalidates the streamed store. Clear so the stream
+        // restarts from cursor 0 instead of appending past a stale tail.
+        if (!shouldSkipFilterBuild(filter_dh, allocator, fp)) try clearFilterFiles(filter_dh);
+        ctx.stats.filter_blocks_matched = try remoteBackfill(m, re, filter_dh, allocator);
+        try writeFilterFingerprint(filter_dh, fp);
+    } else if (shouldSkipFilterBuild(filter_dh, allocator, fp)) {
         ctx.stats.phases_skipped = true;
         // Even with the filter reused, factory children must be rediscovered
         // so the live address gate admits them. The primary store always
@@ -472,7 +503,7 @@ pub fn init(
         // otherwise make build() try to append blocks <= the existing tail,
         // raising error.OutOfOrder. Clear first so the rebuild starts clean.
         try clearFilterFiles(filter_dh);
-        const primary_result = try filter_builder.build(&reader, m, filter_dh, allocator);
+        const primary_result = try filter_builder.build(&reader.?, m, filter_dh, allocator);
         try requireCompleteFilter("phase 1 (build)", primary_result);
         ctx.stats.filter_blocks_scanned = primary_result.blocks_scanned;
         ctx.stats.filter_blocks_matched = primary_result.blocks_matched;
@@ -495,7 +526,7 @@ pub fn init(
                 while (it.next()) |addr| : (i += 1) child_addrs[i] = addr.*;
 
                 const child_result = try filter_builder.appendChildren(
-                    &reader,
+                    &reader.?,
                     m,
                     child_addrs,
                     filter_dh,
@@ -760,6 +791,33 @@ fn writeFilterFingerprint(filter_dh: std.fs.Dir, fp: [32]u8) !void {
     try core.atomic_file.write(filter_dh, "manifest.fingerprint.tmp", "manifest.fingerprint", &fp);
 }
 
+/// Stream the filtered backfill from the remote engine into the primary store.
+/// Returns the number of blocks written. The REGISTER cursor is the primary
+/// store's current tail, so a re-run extends it rather than restreaming.
+fn remoteBackfill(
+    comptime m: sdk_manifest.Manifest,
+    re: RemoteEngine,
+    filter_dh: std.fs.Dir,
+    allocator: std.mem.Allocator,
+) !u64 {
+    var store = try filtered_store_mod.FilteredStore.open(allocator, filter_dh, filter_builder.BASE_PRIMARY);
+    defer store.deinit();
+
+    const cursor = if (store.count() > 0)
+        (try store.readEntry(store.count() - 1)).block_number
+    else
+        0;
+
+    const addrs = comptime filter_builder.collectKnownAddresses(m);
+    const topics = comptime filter_builder.collectAllTopics(m);
+    const result = try tcp_client.backfill(re.host, re.port, .{
+        .cursor = cursor,
+        .addresses = addrs,
+        .topics = topics,
+    }, &store, allocator);
+    return result.blocks_received;
+}
+
 /// Move `discovered` onto the heap and hand ownership to `ctx`. The set has
 /// the lifetime of the Context (same allocator). `Context.deinit` frees it.
 /// The live address gate and child-discovery pre-pass both read/extend it.
@@ -776,8 +834,8 @@ fn setChildAddresses(
 
 fn clearFilterFiles(filter_dh: std.fs.Dir) !void {
     const names = [_][]const u8{
-        "primary.dat",     "primary.idx",
-        "children.dat",    "children.idx",
+        "primary.dat",          "primary.idx",
+        "children.dat",         "children.idx",
         "manifest.fingerprint",
     };
     for (names) |n| filter_dh.deleteFile(n) catch |err| switch (err) {
