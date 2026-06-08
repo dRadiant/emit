@@ -5,3 +5,6 @@ pub const tcp_client = @import("tcp_client.zig");
 pub const filter_builder = @import("filter_builder.zig");
 pub const filtered_store = @import("filtered_store.zig");
 pub const manifest = @import("manifest.zig");
+pub const entry = @import("entry.zig");
+pub const handler = @import("handler.zig");
+pub const StorageMode = @import("root.zig").StorageMode;

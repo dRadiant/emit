@@ -123,3 +123,85 @@ test "streamed FilteredStore matches a local build, with exact timestamps added"
         try std.testing.expectEqual(ts, re.timestamp);
     }
 }
+
+// One immutable record per dispatched Transfer, capturing the block and its
+// timestamp. Lets the end-to-end test compare a remote init against a local one.
+const Hit = struct {
+    pub const storage: sdk.StorageMode = .immutable;
+    id: [16]u8,
+    block: u64,
+    ts: u64,
+};
+
+const HitHandler = struct {
+    pub fn handleTransfer(log: sdk.handler.Log(Transfer), ctx: anytype) !void {
+        try ctx.stores.hits.save(.{ .id = log.eventId(), .block = ctx.block_number, .ts = ctx.timestamp });
+    }
+};
+
+test "remote init produces the same entity state as a local init" {
+    const allocator = std.testing.allocator;
+    const tt = sdk_manifest.eventTopic0(Transfer);
+
+    const blocks = [_]TestBlock{
+        .{ .block_number = 100, .timestamp = 1_700_000_000, .logs = &.{.{ .address = ADDR_TOKEN, .topic0 = tt }} },
+        .{ .block_number = 101, .timestamp = 1_700_000_012, .logs = &.{.{ .address = ADDR_OTHER, .topic0 = tt }} },
+        .{ .block_number = 102, .timestamp = 1_700_000_024, .logs = &.{.{ .address = ADDR_TOKEN, .topic0 = tt }} },
+    };
+
+    var src = std.testing.tmpDir(.{});
+    defer src.cleanup();
+    try writeTestStore(src.dir, &blocks, allocator);
+    var src_path: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try src.dir.realpath(".", &src_path);
+
+    // Local init reads the flat store directly.
+    var local_data = std.testing.tmpDir(.{});
+    defer local_data.cleanup();
+    var ld: [std.fs.max_path_bytes]u8 = undefined;
+    const local_ctx = try sdk.entry.init(TokenManifest, HitHandler, .{Hit}, .{
+        .engine_data_dir = path,
+        .data_dir = try local_data.dir.realpath(".", &ld),
+    }, allocator);
+    defer local_ctx.deinit();
+
+    // Remote init streams the backfill from the engine instead.
+    var reader = try FlatStoreReader.open(path);
+    defer reader.deinit();
+    var ts_reader = try TimestampReader.open(src.dir);
+    defer if (ts_reader) |*r| r.deinit();
+    const ts_ptr: ?*const TimestampReader = if (ts_reader) |*r| r else null;
+
+    var server = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+    var ctx = ServeCtx{ .server = &server, .reader = &reader, .ts = ts_ptr, .allocator = allocator };
+    const th = try std.Thread.spawn(.{}, ServeCtx.run, .{&ctx});
+
+    var remote_data = std.testing.tmpDir(.{});
+    defer remote_data.cleanup();
+    var rd: [std.fs.max_path_bytes]u8 = undefined;
+    const remote_ctx = try sdk.entry.init(TokenManifest, HitHandler, .{Hit}, .{
+        .engine_data_dir = path, // unused in remote mode
+        .data_dir = try remote_data.dir.realpath(".", &rd),
+        .remote_engine = .{ .host = "127.0.0.1", .port = port },
+    }, allocator);
+    defer remote_ctx.deinit();
+    th.join();
+
+    try std.testing.expectEqual(@as(u64, 2), remote_ctx.stats.blocks_dispatched);
+    try std.testing.expectEqual(local_ctx.stats.blocks_dispatched, remote_ctx.stats.blocks_dispatched);
+    try std.testing.expectEqual(local_ctx.count(Hit), remote_ctx.count(Hit));
+
+    // Record by record: same block, and the same exact timestamp (local reads
+    // it from timestamps.bin, remote from the streamed FilteredStore entry).
+    var lrec: [4]Hit = undefined;
+    var rrec: [4]Hit = undefined;
+    const ls = try local_ctx.range(Hit, 0, &lrec);
+    const rs = try remote_ctx.range(Hit, 0, &rrec);
+    try std.testing.expectEqual(ls.len, rs.len);
+    for (ls, rs) |l, r| {
+        try std.testing.expectEqual(l.block, r.block);
+        try std.testing.expectEqual(l.ts, r.ts);
+    }
+}
