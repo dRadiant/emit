@@ -65,7 +65,7 @@ pub fn run(opts: Options) !void {
 /// Serve one client to completion: read REGISTER, stream the backfill, GOAWAY.
 /// `reader` is shared read-only. `ts_reader` supplies exact per-block times.
 /// Null means the client falls back to its own formula.
-fn serveConnection(
+pub fn serveConnection(
     stream: std.net.Stream,
     reader: *const FlatStoreReader,
     ts_reader: ?*const TimestampReader,

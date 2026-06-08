@@ -23,6 +23,7 @@ const event_log = @import("event_log.zig");
 const mutable_store = @import("mutable_store.zig");
 const scanner = @import("scanner.zig");
 const state_snap = @import("state_snap.zig");
+const tcp_client = @import("tcp_client.zig");
 
 // Public submodule: handler-helper utilities called by name.
 pub const manifest = @import("manifest.zig");
@@ -184,6 +185,7 @@ test {
     _ = filtered_store;
     _ = scanner;
     _ = state_snap;
+    _ = tcp_client;
     _ = event_log;
     _ = entry;
     // Test-only fixture.

@@ -253,8 +253,9 @@ fn runPhase(
 }
 
 // ── Manifest projections ─────────────────────────────────────────────────
+// Public so the remote client builds its REGISTER filter from the manifest.
 
-fn collectKnownAddresses(comptime m: sdk_manifest.Manifest) []const [20]u8 {
+pub fn collectKnownAddresses(comptime m: sdk_manifest.Manifest) []const [20]u8 {
     comptime {
         var out: []const [20]u8 = &.{};
         for (m.contracts) |c| out = out ++ &[_][20]u8{c.address};
@@ -263,7 +264,7 @@ fn collectKnownAddresses(comptime m: sdk_manifest.Manifest) []const [20]u8 {
     }
 }
 
-fn collectAllTopics(comptime m: sdk_manifest.Manifest) []const [32]u8 {
+pub fn collectAllTopics(comptime m: sdk_manifest.Manifest) []const [32]u8 {
     comptime {
         var out: []const [32]u8 = &.{};
         for (m.contracts) |c| {
