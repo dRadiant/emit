@@ -1,19 +1,14 @@
-/// Remote-engine TCP server
+/// Remote-engine TCP server. Streams server-side-filtered blocks to off-host
+/// indexers, removing the collocation requirement.
 ///
-/// Streams server-side-filtered blocks to off-host indexers so an indexer
-/// no longer has to be collocated with the engine.
+/// Backfill only. A client sends one REGISTER (filter + cursor), the server
+/// replays every block in `(cursor, tip]` whose logs match as PUSH frames, then
+/// closes with GOAWAY. Accept loop serves one connection at a time.
 ///
-/// **backfill only**. A client connects, sends one REGISTER
-/// (its filter + cursor), and the server replays every block in `(cursor, tip]`
-/// whose logs match — as PUSH frames — then closes with GOAWAY. Live streaming,
-/// reorg signalling, and factory `ADD_ADDRESS` arrive in later steps, as does
-/// concurrency: this accept loop serves one connection at a time.
-///
-/// Stateless across connections: all subscription state rides in
-/// REGISTER, so a reconnect just re-streams from the client's cursor. The
-/// engine never imports the sdk — the filtered-entry bytes come from
-/// `core.filter.filterBlockEntry`, the same primitive the sdk builder uses, so
-/// a streamed FilteredStore is byte-identical to a locally-built one.
+/// Stateless across connections: all subscription state rides in REGISTER, so a
+/// reconnect re-streams from the client's cursor. Filtered-entry bytes come from
+/// `core.filter.filterBlockEntry`, the same primitive the sdk builder uses, so a
+/// streamed FilteredStore is byte-identical to a locally-built one.
 const std = @import("std");
 
 const core = @import("core");
@@ -27,15 +22,14 @@ const types = core.types;
 
 pub const Options = struct {
     data_dir: []const u8,
-    /// Bind host. Defaults to localhost — the engine is never directly exposed;
-    /// remote clients reach it through an SSH tunnel. `0.0.0.0` is opt-in.
+    /// Bind host. Defaults to localhost. Engine is never directly exposed.
+    /// Remote clients reach it through an SSH tunnel. `0.0.0.0` is opt-in.
     host: []const u8 = "127.0.0.1",
     port: u16,
 };
 
-/// Open the flat store once (read-only, shared across connections) and serve
-/// forever. The flat store is mmap'd; the accept loop is single-threaded for
-/// now (a bounded per-client worker pool is a later step).
+/// Open the flat store once (read-only, mmap'd, shared across connections) and
+/// serve forever. Accept loop is single-threaded.
 pub fn run(opts: Options) !void {
     const alloc = std.heap.page_allocator;
 
@@ -69,8 +63,8 @@ pub fn run(opts: Options) !void {
 }
 
 /// Serve one client to completion: read REGISTER, stream the backfill, GOAWAY.
-/// `reader` is shared read-only; `ts_reader` supplies exact per-block times
-/// (null ⇒ the client falls back to its own formula).
+/// `reader` is shared read-only. `ts_reader` supplies exact per-block times,
+/// null means the client falls back to its own formula.
 fn serveConnection(
     stream: std.net.Stream,
     reader: *const FlatStoreReader,
@@ -84,8 +78,8 @@ fn serveConnection(
     if (reg.version != tcp_frame.PROTOCOL_VERSION) {
         return sendGoaway(stream, .version_mismatch, "unsupported protocol version", allocator);
     }
-    // The bloom scan needs at least one positive set; an empty filter is a
-    // client bug, not a "match everything" request.
+    // Bloom scan needs at least one positive set. Empty filter is a client bug,
+    // not a "match everything" request.
     if (reg.addresses.len == 0 and reg.topics.len == 0) {
         return sendGoaway(stream, .shutdown, "empty filter", allocator);
     }
@@ -94,11 +88,11 @@ fn serveConnection(
     return sendGoaway(stream, .shutdown, "backfill complete", allocator);
 }
 
-/// Bloom-scan `(cursor, tip]`, then PUSH every block whose logs actually match
-/// the precise filter. A bloom false positive (block hit the bloom but no log
-/// survives `filterBlockEntry`) is skipped silently — that is the expected
-/// 8% the dual bloom lets through. A store read/decompress failure on a matched
-/// block is **fatal**: we refuse to hand a client an index with a hole.
+/// Bloom-scan `(cursor, tip]`, then PUSH every block whose logs match the
+/// precise filter. A bloom false positive (block hit the bloom but no log
+/// survives `filterBlockEntry`) is skipped silently, the expected 8% the dual
+/// bloom lets through. A store read/decompress failure on a matched block is
+/// fatal: refuse to hand a client an index with a hole.
 fn streamBackfill(
     stream: std.net.Stream,
     reader: *const FlatStoreReader,
@@ -108,7 +102,7 @@ fn streamBackfill(
 ) !void {
     if (reader.index_count == 0) return;
     const tip = tipOf(reader);
-    const start = reg.cursor + 1; // cursor = the last block the client already has
+    const start = reg.cursor + 1; // cursor = last block the client already has
     if (start > tip) return; // already caught up
 
     var matching = std.ArrayListUnmanaged(u64){};
@@ -126,9 +120,9 @@ fn streamBackfill(
         .exclude_addrs = &.{},
     };
 
-    // One block's worth of scratch each — heap, not stack (BLOCK_BUF_SIZE is 4 MB).
-    // Sequential pread per block; io_uring batching like the sdk builder is a
-    // later optimization (the network write dominates a remote client anyway).
+    // One block's worth of scratch each, heap not stack (BLOCK_BUF_SIZE is 4 MB).
+    // Sequential pread per block. Network write dominates a remote client, so
+    // io_uring batching like the sdk builder buys little here.
     const read_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
     defer allocator.free(read_buf);
     const decompress_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
@@ -142,7 +136,7 @@ fn streamBackfill(
         const entry_data = try reader.readBlock(bn, read_buf);
         const decompressed = try log_serial.decompressEntry(entry_data, decompress_buf);
         const maybe = try core.filter.filterBlockEntry(decompressed, filter, serialize_buf, compress_buf);
-        const filtered = maybe orelse continue; // bloom false positive — no log matched
+        const filtered = maybe orelse continue; // bloom false positive, no log matched
         const ts: u32 = if (ts_reader) |r| @intCast(r.get(bn) orelse 0) else 0;
         try sendPush(stream, bn, ts, filtered.entry);
     }
@@ -153,7 +147,7 @@ fn tipOf(reader: *const FlatStoreReader) u64 {
 }
 
 /// Collapse runs of equal block numbers in a sorted list, in place. Mirrors the
-/// sdk builder's dedup so a streamed index matches a locally-built one even when
+/// sdk builder's dedup so a streamed index matches a locally-built one when
 /// `blooms.bin` holds duplicate rows for a reorged block.
 fn dedupAdjacent(list: *std.ArrayListUnmanaged(u64)) void {
     if (list.items.len < 2) return;
@@ -168,9 +162,9 @@ fn dedupAdjacent(list: *std.ArrayListUnmanaged(u64)) void {
 
 // ── Wire I/O ──────────────────────────────────────────────────────────────
 
-/// PUSH a block: `header ‖ prefix ‖ entry`. The 17-byte head goes in one write
-/// and the lz4 entry straight from the block buffer in the next — no payload
-/// copy, no per-block allocation.
+/// PUSH a block: `header ‖ prefix ‖ entry`. The 17-byte head goes in one write,
+/// the lz4 entry straight from the block buffer in the next. No payload copy, no
+/// per-block allocation.
 fn sendPush(stream: std.net.Stream, block_number: u64, timestamp: u32, entry: []const u8) !void {
     const h = tcp_frame.header(.push, @intCast(tcp_frame.Push.PREFIX + entry.len));
     const pfx = tcp_frame.Push.prefix(block_number, timestamp);
@@ -194,7 +188,7 @@ fn writeFrame(stream: std.net.Stream, t: tcp_frame.FrameType, payload: []const u
     if (payload.len > 0) try stream.writeAll(payload);
 }
 
-/// Read one frame whose type must be `expect`; returns the owned payload.
+/// Read one frame whose type must be `expect`. Returns the owned payload.
 fn readFrame(stream: std.net.Stream, expect: tcp_frame.FrameType, allocator: std.mem.Allocator) ![]u8 {
     var hdr: [tcp_frame.HEADER_SIZE]u8 = undefined;
     try readExact(stream, &hdr);
@@ -206,7 +200,7 @@ fn readFrame(stream: std.net.Stream, expect: tcp_frame.FrameType, allocator: std
     return payload;
 }
 
-/// Fill `buf` exactly, or fail — a short read means the peer closed mid-frame.
+/// Fill `buf` exactly, or fail. A short read means the peer closed mid-frame.
 fn readExact(stream: std.net.Stream, buf: []u8) !void {
     var n: usize = 0;
     while (n < buf.len) {
@@ -324,7 +318,7 @@ test "serve streams the matching backfill blocks as PUSH, then GOAWAY" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Block 100 (A/T) and 102 (A/T) match; 101 (B/T) and 103 (A/U) do not.
+    // Blocks 100 (A/T) and 102 (A/T) match. 101 (B/T) and 103 (A/U) do not.
     const blocks = [_]PlantBlock{
         .{ .block_number = 100, .ts = 1_700_000_000, .log = .{ .address = ADDR_A, .topic0 = TOPIC_T } },
         .{ .block_number = 101, .ts = 1_700_000_012, .log = .{ .address = ADDR_B, .topic0 = TOPIC_T } },

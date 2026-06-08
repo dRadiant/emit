@@ -2,9 +2,8 @@
 ///
 /// A block matches when every non-empty bloom set hits: any `target_addresses`
 /// against the addr bloom AND any `target_topics` against the topic bloom.
-/// At least one set must be non-empty (asserted). The bloom scan is the
-/// block-level prefilter; per-log filtering after decompression applies the
-/// precise predicate.
+/// At least one set must be non-empty (asserted). Block-level prefilter only.
+/// Per-log filtering after decompression applies the precise predicate.
 const std = @import("std");
 
 const bloom = @import("bloom.zig");
@@ -51,7 +50,7 @@ pub fn scanBlooms(
     blocks_dropped.* = args.result_dropped;
 }
 
-/// Parallel bloom scan: split blooms.bin across N threads, aggregate results
+/// Parallel bloom scan. Splits blooms.bin across N threads, aggregates results
 /// in block order. Issues `fadvise(WILLNEED)` on matching blocks (Linux) so
 /// the kernel starts async NVMe DMA before io_uring workers begin.
 pub fn scanBloomsParallel(
@@ -106,9 +105,9 @@ pub fn scanBloomsParallel(
         worker_args[i].result_matching.deinit(allocator);
     }
 
-    // No `madvise(DONTNEED)` on blooms.bin: warm reruns avoid a full
-    // re-read of the bloom file. On memory-pressured hosts the kernel
-    // evicts naturally; the hint would only hurt the steady state.
+    // No `madvise(DONTNEED)` on blooms.bin. Warm reruns avoid a full
+    // re-read of the bloom file. Memory-pressured hosts evict naturally,
+    // so the hint would only hurt the steady state.
 }
 
 // ── Internal ─────────────────────────────────────────────────────────────

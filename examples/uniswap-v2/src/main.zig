@@ -1,6 +1,5 @@
-/// Uniswap V2 example indexer (factory pre-pass + child events). All
-/// glue lives in `examples/utils/cli.zig`; this file just wires the
-/// manifest, handlers, and entities together.
+/// Uniswap V2 example indexer (factory pre-pass + child events).
+/// Glue lives in `examples/utils/cli.zig`. Wires manifest, handlers, entities.
 const sdk = @import("sdk");
 const cli = @import("cli");
 

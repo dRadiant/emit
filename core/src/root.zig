@@ -1,10 +1,9 @@
-/// emit core — shared infrastructure for the flat log store.
+/// emit core: shared infrastructure for the flat log store.
 ///
-/// Provides read-only access to blocks.dat/blooms.bin/blocks.idx,
-/// bloom filter operations, parallel block filtering by address,
-/// packed log serialization, and io_uring read pipeline.
+/// Read-only access to blocks.dat/blooms.bin/blocks.idx, bloom filter ops,
+/// parallel block filtering by address, packed log serialization, io_uring read pipeline.
 ///
-/// Imported by both engine (import + head follow) and sdk (filtered index build).
+/// Imported by engine (import + head follow) and sdk (filtered index build).
 pub const types = @import("types.zig");
 pub const bloom = @import("bloom.zig");
 pub const flat_reader = @import("flat_reader.zig");
@@ -19,7 +18,7 @@ pub const flat_format = @import("flat_format.zig");
 pub const timestamps = @import("timestamps.zig");
 pub const tcp_frame = @import("tcp_frame.zig");
 
-// Re-export commonly used types at top level for convenience.
+// Top-level re-exports of commonly used types.
 pub const RawLog = types.RawLog;
 pub const Bloom = bloom.Bloom;
 pub const AddrBloom = bloom.AddrBloom;

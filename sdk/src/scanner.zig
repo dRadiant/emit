@@ -1,17 +1,16 @@
 /// Filtered-index scanner. Two entry points:
 ///
-/// - `scanCreations(dir, manifest, allocator)` walks the `primary` filtered
-///   pair and dispatches only factory creation events to a comptime-restricted
-///   collector that returns the discovered child addresses. No user
-///   handlers run. Phase 2 of the four-phase pipeline.
+/// - `scanCreations`: walks the `primary` filtered pair, dispatches only
+///   factory creation events to a comptime-restricted collector returning
+///   discovered child addresses. No user handlers run.
 ///
-/// - `replay(dir, manifest, Handler, ctx, options)` walks the `primary` pair
-///   (always) and `children` pair (when present), k-way-merges logs by
-///   `(block_number, tx_index, log_index)`, and dispatches each to the
-///   user's handler via `handler.dispatcherFor(manifest).dispatch`. Phase 4.
+/// - `replay`: walks the `primary` pair (always) and `children` pair (when
+///   present), k-way-merges logs by `(block_number, tx_index, log_index)`,
+///   dispatches each to the user's handler via
+///   `handler.dispatcherFor(manifest).dispatch`.
 ///
-/// Both functions assume the pairs were produced by `filter_builder` and
-/// therefore the file names follow `BASE_PRIMARY` / `BASE_CHILDREN`.
+/// Both assume the pairs were produced by `filter_builder`, so file names
+/// follow `BASE_PRIMARY` / `BASE_CHILDREN`.
 const std = @import("std");
 
 const core = @import("core");
@@ -32,9 +31,9 @@ const types = core.types;
 pub const ReplayOptions = struct {
     commit_interval: u32 = 100_000,
     /// Skip every filtered-index block whose number is at or below `start_block`.
-    /// `entry.init` seeds this from `state.snap.cursor`, so replay against
-    /// an existing entity store re-dispatches only the uncovered range.
-    /// The default 0 starts from the oldest entry.
+    /// `entry.init` seeds this from `state.snap.cursor`, so replay against an
+    /// existing entity store re-dispatches only the uncovered range. Default 0
+    /// starts from the oldest entry.
     start_block: u64 = 0,
 };
 
@@ -44,7 +43,7 @@ pub const ReplayResult = struct {
     elapsed_ns: u64 = 0,
 };
 
-// ── Phase 2: scanCreations ───────────────────────────────────────────────
+// ── scanCreations ────────────────────────────────────────────────────────
 
 /// Walk `BLOCKS_PRIMARY` and collect spawned-contract addresses from every
 /// log whose `topic0` matches a factory's `create_event`. Caller owns the
@@ -90,15 +89,15 @@ pub fn scanCreations(
     return discovered;
 }
 
-// ── Phase 4: replay ──────────────────────────────────────────────────────
+// ── replay ───────────────────────────────────────────────────────────────
 
 /// Walk the filtered index in canonical `(block_number, tx_index, log_index)`
-/// order, dispatching each log via the comptime topic0 dispatcher. Logs
-/// with no matching event in the manifest (bloom false positives that
-/// slipped through) are silently skipped by the dispatcher, not by us.
+/// order, dispatching each log via the comptime topic0 dispatcher. Logs with
+/// no matching manifest event (bloom false positives) are skipped by the
+/// dispatcher, not here.
 ///
-/// Working buffers are heap-allocated and pulled from the ctx's allocator
-/// (the buffer rule in `core.parallel`: main-thread paths get the heap).
+/// Working buffers are heap-allocated from the ctx's allocator (main-thread
+/// paths get the heap, per `core.parallel`).
 pub fn replay(
     dir: std.fs.Dir,
     comptime m: sdk_manifest.Manifest,
@@ -114,9 +113,9 @@ pub fn replay(
 
     const allocator = ctxAllocator(ctx);
 
-    // The primary pair may not exist when filter_builder.build matched zero
-    // blocks (e.g. a fresh `--follow` run before any historical match).
-    // Treat identically to the children pair: empty walker, no work.
+    // Primary pair may not exist when filter_builder.build matched zero blocks
+    // (e.g. fresh `--follow` before any historical match). Treat like the
+    // children pair: empty walker, no work.
     var primary_storage: CursorWalker = undefined;
     var primary: ?*CursorWalker = null;
     if (CursorWalker.open(allocator, dir, filter_builder.BASE_PRIMARY, options.start_block)) |w| {
@@ -178,9 +177,9 @@ pub fn replay(
         if (merge_count == 0) continue;
         std.mem.sort(RawLog, merge_buf[0..merge_count], {}, lessByTxLog);
 
-        // Update ctx for this block. Prefer the exact time carried in the
-        // FilteredStore entry — the remote stream fills it from the PUSH frame;
-        // 0 means a local build, so fall back to the engine's timestamps.bin.
+        // Update ctx for this block. Prefer the exact time in the FilteredStore
+        // entry (remote stream fills it from the PUSH frame). 0 means a local
+        // build, so fall back to the engine's timestamps.bin.
         ctx.block_number = block_number;
         ctx.timestamp = if (block_ts != 0) @as(u64, block_ts) else humanize.timestampOf(ctx, block_number);
         result.blocks_dispatched += 1;
@@ -191,9 +190,9 @@ pub fn replay(
             events_since_commit += 1;
         }
 
-        // Block boundary. Record the cursor and gate the commit check here
-        // — mid-block commits would leave the cursor pointing at a
-        // partially-dispatched block.
+        // Block boundary. Record the cursor and gate the commit check here.
+        // Mid-block commits would leave the cursor at a partially-dispatched
+        // block.
         setLastDispatched(ctx, block_number);
         if (events_since_commit >= options.commit_interval) {
             try maybeCommit(ctx);
@@ -205,8 +204,8 @@ pub fn replay(
     return result;
 }
 
-/// Pull an allocator off the ctx. `entry.Context` exposes it as
-/// `_allocator`; the test `Counter` uses the bare name `allocator`.
+/// Pull an allocator off the ctx. `entry.Context` exposes `_allocator`, the
+/// test `Counter` uses the bare name `allocator`.
 inline fn ctxAllocator(ctx: anytype) std.mem.Allocator {
     const T = std.meta.Child(@TypeOf(ctx));
     if (comptime @hasField(T, "_allocator")) return ctx._allocator;
@@ -214,9 +213,9 @@ inline fn ctxAllocator(ctx: anytype) std.mem.Allocator {
     @compileError("scanner.replay: ctx of type '" ++ @typeName(T) ++ "' must expose `_allocator` or `allocator` so replay can size its merge buffers off the heap.");
 }
 
-/// Calls `ctx.commitCycle()` if the context type defines one. Tests using
-/// a counter-shaped ctx (no entity stores) skip the commit; entry.zig's
-/// Context type provides commitCycle and gets the every-N-events flush.
+/// Calls `ctx.commitCycle()` if the context type defines one. Counter-shaped
+/// test contexts (no entity stores) skip the commit. entry.zig's Context
+/// provides commitCycle and gets the every-N-events flush.
 inline fn maybeCommit(ctx: anytype) !void {
     const T = std.meta.Child(@TypeOf(ctx));
     if (comptime @hasDecl(T, "commitCycle")) {
@@ -224,8 +223,8 @@ inline fn maybeCommit(ctx: anytype) !void {
     }
 }
 
-/// Set the ctx's cursor-boundary field, if it has one. Counter-shaped
-/// test contexts don't, and skip silently.
+/// Set the ctx's cursor-boundary field if it has one. Counter-shaped test
+/// contexts don't, and skip silently.
 inline fn setLastDispatched(ctx: anytype, block: u64) void {
     const T = std.meta.Child(@TypeOf(ctx));
     if (comptime @hasField(T, "_last_dispatched_block")) {
@@ -244,17 +243,17 @@ fn lessByTxLog(_: void, a: RawLog, b: RawLog) bool {
     return a.log_index < b.log_index;
 }
 
-/// Wraps a position-based iterator over a `FilteredStore`, providing
-/// peek/consume so the merge loop in replay can advance one pair at a
-/// time without juggling cursor state across two streams.
+/// Position-based iterator over a `FilteredStore`. peek/consume let replay's
+/// merge loop advance one pair at a time without juggling cursor state across
+/// two streams.
 const CursorWalker = struct {
     store: FilteredStore,
     /// Owns the next-payload scratch buffer. Sized for one block's LZ4 entry.
     payload_buf: []u8,
     next_index: u64,
-    /// The IndexEntry at `next_index`, cached by `peek` and reused by
-    /// `consume`. Without this every iteration would read the same entry
-    /// twice (once for block_number, once for offset+length).
+    /// IndexEntry at `next_index`, cached by `peek` and reused by `consume`.
+    /// Without it every iteration reads the same entry twice (block_number,
+    /// then offset+length).
     peeked: ?filtered_store_mod.IndexEntry = null,
 
     /// `start_block == 0` walks from the oldest entry. Any other value seeks
@@ -287,7 +286,7 @@ const CursorWalker = struct {
     }
 
     /// Exact block time of the peeked entry (0 = unknown). Valid only after
-    /// `peek` cached the entry; the merge loop reads it before `consume`.
+    /// `peek` cached the entry. The merge loop reads it before `consume`.
     fn peekedTimestamp(self: *const CursorWalker) u32 {
         return if (self.peeked) |e| e.timestamp else 0;
     }
@@ -469,10 +468,9 @@ test "scanCreations: extracts spawned addresses from factory creation events" {
 
     const create_topic = topicOf(PairCreated);
 
-    // Use writeFlatStore for simplicity. Note that writeFlatStore stores an
-    // empty `data` field, so we instead skip the helper and craft a single
-    // block manually with the spawned address embedded in topic[1] — that
-    // exercises the indexed slot path of extractFactoryAddress.
+    // writeFlatStore stores an empty `data` field, so craft a single block
+    // manually with the spawned address in topic[1]. Exercises the indexed
+    // slot path of extractFactoryAddress.
     const flat_reader = core.flat_reader;
     const bloom = core.bloom;
 
@@ -559,9 +557,9 @@ test "scanCreations: extracts spawned addresses from factory creation events" {
 test "replay: dispatches logs in canonical (block, tx, log_index) order across one DBI" {
     const allocator = testing.allocator;
 
-    // Three blocks. Block 100 has logs at (tx=0, log=0) and (tx=0, log=1).
-    // writeFlatStore preserves the order as given in `logs`, but we plant
-    // them out of order to verify the scanner sorts within a block.
+    // Block 100 has logs at (tx=0, log=0) and (tx=0, log=1). writeFlatStore
+    // preserves the given order, so plant them out of order to verify the
+    // scanner sorts within a block.
     var src_tmp = testing.tmpDir(.{});
     defer src_tmp.cleanup();
 
@@ -612,11 +610,9 @@ test "replay: dispatches logs in canonical (block, tx, log_index) order across o
 }
 
 test "replay seeks past start_block so already-dispatched range is skipped" {
-    // cursor: when init reads a non-zero cursor from `_meta`, scanner
-    // walks `cursor.seek(blockKey(start_block + 1))` to skip the
-    // already-covered range without per-block iteration. Plant three
-    // blocks, run replay with start_block = 100, expect only blocks 101
-    // and 102 dispatched.
+    // When init reads a non-zero cursor from `_meta`, scanner seeks past the
+    // already-covered range without per-block iteration. Plant three blocks,
+    // run replay with start_block = 100, expect only blocks 101 and 102.
     const allocator = testing.allocator;
     var src_tmp = testing.tmpDir(.{});
     defer src_tmp.cleanup();
@@ -668,7 +664,7 @@ test "replay: k-way merge across BLOCKS_PRIMARY and BLOCKS_CHILDREN preserves bl
     const allocator = testing.allocator;
 
     // Plant a flat store with:
-    //   block 100: factory creation (PrimaryAddr emits PairCreated)
+    //   block 100: factory address emits PairCreated → primary
     //   block 101: child 1 emits Sync
     //   block 102: factory address emits another PairCreated → primary
     //   block 103: child 2 emits Sync
@@ -735,15 +731,15 @@ test "factory orchestration: build → scanCreations → appendChildren → repl
 
     // Block 100: factory creates child_1.
     // Block 101: child_1 emits Sync (child event).
-    // Block 102: noise — unrelated address with unrelated topic.
+    // Block 102: noise. Unrelated address with unrelated topic.
     var src_tmp = testing.tmpDir(.{});
     defer src_tmp.cleanup();
 
     const create_topic = topicOf(PairCreated);
     const sync_topic = topicOf(Sync);
 
-    // For the factory log we need data containing the spawned address at offset 0.
-    // writeFlatStore plants empty data; build a custom log with non-empty data.
+    // Factory log needs data with the spawned address at offset 0. writeFlatStore
+    // plants empty data, so build a custom log with non-empty data.
     const flat_reader = core.flat_reader;
     const bloom = core.bloom;
 

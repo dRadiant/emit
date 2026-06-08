@@ -1,7 +1,6 @@
-/// Test fixture: pure-Zig stand-in for the engine that writes `pending.bin`
-/// and `meta.bin` to a directory on demand. Lets SDK tests script
-/// ingest / reorg / finalize sequences without an EVM node. Not re-exported
-/// from `root.zig`.
+/// Pure-Zig stand-in for the engine. Writes `pending.bin` and `meta.bin`
+/// to a directory on demand so SDK tests can script ingest/reorg/finalize
+/// sequences without an EVM node. Not re-exported from `root.zig`.
 const std = @import("std");
 
 const core = @import("core");
@@ -25,8 +24,8 @@ pub const FakeEngine = struct {
 
     pub const Entry = struct {
         block_number: u64,
-        /// Exact block time (epoch seconds). 0 = unknown — mirrors the engine
-        /// follower carrying `header.timestamp` into `pending.bin`.
+        /// Exact block time (epoch seconds). 0 = unknown. Mirrors the follower
+        /// carrying `header.timestamp` into `pending.bin`.
         timestamp: u32 = 0,
         hash: [32]u8,
         topic_bloom: [bloom.BLOOM_SIZE]u8,
@@ -45,7 +44,7 @@ pub const FakeEngine = struct {
     }
 
     /// Append a block to pending and atomically rewrite `pending.bin`.
-    /// Timestamp is left unknown (0); use `ingestAt` to drive the exact path.
+    /// Timestamp left unknown (0). Use `ingestAt` for the exact-time path.
     pub fn ingest(
         self: *FakeEngine,
         block_number: u64,
@@ -90,7 +89,7 @@ pub const FakeEngine = struct {
 
     /// Drop the oldest pending block and advance `meta.last_finalized_block`
     /// to `block`. Returns `error.InvalidFinalize` when `block` isn't the
-    /// oldest entry — engine semantics only finalize in order.
+    /// oldest entry. Finalization is in-order only.
     pub fn finalize(self: *FakeEngine, block: u64) !void {
         if (self.entries.items.len == 0 or self.entries.items[0].block_number != block)
             return error.InvalidFinalize;
@@ -102,7 +101,7 @@ pub const FakeEngine = struct {
     }
 
     /// Truncate pending entries with `block_number >= fork`. Mirrors the
-    /// engine's `resolveReorg.truncateFrom`; meta is unchanged so the SDK
+    /// engine's `resolveReorg.truncateFrom`. Meta is unchanged so the SDK
     /// can disambiguate truncation from finalization.
     pub fn reorg(self: *FakeEngine, fork: u64) !void {
         while (self.entries.items.len > 0) {
@@ -123,8 +122,8 @@ pub const FakeEngine = struct {
     }
 
     fn persistMeta(self: *FakeEngine) !void {
-        // `core.Meta.serialize` writes a valid checksum, which `readMeta`
-        // validates via the same `deserialize` path.
+        // `Meta.serialize` writes a valid checksum that `readMeta` validates
+        // via the same `deserialize` path.
         const meta = flat_reader.Meta{
             .last_finalized_block = self.last_finalized,
             .blocks_dat_size = 0,
@@ -193,7 +192,7 @@ test "reorg truncates pending but leaves meta alone" {
 
     const hash_a = [_]u8{0xAA} ** 32;
     for (100..106) |i| try fake.ingest(i, hash_a, &.{dummyLog(i)});
-    // meta.bin doesn't exist yet — finalize hasn't fired.
+    // meta.bin doesn't exist yet. Finalize hasn't fired.
     try testing.expectError(error.FileNotFound, tmp.dir.openFile(META_FILE, .{}));
 
     try fake.reorg(103);
@@ -206,10 +205,10 @@ test "reorg truncates pending but leaves meta alone" {
     try testing.expectEqual(@as(usize, 3), parsed.len);
     try testing.expectEqual(@as(u64, 102), parsed[parsed.len - 1].block_number);
 
-    // Meta still absent — reorg-truncation must not touch meta.
+    // Meta still absent. Reorg-truncation must not touch meta.
     try testing.expectError(error.FileNotFound, tmp.dir.openFile(META_FILE, .{}));
 
-    // Re-ingest canonical chain with a different hash; ring stays dense.
+    // Re-ingest canonical chain with a different hash. Ring stays dense.
     const hash_b = [_]u8{0xBB} ** 32;
     for (103..106) |i| try fake.ingest(i, hash_b, &.{dummyLog(i)});
 
@@ -261,7 +260,7 @@ test "finalize rejects out-of-order block" {
     try fake.ingest(100, hash_a, &.{dummyLog(100)});
     try fake.ingest(101, hash_a, &.{dummyLog(101)});
 
-    // Block 101 isn't the oldest — engine semantics require finalize on the
-    // oldest pending block. The fake catches the mismatch.
+    // Block 101 isn't the oldest. Finalize requires the oldest pending block.
+    // The fake catches the mismatch.
     try testing.expectError(error.InvalidFinalize, fake.finalize(101));
 }

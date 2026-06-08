@@ -5,12 +5,12 @@
 ///     "Transfer(address,address,uint256)"                                  // bare
 ///     "Transfer(address indexed from, address indexed to, uint256 value)"  // full
 ///
-/// `abi_parse` produces a canonical form (names + `indexed` stripped,
-/// aliases resolved) which is what gets keccak-hashed for topic0. Both
-/// forms above hash identically, matching `solc`'s event selector.
+/// `abi_parse` strips names + `indexed` and resolves aliases to a canonical
+/// form. That form is keccak-hashed for topic0, so both spellings produce
+/// the same selector as `solc`.
 ///
-/// The full form unlocks named parameter lookup (`log.param(E, "from")`)
-/// and named factory spawn parameters (`spawn_param = "pair"`).
+/// Full form unlocks named parameter lookup (`log.param(E, "from")`) and
+/// named factory spawn parameters (`spawn_param = "pair"`).
 const std = @import("std");
 
 const eth = @import("eth");
@@ -21,24 +21,20 @@ pub const Manifest = struct {
     name: []const u8,
     chain_id: u64,
     start_block: u64,
-    /// Optional inclusive upper bound on the scan range. `null` (the
-    /// default) scans to the flat store's `latest_block`. Set this to
-    /// pin a benchmark or test to a fixed window. For example, to compare
-    /// entity counts byte-for-byte against an external reference that
-    /// covers a specific block range.
+    /// Optional inclusive upper bound on the scan range. `null` scans to the
+    /// flat store's `latest_block`. Pins a run to a fixed window for
+    /// byte-for-byte comparison against an external reference.
     end_block: ?u64 = null,
     contracts: []const ContractDef = &.{},
     factories: []const FactoryDef = &.{},
-    /// Event-driven eth_call prefetch declarations. For each matching log,
-    /// the SDK queues the declared `(address, method)` pairs and batches
-    /// them through Multicall3 during Phase 4. Handlers read the cached
-    /// results via `ctx.ethCall(T, addr, "method()")`.
+    /// Event-driven eth_call prefetch. Per matching log, queues the declared
+    /// `(address, method)` pairs and batches them through Multicall3.
+    /// Handlers read cached results via `ctx.ethCall(T, addr, "method()")`.
     prefetch: []const PrefetchDef = &.{},
-    /// Address-driven eth_call declarations independent of any event.
-    /// Useful for canonical contracts whose metadata the indexer references
-    /// from handler code regardless of which logs flow through (WETH
-    /// decimals, a router's factory pointer, etc.). Each entry is one
-    /// `(address, method)` pair.
+    /// Address-driven eth_call independent of any event. For canonical
+    /// contracts whose metadata handlers reference regardless of log flow
+    /// (WETH decimals, a router's factory pointer). One `(address, method)`
+    /// pair per entry.
     static_prefetch: []const StaticCall = &.{},
 };
 
@@ -52,25 +48,24 @@ pub const FactoryDef = struct {
     name: []const u8,
     address: [20]u8,
     create_event: type,
-    /// Name of the parameter in `create_event` that carries the spawned
-    /// address. Must reference a named `address` parameter in the signature;
-    /// comptime validation fires `@compileError` listing available
-    /// parameters otherwise.
+    /// Name of the `create_event` parameter carrying the spawned address.
+    /// Must reference a named `address` parameter. Comptime validation
+    /// fires `@compileError` listing available parameters otherwise.
     spawn_param: []const u8,
     child_events: []const type,
 };
 
 /// Per-log target-address source for a `PrefetchCall`. `.log` selects the
-/// emitter address; `.param: "name"` resolves a named event parameter
-/// through `abi_parse.paramByName` (the same machinery `FactoryDef.spawn_param`
-/// uses). Comptime validation rejects names that are absent from the event
-/// signature or whose type is not `address`.
+/// emitter address. `.param: "name"` resolves a named event parameter via
+/// `abi_parse.paramByName` (same machinery as `FactoryDef.spawn_param`).
+/// Comptime validation rejects names absent from the signature or not of
+/// type `address`.
 pub const AddressSource = union(enum) {
     log,
     param: []const u8,
 };
 
-/// One declared eth_call. The target address resolves per-log via `address`;
+/// One declared eth_call. Target address resolves per-log via `address`.
 /// `method` is the no-argument Solidity signature whose first four keccak
 /// bytes form the call selector.
 pub const PrefetchCall = struct {
@@ -83,27 +78,26 @@ pub const PrefetchDef = struct {
     calls: []const PrefetchCall,
 };
 
-/// One eth_call declared against a fixed address, independent of any event.
-/// The `method` string is the no-argument Solidity signature; the SDK
-/// keccaks the first four bytes as the selector. The same string appears
-/// at the handler call site (`ctx.ethCall(T, address, "method()")`) so the
-/// cache key derivation is unambiguous and consistent.
+/// One eth_call against a fixed address, independent of any event. `method`
+/// is the no-argument Solidity signature whose first four keccak bytes form
+/// the selector. The same string appears at the handler call site
+/// (`ctx.ethCall(T, address, "method()")`) so cache key derivation is
+/// unambiguous.
 pub const StaticCall = struct {
     address: [20]u8,
     method: []const u8,
 };
 
-/// Parse the event's signature at comptime. Cached per type by the
-/// compiler's memoization of comptime calls.
+/// Parse the event's signature at comptime. Memoized per type by the compiler.
 pub fn parsedEvent(comptime E: type) abi_parse.ParsedEvent {
     return comptime abi_parse.parseEvent(E.signature);
 }
 
-/// Comptime-only: eth.zig's runtime xkcp backend does unaligned u64 loads
-/// that crash on aarch64, so we route every call through the stdlib keccak
-/// path by forcing the body to comptime. We hash the canonical form so
-/// `"Transfer(address indexed from, …)"` and `"Transfer(address,…)"` both
-/// produce the same selector, matching `solc`.
+/// Comptime-only. eth.zig's runtime xkcp backend does unaligned u64 loads
+/// that crash on aarch64, so forcing the body to comptime routes through the
+/// stdlib keccak path. Hashes the canonical form, so
+/// `"Transfer(address indexed from, …)"` and `"Transfer(address,…)"` yield
+/// the same selector as `solc`.
 pub fn eventTopic0(comptime E: type) [32]u8 {
     return comptime blk: {
         @setEvalBranchQuota(200_000);
@@ -144,9 +138,9 @@ fn validateStaticCall(comptime c: StaticCall) void {
     );
 }
 
-/// Comptime check that every `PrefetchCall` in `d` declares a non-empty
-/// method and that any `.param: name` source resolves to an `address`
-/// parameter on `d.on_event`'s signature.
+/// Comptime check: every `PrefetchCall` in `d` has a non-empty method, and
+/// any `.param: name` source resolves to an `address` parameter on
+/// `d.on_event`'s signature.
 fn validatePrefetch(comptime d: PrefetchDef) void {
     comptime {
         validateEvent(d.on_event);
@@ -168,8 +162,8 @@ fn validatePrefetch(comptime d: PrefetchDef) void {
     }
 }
 
-/// Comptime check that `f.spawn_param` references a named `address`
-/// parameter on `f.create_event`'s signature.
+/// Comptime check: `f.spawn_param` references a named `address` parameter on
+/// `f.create_event`'s signature.
 fn validateSpawnParam(comptime f: FactoryDef) void {
     comptime {
         const parsed = parsedEvent(f.create_event);
@@ -181,16 +175,16 @@ fn validateSpawnParam(comptime f: FactoryDef) void {
 }
 
 /// Extract the spawned address from a factory log. Thin wrapper over
-/// `extractAddress(.param)` — kept for call-site clarity at factory pre-pass.
+/// `extractAddress(.param)`, kept for call-site clarity at factory pre-pass.
 pub fn extractFactoryAddress(comptime f: FactoryDef, topics: []const [32]u8, data: []const u8) [20]u8 {
     return extractAddress(f.create_event, .{ .param = f.spawn_param }, [_]u8{0} ** 20, topics, data);
 }
 
 /// Resolve a `PrefetchCall`'s target address against a matching log.
-/// `.log` returns `log_address` directly; `.param: name` resolves the
-/// named parameter at comptime through `abi_parse.paramByName` and reads
-/// from `topics[slot_index]` or `data[slot_index..][0..32]` per the
-/// parser's `slot_kind`, returning the trailing 20 bytes.
+/// `.log` returns `log_address` directly. `.param: name` resolves the named
+/// parameter at comptime via `abi_parse.paramByName`, reads from
+/// `topics[slot_index]` or `data[slot_index..][0..32]` per the parser's
+/// `slot_kind`, and returns the trailing 20 bytes.
 pub fn extractAddress(
     comptime E: type,
     comptime src: AddressSource,
@@ -210,9 +204,9 @@ pub fn extractAddress(
 }
 
 /// Statically known emitter addresses: every contract plus every factory.
-/// These are the addresses whose logs the historical filter keeps and the
-/// live path admits without consulting the runtime child set. Factory
-/// children are discovered at runtime and tracked separately.
+/// The historical filter keeps these logs and the live path admits them
+/// without consulting the runtime child set. Factory children are discovered
+/// at runtime and tracked separately.
 pub fn knownAddresses(comptime m: Manifest) []const [20]u8 {
     comptime {
         var out: []const [20]u8 = &.{};
@@ -222,8 +216,8 @@ pub fn knownAddresses(comptime m: Manifest) []const [20]u8 {
     }
 }
 
-/// Topic0-deduplicated flat list of every event referenced by `m`. Used to
-/// generate the comptime dispatch table.
+/// Topic0-deduplicated flat list of every event referenced by `m`. Drives
+/// the comptime dispatch table.
 pub fn allEvents(comptime m: Manifest) []const type {
     comptime {
         var seen_topics: []const [32]u8 = &.{};
@@ -255,9 +249,9 @@ fn containsTopic(haystack: []const [32]u8, needle: [32]u8) bool {
     return false;
 }
 
-/// SHA-256 over fields that affect filtered-index content. The SDK persists
-/// this next to the filter dir and rebuilds if it doesn't match — manifest
-/// edits between runs would otherwise replay stale data into new handlers.
+/// SHA-256 over fields that affect filtered-index content. Persisted next to
+/// the filter dir, triggering a rebuild on mismatch. Without it, manifest
+/// edits between runs would replay stale data into new handlers.
 pub fn fingerprint(comptime m: Manifest) [32]u8 {
     return comptime blk: {
         @setEvalBranchQuota(200_000);
@@ -347,8 +341,8 @@ test "eventName honors an explicit name override" {
 }
 
 test "eventTopic0 hashes the signature" {
-    // Hash at comptime to dodge an alignment bug in eth.zig's runtime xkcp
-    // backend on aarch64. The SDK only ever calls this at comptime anyway.
+    // Comptime hash dodges an alignment bug in eth.zig's runtime xkcp
+    // backend on aarch64. SDK only ever calls this at comptime anyway.
     const expected = comptime eth.keccak.hash("Transfer(address,address,uint256)");
     try std.testing.expectEqualSlices(u8, &expected, &eventTopic0(Transfer));
 }

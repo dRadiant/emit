@@ -1,12 +1,11 @@
-/// `tmp + fsync + rename` snapshot writer. Any reader of `final_name`
-/// sees either the previous content or the new — never torn.
+/// `tmp + fsync + rename` snapshot writer. Readers of `final_name` see
+/// either the previous or new content, never torn.
 ///
-/// No directory fsync. A power loss between the rename landing in the
-/// inode cache and the directory metadata reaching disk could roll the
-/// rename back; in that case the reader sees the prior file content,
-/// which is still consistent. Recovery is whatever the caller's normal
-/// "open and resume" path does (e.g. cursor pointed at an earlier block
-/// → replay).
+/// No directory fsync. Power loss between the rename hitting the inode
+/// cache and directory metadata reaching disk can roll the rename back,
+/// leaving the reader on prior (still-consistent) content. Recovery is
+/// the caller's normal open-and-resume path (e.g. cursor at an earlier
+/// block replays).
 const std = @import("std");
 
 pub fn write(

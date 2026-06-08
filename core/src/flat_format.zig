@@ -1,7 +1,6 @@
-/// Shared magic-header helpers for flat files across the project. Every
-/// flat file in `core` and `sdk` carries an 8-byte magic at offset 0 so a
-/// stray copy, truncated download, or arbitrary bytes is rejected loud
-/// rather than misread as empty state.
+/// Magic-header helpers for flat files. Every flat file in `core` and `sdk`
+/// carries an 8-byte magic at offset 0 so a stray copy, truncated download,
+/// or arbitrary bytes is rejected loud rather than misread as empty state.
 const std = @import("std");
 
 pub const MAGIC_SIZE: usize = 8;
@@ -19,8 +18,7 @@ pub fn validateMagic(buf: []const u8, expected: Magic) Error!void {
 }
 
 /// Create `dir/name`, truncating any prior content, and write the magic
-/// header. Used both for first-time creation and as the recovery path
-/// when an existing file is corrupted past the magic.
+/// header. Recovery path when an existing file is corrupted past the magic.
 pub fn createWithMagic(dir: std.fs.Dir, name: []const u8, magic: Magic) !std.fs.File {
     const file = try dir.createFile(name, .{ .read = true, .truncate = true });
     errdefer file.close();
@@ -29,18 +27,16 @@ pub fn createWithMagic(dir: std.fs.Dir, name: []const u8, magic: Magic) !std.fs.
 }
 
 /// Open `dir/name` and validate its magic, or create a fresh file with
-/// `magic` written as its first bytes. Files shorter than `MAGIC_SIZE` are
-/// treated as fresh (the caller's previous run crashed before any record
-/// was written). Files with a wrong magic surface `error.InvalidMagic`
-/// so callers can pick their own recovery policy (re-raise or reset).
+/// `magic` as its first bytes. Files shorter than `MAGIC_SIZE` are treated
+/// as fresh (prior run crashed before any record was written). Wrong magic
+/// surfaces `error.InvalidMagic` so callers pick their own recovery policy.
 ///
-/// Caller owns the returned file and is responsible for any further
-/// header parsing and for closing.
+/// Caller owns the returned file: further header parsing and closing.
 pub fn openOrCreateWithMagic(dir: std.fs.Dir, name: []const u8, magic: Magic) !std.fs.File {
     if (dir.openFile(name, .{ .mode = .read_write })) |file| {
         errdefer file.close();
         var buf: [MAGIC_SIZE]u8 = undefined;
-        // Propagate real I/O errors; swallowing them would silently truncate the file.
+        // Propagate real I/O errors. Swallowing them would silently truncate the file.
         const n = try file.pread(&buf, 0);
         if (n < MAGIC_SIZE) {
             file.close();

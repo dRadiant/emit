@@ -1,5 +1,5 @@
 /// Minimal RLP decoder for walking Ethereum receipt structures.
-/// Cursor over an input byte slice — no allocations, no copying.
+/// Cursor over an input byte slice. No allocations, no copying.
 /// Handles Nethermind's CompactReceiptStore format (0x7F marker + compact RLP).
 const std = @import("std");
 
@@ -90,7 +90,7 @@ pub const Rlp = struct {
     }
 
     /// Reconstruct a zero-stripped value into a fixed-size array.
-    /// Topics are 32 bytes, addresses 20 bytes — Nethermind strips leading zeros.
+    /// Topics are 32 bytes, addresses 20 bytes. Nethermind strips leading zeros.
     pub fn padLeft(comptime N: usize, stripped: []const u8) [N]u8 {
         var out = std.mem.zeroes([N]u8);
         if (stripped.len <= N) @memcpy(out[N - stripped.len ..], stripped);
@@ -113,11 +113,9 @@ pub const Rlp = struct {
 };
 
 /// Extract the `timestamp` (field 11) from an RLP-encoded block header.
-/// Header field order is fixed: parentHash, ommersHash, beneficiary,
-/// stateRoot, txRoot, receiptsRoot, logsBloom, difficulty, number, gasLimit,
-/// gasUsed, **timestamp**, extraData, ... so we enter the list and skip the
-/// first 11 fields. Post-1559/Shanghai/Cancun fields trail the timestamp and
-/// are irrelevant here.
+/// Fixed field order: parentHash, ommersHash, beneficiary, stateRoot, txRoot,
+/// receiptsRoot, logsBloom, difficulty, number, gasLimit, gasUsed, timestamp.
+/// Skip the first 11 fields. Trailing post-1559/Shanghai/Cancun fields unused.
 pub fn headerTimestamp(header_rlp: []const u8) Error!u64 {
     var rlp = Rlp.init(header_rlp);
     _ = try rlp.enterList();
@@ -176,8 +174,8 @@ test "padLeft reconstructs zero-stripped topic" {
 }
 
 test "headerTimestamp reads field 11" {
-    // Synthetic header: 11 empty fields (0..10), then a 4-byte timestamp.
-    // List payload = 11*1 + 5 = 16 bytes, so the list prefix is 0xC0+16 = 0xD0.
+    // 11 empty fields then a 4-byte timestamp.
+    // Payload = 11*1 + 5 = 16 bytes, list prefix 0xC0+16 = 0xD0.
     const header = [_]u8{0xD0} ++ ([_]u8{0x80} ** 11) ++ [_]u8{ 0x84, 0x64, 0x32, 0x5a, 0x80 };
     try std.testing.expectEqual(@as(u64, 0x64325a80), try headerTimestamp(&header));
 }

@@ -1,12 +1,11 @@
-/// Comptime-generic bloom filter. Topic blooms use 256 bytes (2048 bits),
-/// address blooms use 1024 bytes (8192 bits) for lower false-positive rates
-/// on blocks with hundreds of unique addresses (~3.4% FP at 500 addresses
-/// vs 25% with 256 bytes).
+/// Comptime-generic bloom filter. Topic blooms use 256 bytes (2048 bits).
+/// Address blooms use 1024 bytes (8192 bits) for lower FP on blocks with
+/// hundreds of unique addresses (~3.4% FP at 500 addresses vs 25% at 256 bytes).
 const std = @import("std");
 
-/// k=7 hash functions extracted from non-overlapping 2-byte windows in the
-/// 32-byte key. No extra hashing needed — topic0 values are already keccak256
-/// (uniformly distributed). Addresses are right-padded to 32 bytes.
+/// k=7 hash functions from non-overlapping 2-byte windows of the 32-byte key.
+/// No extra hashing: topic0 values are already keccak256 (uniformly distributed).
+/// Addresses are right-padded to 32 bytes.
 const NUM_HASHES = 7;
 
 pub fn BloomFilter(comptime SIZE: comptime_int) type {

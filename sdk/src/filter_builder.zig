@@ -1,18 +1,17 @@
 /// Filtered-index builder. Reads the engine's flat log store via `core`,
-/// keeps logs that match the manifest, and writes them into a flat-file
-/// pair (`<base>.dat` + `<base>.idx`) via `sdk.filtered_store`. Per ADR-002.
+/// keeps logs matching the manifest, writes them into a flat-file pair
+/// (`<base>.dat` + `<base>.idx`) via `sdk.filtered_store`. Per ADR-002.
 ///
 /// Two entry points:
 ///   - `build`: phase 1, writes the `primary` pair for static + factory addresses.
 ///   - `appendChildren`: phase 3, writes the `children` pair for addresses
-///     discovered by the scanner's factory pre-pass. No-op when the
-///     discovered set is empty.
+///     discovered by the scanner's factory pre-pass. No-op for an empty set.
 ///
-/// Per-log keep rule (uniform across both phases via the `Filter` struct):
+/// Per-log keep rule (uniform across both phases via `Filter`):
 ///   keep = (address ∈ filter.match_addrs)
 ///       AND (topic0 ∈ filter.match_topics)
 ///       AND (address ∉ filter.exclude_addrs)
-/// Phase 1 sets exclude_addrs empty; phase 3 sets it to static∪factory so a
+/// Phase 1 leaves exclude_addrs empty. Phase 3 sets it to static∪factory so a
 /// static contract that's also a factory child does not appear in both pairs.
 const std = @import("std");
 
@@ -33,8 +32,8 @@ const io_pipeline = core.io_pipeline;
 const types = core.types;
 
 pub const WORKER_QUEUE_DEPTH = 16;
-/// Min matching blocks before we spawn worker threads. Below this, the
-/// thread spin-up cost is larger than the parallel speedup.
+/// Min matching blocks before spawning worker threads. Below this, thread
+/// spin-up cost exceeds the parallel speedup.
 pub const PARALLEL_THRESHOLD = 1_000;
 
 pub const BASE_PRIMARY: []const u8 = "primary";
@@ -44,20 +43,20 @@ pub const BuildResult = struct {
     blocks_scanned: u64 = 0,
     blocks_matched: u64 = 0,
     total_logs: u64 = 0,
-    /// Bloom-matched blocks the worker pipeline failed to materialize. Caller
-    /// must treat any non-zero value as a hard failure (incomplete index).
+    /// Bloom-matched blocks the worker pipeline failed to materialize. Any
+    /// non-zero value is a hard failure (incomplete index).
     dropped_blocks: u64 = 0,
     elapsed_ns: u64 = 0,
 };
 
-/// Per-log keep predicate, shared with the engine via `core.filter`. Used by
-/// both `build` (phase 1) and `appendChildren` (phase 3): phase 1 leaves
-/// `exclude_addrs` empty; phase 3 sets it to static∪factory.
+/// Per-log keep predicate, shared with the engine via `core.filter`. Phase 1
+/// (`build`) leaves `exclude_addrs` empty. Phase 3 (`appendChildren`) sets it
+/// to static∪factory.
 const Filter = core.filter.Filter;
 
 /// Phase 1: build the `primary` filtered-store pair under `dir` from the
 /// manifest's static and factory addresses. Caller owns `reader` and `dir`.
-/// Appending to a pre-existing pair extends it; block numbers must be
+/// Appending to a pre-existing pair extends it. Block numbers must be
 /// strictly greater than the last recorded block.
 pub fn build(
     reader: *const FlatStoreReader,
@@ -69,10 +68,10 @@ pub fn build(
 }
 
 /// Extend the primary filtered-store pair over `from_block..=to_block`.
-/// `build` is a special case with `from_block = manifest.start_block`.
-/// Used by the follow-mode gap fill in `entry.init`: when the engine
-/// advances during backfill, the SDK re-scans the new range and appends
-/// matching blocks to the existing pair without rebuilding from scratch.
+/// `build` is the special case `from_block = manifest.start_block`.
+/// Drives the follow-mode gap fill in `entry.init`: when the engine advances
+/// during backfill, the SDK re-scans the new range and appends matching blocks
+/// without rebuilding from scratch.
 pub fn appendBlocks(
     reader: *const FlatStoreReader,
     comptime m: sdk_manifest.Manifest,
@@ -99,10 +98,10 @@ pub fn appendBlocks(
     );
 }
 
-/// Phase 3: walk the engine's flat store filtered by the
-/// scanner-discovered child addresses, write matching child-event logs to
-/// the `children` pair under `dir`. Spans the manifest's whole range; the
-/// follow-mode gap fill uses `appendChildrenBlocks` for a sub-range instead.
+/// Phase 3: walk the engine's flat store filtered by scanner-discovered child
+/// addresses, write matching child-event logs to the `children` pair under
+/// `dir`. Spans the manifest's whole range. The follow-mode gap fill uses
+/// `appendChildrenBlocks` for a sub-range instead.
 pub fn appendChildren(
     reader: *const FlatStoreReader,
     comptime m: sdk_manifest.Manifest,
@@ -126,7 +125,7 @@ pub fn appendChildren(
 /// per-log filter excludes addresses already in `static∪factory` so a static
 /// contract that's also a factory child does not produce duplicate entries
 /// across pairs. Block numbers must exceed the children store's current tail
-/// (the caller fills strictly-increasing ranges).
+/// (caller fills strictly-increasing ranges).
 pub fn appendChildrenBlocks(
     reader: *const FlatStoreReader,
     comptime m: sdk_manifest.Manifest,
@@ -158,10 +157,10 @@ pub fn appendChildrenBlocks(
     );
 }
 
-/// Shared phase runner. `bloom_addresses` is what we feed the bloom scan
-/// (block-level prefilter); `filter` is the per-log keep predicate
-/// (post-decompression precision filter). `base` selects which flat-store
-/// pair under `dir` to append to (one of `BASE_PRIMARY` / `BASE_CHILDREN`).
+/// Shared phase runner. `bloom_addresses` feeds the bloom scan (block-level
+/// prefilter). `filter` is the per-log keep predicate (post-decompression
+/// precision filter). `base` selects the flat-store pair under `dir` to append
+/// to (`BASE_PRIMARY` or `BASE_CHILDREN`).
 fn runPhase(
     reader: *const FlatStoreReader,
     bloom_addresses: []const [20]u8,
@@ -195,11 +194,11 @@ fn runPhase(
         return result;
     }
 
-    // blooms.bin can hold duplicate entries for the same block_number when the
+    // blooms.bin can hold duplicate entries for one block_number when the
     // importer's RocksDB key parsing collapses multi-byte discriminators (reorg
-    // entries) onto the same u64. The list is already sorted, so adjacent dedup
-    // suffices. Without this, FilteredStore.appendEntry raises OutOfOrder on
-    // the second write and the build fails.
+    // entries) onto the same u64. The list is sorted, so adjacent dedup
+    // suffices. Without it, FilteredStore.appendEntry raises OutOfOrder on the
+    // second write and the build fails.
     var write_idx: usize = 1;
     for (1..matching.items.len) |read_idx| {
         if (matching.items[read_idx] == matching.items[read_idx - 1]) continue;
@@ -238,9 +237,9 @@ fn runPhase(
 
     for (0..num_workers) |i| {
         for (worker_results[i].items) |fb| {
-            // Local build leaves the FilteredStore timestamp 0; the scanner
-            // falls back to the engine's timestamps.bin via `timestampOf`. The
-            // remote client is the path that fills it (from the PUSH frame).
+            // Local build leaves the FilteredStore timestamp 0. The scanner
+            // falls back to the engine's timestamps.bin via `timestampOf`. Only
+            // the remote client fills it, from the PUSH frame.
             try store.appendEntry(fb.block_number, 0, fb.entry);
             result.blocks_matched += 1;
             result.total_logs += fb.log_count;
@@ -309,15 +308,15 @@ const FilterWorkerArgs = struct {
     filter: Filter,
     results: *std.ArrayListUnmanaged(FilteredBlock),
     allocator: std.mem.Allocator,
-    /// Per-block recoverable failures (alloc, lz4, etc.) — surfaced via BuildResult.
+    /// Per-block recoverable failures (alloc, lz4, etc.), surfaced via BuildResult.
     dropped_blocks: u64 = 0,
-    /// First fatal pipeline-level error — init/wait/oversize. Aborts the build.
+    /// First fatal pipeline-level error (init/wait/oversize). Aborts the build.
     err: ?anyerror = null,
 };
 
 fn filterWorker(args: *FilterWorkerArgs) void {
-    // Stack scratch is safe under the buffer rule in `core.parallel`:
-    // `parallel.run` always spawns workers at `WORKER_STACK_SIZE`.
+    // Stack scratch is safe: `parallel.run` always spawns workers at
+    // `WORKER_STACK_SIZE`.
     var decompress_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
     var serialize_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
     var compress_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
@@ -348,7 +347,7 @@ fn filterWorker(args: *FilterWorkerArgs) void {
                 };
                 pipeline.submit(slot, args.matching_blocks[submitted], loc.offset, loc.length) catch |e| {
                     pipeline.releaseSlot(slot);
-                    // EntryExceedsBuffer = corrupt store (fatal); else SQE-full (drain + retry).
+                    // EntryExceedsBuffer = corrupt store, fatal. Else SQE-full, drain and retry.
                     if (e == error.EntryExceedsBuffer) {
                         args.err = e;
                         return;
@@ -376,15 +375,15 @@ fn filterWorker(args: *FilterWorkerArgs) void {
                 completed += 1;
             }
         }
-        // io_uring completes in NVMe order, not submission order. Sort so
-        // the writer iterates worker outputs in ascending block order,
-        // satisfying FilteredStore.appendEntry's monotonic invariant.
+        // io_uring completes in NVMe order, not submission order. Sort so the
+        // writer iterates worker outputs in ascending block order, satisfying
+        // FilteredStore.appendEntry's monotonic invariant.
         std.mem.sort(FilteredBlock, args.results.items, {}, blockNumberLessThan);
         return;
     }
 
-    // pread fallback (non-Linux). Reads in matching_blocks order, no sort
-    // needed but we sort anyway for path-uniform output.
+    // pread fallback (non-Linux). Reads in matching_blocks order. Sort anyway
+    // for path-uniform output.
     var read_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
     for (args.matching_blocks) |bn| {
         const entry_data = reader.readBlock(bn, &read_buf) catch {
@@ -408,16 +407,17 @@ fn processBlockEntry(
     serialize_buf: []u8,
     compress_buf: []u8,
 ) void {
-    // Every error path counts the block as dropped → BuildResult.dropped_blocks
-    // → entry point refuses to ship the index. No silent failures here.
+    // Every error path counts the block as dropped, propagating to
+    // BuildResult.dropped_blocks so the entry point refuses to ship the index.
+    // No silent failures here.
     const decompressed = log_serial.decompressEntry(entry_data, decompress_buf) catch {
         args.dropped_blocks += 1;
         return;
     };
 
-    // Precision filter (shared with the engine's TCP server via core): keep
-    // only matching logs and recompress into `compress_buf`. A compress
-    // failure on an oversize block counts as a drop; `null` = no match.
+    // Precision filter, shared with the engine's TCP server via core. Keeps
+    // only matching logs, recompresses into `compress_buf`. A compress failure
+    // on an oversize block counts as a drop. `null` = no match.
     const maybe = core.filter.filterBlockEntry(decompressed, args.filter, serialize_buf, compress_buf) catch {
         args.dropped_blocks += 1;
         return;
@@ -477,7 +477,7 @@ fn topicOf(comptime E: type) [32]u8 {
 }
 
 /// Write a synthetic flat store (blocks.dat + blocks.idx + blooms.bin) into
-/// `dir`. Returns nothing — caller opens via `FlatStoreReader.open(dir_path)`.
+/// `dir`. Caller opens via `FlatStoreReader.open(dir_path)`.
 fn writeFlatStore(dir: std.fs.Dir, blocks: []const TestBlock, allocator: std.mem.Allocator) !void {
     var blocks_file = try dir.createFile("blocks.dat", .{});
     defer blocks_file.close();
@@ -599,8 +599,8 @@ fn freeDecoded(decoded: *std.ArrayListUnmanaged(DecodedBlock), allocator: std.me
 test "build: filters multi-contract flat store, primary contains exactly the matches" {
     const allocator = testing.allocator;
 
-    // Plant 1000 blocks. Even-numbered → contract A and B logs (matching).
-    // Odd-numbered → contract C only (non-matching).
+    // Plant 1000 blocks. Even blocks: contract A+B logs (matching). Odd
+    // blocks: contract C only (non-matching).
     const N: u64 = 1000;
     const a_topic = topicOf(ContractA);
     const b_topic = topicOf(ContractB);
@@ -783,7 +783,7 @@ test "build + appendChildren: primary holds creations, children holds child even
     sync3_logs[0] = .{ .address = ChildAddr3, .topic0 = sync_topic };
     try blocks_list.append(allocator, .{ .block_number = 103, .logs = sync3_logs });
 
-    // Block 104: unrelated address with unrelated topic — must NOT appear in either DBI.
+    // Block 104: unrelated address with unrelated topic. Must NOT appear in either pair.
     const noise_topic = topicOf(Other);
     const noise_logs = try arena.alloc(TestLog, 1);
     noise_logs[0] = .{ .address = ADDR_C, .topic0 = noise_topic };
@@ -800,8 +800,8 @@ test "build + appendChildren: primary holds creations, children holds child even
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
 
-    // Phase 1: build primary. Only the factory creation event qualifies
-    // because child addresses are not yet known.
+    // Phase 1: build primary. Only the factory creation event qualifies, since
+    // child addresses are not yet known.
     const primary = try build(&reader, FactoryManifest, dst_tmp.dir, allocator);
     try testing.expectEqual(@as(u64, 1), primary.blocks_matched);
     try testing.expectEqual(@as(u64, 1), primary.total_logs);
@@ -877,9 +877,9 @@ test "appendChildren: returns zero-result for empty discovered set" {
 test "build: end_block clamps the scan range to a fixed window" {
     const allocator = testing.allocator;
 
-    // Plant 50 contiguous blocks; every block has a matching ContractA log.
-    // With end_block = 119 (start_block 0, first block 100), the build
-    // should match exactly 20 blocks (100..=119) and ignore 120..=149.
+    // Plant 50 contiguous blocks, each with a matching ContractA log. With
+    // end_block = 119 (first block 100), the build matches exactly 20 blocks
+    // (100..=119) and ignores 120..=149.
     const a_topic = topicOf(ContractA);
     var blocks_list: std.ArrayListUnmanaged(TestBlock) = .{};
     defer blocks_list.deinit(allocator);
@@ -915,7 +915,7 @@ test "build: end_block clamps the scan range to a fixed window" {
     try testing.expectEqual(@as(u64, 20), result.blocks_matched);
     try testing.expectEqual(@as(u64, 20), result.total_logs);
 
-    // Verify the on-disk contents: exactly blocks 100..=119, none past 119.
+    // On-disk contents: exactly blocks 100..=119, none past 119.
     var decoded = try dumpDecodedBlocks(dst_tmp.dir, BASE_PRIMARY, allocator);
     defer freeDecoded(&decoded, allocator);
     try testing.expectEqual(@as(usize, 20), decoded.items.len);
@@ -961,7 +961,7 @@ test "appendBlocks extends a primary filter env over the new range" {
     const first = try appendBlocks(&reader, M, 100, 104, dst_tmp.dir, allocator);
     try testing.expectEqual(@as(u64, 5), first.blocks_matched);
 
-    // Second pass extends the pair over 105..=109 — same files, appended.
+    // Second pass extends the pair over 105..=109, same files, appended.
     const second = try appendBlocks(&reader, M, 105, 109, dst_tmp.dir, allocator);
     try testing.expectEqual(@as(u64, 5), second.blocks_matched);
 
@@ -1021,7 +1021,7 @@ test "appendChildrenBlocks extends the children pair over a sub-range" {
     defer dst_tmp.cleanup();
 
     const children = [_][20]u8{ChildAddr};
-    // Backfill covers 100..=104; the follow gap then extends 105..=109.
+    // Backfill covers 100..=104, then the follow gap extends 105..=109.
     const first = try appendChildrenBlocks(&reader, M, &children, 100, 104, dst_tmp.dir, allocator);
     try testing.expectEqual(@as(u64, 5), first.blocks_matched);
     const second = try appendChildrenBlocks(&reader, M, &children, 105, 109, dst_tmp.dir, allocator);
@@ -1048,8 +1048,8 @@ test "processBlockEntry: corrupt entry counts as dropped_block (fail-loud safety
         .allocator = allocator,
     };
 
-    // lz4_len prefix claims more bytes than the entry contains → decompressEntry
-    // returns error.InvalidEntry. A regression that re-introduced silent drop
+    // lz4_len prefix claims more bytes than the entry holds, so decompressEntry
+    // returns error.InvalidEntry. A regression re-introducing a silent drop
     // would leave dropped_blocks == 0 here.
     const corrupt_entry = [_]u8{ 0xFF, 0xFF, 0xFF, 0x7F, 0x42 };
     var decompress_buf: [256]u8 = undefined;

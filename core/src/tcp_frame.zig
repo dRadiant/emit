@@ -1,35 +1,34 @@
-//! Remote-engine streaming wire protocol
+//! Remote-engine streaming wire protocol.
 //!
-//! Pure bytes↔structs: the socket read/write loop lives in the engine
-//! server and the SDK client, so this module has no I/O dependency
+//! Pure bytes↔structs. No I/O dependency. The socket read/write loop lives in
+//! the engine server and the SDK client.
 //!
 //! Frame on the wire: `[type u8][length u32 LE][payload, length bytes]`.
-//! Decoders that return slices (`Register.addresses`, `Push.lz4_entry`, …) are
-//! views into the payload buffer - keep alive for the struct's lifetime.
+//! Decoders that return slices (`Register.addresses`, `Push.lz4_entry`) are
+//! views into the payload buffer. Keep alive for the struct's lifetime.
 const std = @import("std");
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const HEADER_SIZE: usize = 5;
-/// Upper bound on a single payload, so a hostile or corrupt length word can't
-/// drive an unbounded allocation. A backfill `PUSH` is one block's filtered
-/// logs
+/// Upper bound on a single payload. Caps allocation against a hostile or
+/// corrupt length word. A backfill `PUSH` is one block's filtered logs.
 pub const MAX_PAYLOAD: u32 = 16 * 1024 * 1024;
 
 pub const FrameType = enum(u8) {
     register = 1, // client→engine: filter (addresses, topics) + cursor
     push = 2, // engine→client: one server-side-filtered matched block
-    add_address = 3, // client→engine: add a live-discovered factory child + mini-backfill from its creation block
-    reorg = 4, // engine→client: fork point; client truncates its pending snapshot
+    add_address = 3, // client→engine: live-discovered factory child + mini-backfill from creation block
+    reorg = 4, // engine→client: fork point. client truncates its pending snapshot
     heartbeat = 5, // bidirectional: cursor, tip, last_finalized
-    goaway = 6, // engine→client: graceful close / version mismatch / overload
-    // Exhaustive: an unknown type is a protocol error (versions are negotiated
-    // via REGISTER + GOAWAY, so peers never send each other unknown frames).
+    goaway = 6, // engine→client: graceful close, version mismatch, or overload
+    // Exhaustive. Unknown type is a protocol error. Versions negotiated via
+    // REGISTER + GOAWAY, so peers never send unknown frames.
 };
 
 pub const Error = error{ InvalidFrameType, PayloadTooLarge, Truncated };
 
-/// 5-byte frame header for a payload of `len`. The caller writes the header
-/// then the payload to the socket (two `writeAll`s — no concatenation).
+/// 5-byte frame header for a payload of `len`. Caller writes header then
+/// payload as two `writeAll`s, no concatenation.
 pub fn header(t: FrameType, len: u32) [HEADER_SIZE]u8 {
     var h: [HEADER_SIZE]u8 = undefined;
     h[0] = @intFromEnum(t);
@@ -39,7 +38,7 @@ pub fn header(t: FrameType, len: u32) [HEADER_SIZE]u8 {
 
 pub const Header = struct { type: FrameType, len: u32 };
 
-/// Parse a header, rejecting unknown types and oversized lengths so a bad
+/// Parse a header. Rejects unknown types and oversized lengths so a bad
 /// stream fails before the payload is allocated.
 pub fn parseHeader(buf: []const u8) Error!Header {
     if (buf.len < HEADER_SIZE) return error.Truncated;
@@ -55,9 +54,7 @@ pub fn parseHeader(buf: []const u8) Error!Header {
 
 pub const Register = struct {
     version: u32 = PROTOCOL_VERSION,
-    /// Reserved auth slot
-    /// Currently empty
-    /// Will be used in the future
+    /// Reserved auth slot. Currently empty.
     token: []const u8 = &.{},
     cursor: u64,
     addresses: []const [20]u8 = &.{}, // borrowed from the payload
@@ -116,10 +113,10 @@ pub const Register = struct {
 
 // ── PUSH (engine → client) ───────────────────────────────────────────────────
 // block_number(u64 LE) ‖ timestamp(u32 LE) ‖ lz4_entry. The lz4 is a
-// `primary.dat` entry verbatim; the timestamp rides in the entry the client
+// `primary.dat` entry verbatim. The timestamp rides in the entry the client
 // persists (its FilteredStore), so `ctx.timestamp` is exact off-engine.
-// Used for both backfill and live (live blocks are pending until `last_finalized`
-// passes them; a reorg is signalled out-of-band via REORG).
+// Backfill and live. Live blocks stay pending until `last_finalized` passes
+// them. Reorg is signalled out-of-band via REORG.
 
 pub const Push = struct {
     pub const PREFIX = 8 + 4;
@@ -127,9 +124,9 @@ pub const Push = struct {
     timestamp: u32,
     lz4_entry: []const u8, // borrowed from the payload
 
-    /// The fixed 12-byte head of a PUSH payload (block ‖ timestamp), written
-    /// before the lz4 entry. Lets a streaming server emit `header ‖ prefix ‖
-    /// entry` straight from its block buffer — no copy into a payload buffer.
+    /// Fixed 12-byte head of a PUSH payload (block ‖ timestamp), written before
+    /// the lz4 entry. Lets a streaming server emit `header ‖ prefix ‖ entry`
+    /// straight from its block buffer, no copy into a payload buffer.
     pub fn prefix(block_number: u64, timestamp: u32) [PREFIX]u8 {
         var b: [PREFIX]u8 = undefined;
         std.mem.writeInt(u64, b[0..8], block_number, .little);
@@ -156,10 +153,10 @@ pub const Push = struct {
 };
 
 // ── ADD_ADDRESS (client → engine) ────────────────────────────────────────────
-// address(20) ‖ from_block(u64 LE). A live-discovered factory child: the engine
+// address(20) ‖ from_block(u64 LE). A live-discovered factory child. The engine
 // mini-backfills [from_block, tip] for this address (catching same-block-as-
-// creation events) and adds it to the client's live filter. Keeps the engine
-// dumb — the client does the discovery, the engine just adds + backfills.
+// creation events) and adds it to the client's live filter. Client does the
+// discovery, engine just adds + backfills.
 
 pub const AddAddress = struct {
     const SIZE = 20 + 8;

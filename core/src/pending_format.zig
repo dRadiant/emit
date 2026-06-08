@@ -1,26 +1,23 @@
-/// Wire format for `pending.bin` — the engine's pre-finality block buffer.
+/// Wire format for `pending.bin`, the engine's pre-finality block buffer.
 ///
 /// Engine owns the write path (insert, persist, truncate). SDK owns the read
-/// path. This module is the single source of truth on the byte layout so the
-/// two never drift.
+/// path. Single source of truth on the byte layout so the two never drift.
 ///
 /// Layout:
 ///   magic "EMITPEND" (8 bytes)
 ///   count(u32 LE)
 ///   [count × Entry]:
 ///     block_number(u64 BE)
-///     timestamp(u32 LE)      — exact block time, 0 when unknown
+///     timestamp(u32 LE)      exact block time, 0 when unknown
 ///     hash(32)
 ///     topic_bloom(BLOOM_SIZE = 256)
 ///     addr_bloom(ADDR_BLOOM_SIZE = 1024)
 ///     lz4_len(u32 LE)
 ///     lz4_data(lz4_len)
 ///
-/// The magic lets a reader distinguish a pre-magic (old-format) or foreign
-/// file from a genuinely corrupt one: a magic mismatch surfaces
-/// `error.InvalidMagic`, which engine/SDK treat as "no usable ring" (the
-/// follower re-baselines from meta), while a matching magic with a short body
-/// is a real `error.Truncated`.
+/// Magic distinguishes a pre-magic/foreign file from a corrupt one. Mismatch
+/// surfaces `error.InvalidMagic`, treated as "no usable ring" (follower
+/// re-baselines from meta). Matching magic with a short body is `error.Truncated`.
 const std = @import("std");
 
 const bloom = @import("bloom.zig");
@@ -34,7 +31,7 @@ pub const FIXED_ENTRY_SIZE: usize =
     8 + 4 + HASH_SIZE + bloom.BLOOM_SIZE + bloom.ADDR_BLOOM_SIZE + 4;
 
 /// A parsed entry. `lz4_entry` is a non-owning slice into the source buffer
-/// passed to `parse` — callers must keep that buffer alive while reading.
+/// passed to `parse`. Callers must keep that buffer alive while reading.
 pub const Entry = struct {
     block_number: u64,
     timestamp: u32 = 0,
@@ -47,10 +44,9 @@ pub const Entry = struct {
 pub const ParseError = error{ Truncated, InvalidMagic, OutOfMemory };
 pub const ValidateError = ParseError || error{ NonDense, Oversized };
 
-/// Serialize a slice of entries into a freshly-allocated `pending.bin`
-/// buffer. Caller frees with `allocator.free(buf)`. `entries` is
-/// `anytype` to accept both `pending_format.Entry` (zero-copy view) and
-/// engine-side owning variants of the same shape.
+/// Serialize entries into a freshly-allocated `pending.bin` buffer. Caller
+/// frees with `allocator.free(buf)`. `entries` is `anytype` to accept both
+/// `pending_format.Entry` (zero-copy view) and engine-side owning variants.
 pub fn serialize(allocator: std.mem.Allocator, entries: anytype) ![]u8 {
     var total_size: usize = HEADER_SIZE;
     for (entries) |e| total_size += FIXED_ENTRY_SIZE + e.lz4_entry.len;
@@ -82,7 +78,7 @@ pub fn serialize(allocator: std.mem.Allocator, entries: anytype) ![]u8 {
 }
 
 /// Parse `pending.bin` contents into a slice of entries. Entries are
-/// zero-copy views into `buf`; the returned slice itself is owned by
+/// zero-copy views into `buf`. The returned slice itself is owned by
 /// `allocator` and freed with `allocator.free`.
 pub fn parse(allocator: std.mem.Allocator, buf: []const u8) ParseError![]Entry {
     if (buf.len < HEADER_SIZE) return try allocator.alloc(Entry, 0);
@@ -115,11 +111,10 @@ pub fn parse(allocator: std.mem.Allocator, buf: []const u8) ParseError![]Entry {
     return entries;
 }
 
-/// Parse + enforce the engine's structural invariants on the ring:
-/// strictly monotonic, gap-free block numbers and at most FINALITY_DEPTH
-/// entries. Either invariant failing means pending.bin is corrupt — the
-/// engine's reorg recovery indexes the ring as a dense array and would
-/// silently mis-report block presence on a non-dense ring.
+/// Parse and enforce the ring's structural invariants: strictly monotonic,
+/// gap-free block numbers, at most FINALITY_DEPTH entries. Either failing
+/// means pending.bin is corrupt. Reorg recovery indexes the ring as a dense
+/// array and would silently mis-report block presence on a non-dense ring.
 pub fn parseValidated(allocator: std.mem.Allocator, buf: []const u8) ValidateError![]Entry {
     if (buf.len >= HEADER_SIZE and std.mem.eql(u8, buf[0..MAGIC.len], &MAGIC)) {
         const declared: usize = std.mem.readInt(u32, buf[MAGIC.len..][0..4], .little);

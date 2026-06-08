@@ -45,15 +45,14 @@ pub fn serializeLogs(logs: []const RawLog, buf: []u8) usize {
 }
 
 /// Unpack logs from the flat store binary format. Returns log count.
-/// RawLog.data slices point into `buf` — valid until buf is overwritten.
-/// block_number is zeroed; caller fills it from the index key or context.
+/// RawLog.data slices point into `buf`, valid until buf is overwritten.
+/// block_number is zeroed. Caller fills it from the index key or context.
 ///
-/// Trusted input: the flat store is written by the engine and consumed by
-/// the SDK in the same operator trust domain — no network producer, no
-/// untrusted source. This function does not bounds-check the buffer; a
-/// truncated or corrupt entry will either trip Zig safety in Debug builds
-/// or read past the end in ReleaseFast. If remote streaming ever crosses
-/// a trust boundary (TCP push), revisit and add fail-loud guards.
+/// Trusted input. Flat store is written by the engine and consumed by the
+/// SDK in one operator trust domain, no network producer. No buffer
+/// bounds-check. A truncated entry trips Zig safety in Debug or reads past
+/// the end in ReleaseFast. Add fail-loud guards if input ever crosses a
+/// trust boundary.
 pub fn deserializeLogs(buf: []const u8, out: []RawLog) usize {
     var pos: usize = 0;
 
@@ -110,7 +109,7 @@ pub fn decompressEntry(entry: []const u8, out: []u8) ![]const u8 {
 
 // ── Bloom builders ───────────────────────────────────────────────────────
 // Built during import (engine) and during filtered index build (sdk).
-// Topic bloom: insert topic0 of each log. Address bloom: insert emitting address.
+// Topic bloom inserts topic0 of each log. Address bloom inserts emitting address.
 
 const bloom = @import("bloom.zig");
 

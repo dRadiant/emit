@@ -6,7 +6,7 @@
 const std = @import("std");
 
 /// Byte size of a fixed-size entity field. `ctx` is a "Type.field" string
-/// used to make @compileError messages locatable.
+/// for locatable @compileError messages.
 pub fn fixedSize(comptime F: type, comptime ctx: []const u8) comptime_int {
     return switch (@typeInfo(F)) {
         .int => @sizeOf(F),
@@ -43,10 +43,10 @@ pub fn entitySize(comptime T: type) comptime_int {
     return n;
 }
 
-/// Pack an entity into `out`. The first field (primary key) is big-endian
-/// so a sorted-by-bytes slab matches key-numeric order — binary search over
-/// the serialized records is correct without a separate key encoding. The
-/// remaining fields are little-endian for native reads.
+/// Pack an entity into `out`. First field (primary key) big-endian so a
+/// sorted-by-bytes slab matches key-numeric order, making binary search over
+/// serialized records correct without a separate key encoding. Remaining
+/// fields little-endian for native reads.
 pub fn serialize(comptime T: type, entity: T, out: []u8) void {
     const fields = @typeInfo(T).@"struct".fields;
     var pos: usize = 0;

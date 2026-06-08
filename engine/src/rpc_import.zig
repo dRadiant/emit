@@ -1,18 +1,15 @@
-/// RPC import: backfill the flat log store via `eth_getLogs` range queries.
+/// Backfill the flat log store via `eth_getLogs` range queries.
 ///
-/// The fallback to `import --rocksdb` for chains without a local Nethermind
-/// receipts DB, L2s, or L1 operators without a colocated node.
-/// Unfiltered `eth_getLogs` over [from, to] returns every log in the range grouped
-/// by block.
-/// Utilizes the same `flat_writer` the RocksDB path uses. Block ranges are sized
-/// adaptively: grow while the node accepts them, halve on rejection.
+/// Fallback to `import --rocksdb` for chains without a local Nethermind receipts
+/// DB, L2s, or L1 operators without a colocated node. Unfiltered `eth_getLogs`
+/// over [from, to] returns every log in the range grouped by block.
+/// Shares the `flat_writer` the RocksDB path uses. Block ranges sized
+/// adaptively, grow while the node accepts them, halve on rejection.
 ///
-/// Timestamps are populated alongside the logs: per log batch, a batched
-/// `eth_getBlockByNumber` over the same range fills `timestamps.bin` (the only
-/// way over RPC — there is no `headers` DB to read). Essential for L2s, whose
-/// block time the L1 `blockTimestamp` formula does not model. The timestamp
-/// pass is best-effort — a failure leaves those blocks on the formula fallback
-/// and never aborts the log import.
+/// Timestamps populated alongside logs. Per log batch a batched
+/// `eth_getBlockByNumber` over the same range fills `timestamps.bin`, the only
+/// way over RPC since there is no `headers` DB to read. Essential for L2s, whose
+/// block time the L1 `blockTimestamp` formula does not model.
 const std = @import("std");
 
 const core = @import("core");
@@ -22,19 +19,19 @@ const FlatStoreWriter = @import("flat_writer.zig").FlatStoreWriter;
 const types = core.types;
 const log_serial = core.log_serial;
 
-/// Starting block span per `eth_getLogs`. Grows ×2 on success up to
-/// `MAX_BATCH`, halves on rejection (a provider result-count or range cap)
-/// down to a single block. A moderate start self-tunes within a few batches.
+/// Starting block span per `eth_getLogs`. Grows x2 on success up to
+/// `MAX_BATCH`, halves on rejection (provider result-count or range cap) down to
+/// a single block. A moderate start self-tunes within a few batches.
 const INITIAL_BATCH: u64 = 512;
 const MAX_BATCH: u64 = 8192;
-/// Transient-error retries once the span is already a single block (a
-/// one-block query rarely trips a result cap, so failures there are network).
+/// Transient-error retries once the span is already a single block. A one-block
+/// query rarely trips a result cap, so failures there are network.
 const MAX_RETRIES: u32 = 5;
 /// Progress line cadence, in blocks.
 const LOG_EVERY: u64 = 100_000;
-/// Blocks per batched `eth_getBlockByNumber` timestamp request. Each result is
-/// a full header (~1 KB JSON), so 256 caps the response at a few hundred KB.
-/// Adaptive like the log span: halves on a node batch-size cap, grows back.
+/// Blocks per batched `eth_getBlockByNumber` timestamp request. Each result is a
+/// full header (~1 KB JSON), so 256 caps the response at a few hundred KB.
+/// Adaptive like the log span, halves on a node batch-size cap, grows back.
 const TS_CHUNK: u64 = 256;
 const TS_CHUNK_MAX: u64 = 1024;
 
@@ -45,13 +42,13 @@ pub const Config = struct {
     /// resumes from the next dense block). Defaults to 0 for a fresh store.
     from_block: ?u64 = null,
     /// Inclusive upper bound. Defaults to `chain_tip - FINALITY_DEPTH` so the
-    /// flat store holds only finalized blocks; the follower covers the tail.
+    /// flat store holds only finalized blocks. The follower covers the tail.
     to_block: ?u64 = null,
     /// Populate `timestamps.bin` via batched `eth_getBlockByNumber`. On by
-    /// default and strict — a persistent timestamp failure aborts the import
-    /// loudly (the L1 formula is wrong for L2s, so a silent fallback would be a
-    /// correctness landmine). Set false (`--no-timestamps`) only for chains
-    /// where the formula is acceptable.
+    /// default and strict, a persistent timestamp failure aborts the import
+    /// loudly. The L1 formula is wrong for L2s, so a silent fallback would be a
+    /// correctness landmine. Set false (`--no-timestamps`) only for chains where
+    /// the formula is acceptable.
     timestamps: bool = true,
 };
 
@@ -76,7 +73,7 @@ pub fn run(config: Config) !void {
         break :blk if (tip > types.FINALITY_DEPTH) tip - types.FINALITY_DEPTH else 0;
     };
 
-    // Pass 1 — logs. Resumes from the next dense block; `appendBlock`'s
+    // Pass 1, logs. Resumes from the next dense block. `appendBlock`'s
     // dense-append invariant guarantees `log_start` lands on `first_block + count`.
     const log_start: u64 = if (writer.meta.blocks_idx_count > 0)
         writer.first_block + writer.meta.blocks_idx_count
@@ -84,10 +81,10 @@ pub fn run(config: Config) !void {
         (config.from_block orelse 0);
     try importLogs(&writer, config.rpc_url, log_start, end, page);
 
-    // Pass 2 — timestamps (strict by default). A separate pass with its own
-    // resume cursor (`timestamps.bin` count), so a re-run after a failure
-    // backfills exactly the missing range — no silent formula fallback. Only
-    // meaningful once the store has blocks to stamp.
+    // Pass 2, timestamps (strict by default). Separate pass with its own resume
+    // cursor (`timestamps.bin` count), so a re-run after a failure backfills
+    // exactly the missing range with no silent formula fallback. Only meaningful
+    // once the store has blocks to stamp.
     if (config.timestamps and writer.meta.blocks_idx_count > 0) {
         var dir = try std.fs.cwd().openDir(config.data_dir, .{});
         defer dir.close();
@@ -99,9 +96,9 @@ pub fn run(config: Config) !void {
     }
 }
 
-/// Pass 1: import logs over [start, end] via adaptively-sized `eth_getLogs`.
-/// Fails loud — a span that can't be fetched even at one block, after retries,
-/// aborts (the store stays consistent; a re-run resumes from the next block).
+/// Import logs over [start, end] via adaptively-sized `eth_getLogs`. Fails loud,
+/// a span that can't be fetched even at one block after retries aborts. The
+/// store stays consistent and a re-run resumes from the next block.
 fn importLogs(writer: *FlatStoreWriter, rpc_url: []const u8, start: u64, end: u64, page: std.mem.Allocator) !void {
     if (start > end) {
         std.debug.print("Logs: flat store already covers through block {d}.\n", .{end});
@@ -138,8 +135,8 @@ fn importLogs(writer: *FlatStoreWriter, rpc_url: []const u8, start: u64, end: u6
                 next_log = hi + LOG_EVERY;
             }
         } else |err| {
-            // Wide range rejected → halve and retry the same span. Already a
-            // single block → treat as transient and back off, then fail loud.
+            // Wide range rejected: halve and retry the same span. Already a
+            // single block: treat as transient and back off, then fail loud.
             if (batch > 1) {
                 batch = @max(1, batch / 2);
                 continue;
@@ -158,11 +155,11 @@ fn importLogs(writer: *FlatStoreWriter, rpc_url: []const u8, start: u64, end: u6
     std.debug.print("Logs done: [{d}, {d}] — {d} blocks, {d} logs.\n", .{ start, end, end - start + 1, total_logs });
 }
 
-/// Pass 2: fill `timestamps.bin` over [resume, end] via batched
-/// `eth_getBlockByNumber`. Strict and fail-loud — every block in a chunk must
-/// return a timestamp, and a chunk that can't be fetched even at size one,
-/// after retries, aborts the import. Independently resumable from the
-/// timestamps.bin count, so a re-run continues exactly where it stopped.
+/// Fill `timestamps.bin` over [resume, end] via batched `eth_getBlockByNumber`.
+/// Strict and fail-loud, every block in a chunk must return a timestamp, and a
+/// chunk that can't be fetched even at size one after retries aborts the import.
+/// Independently resumable from the timestamps.bin count, so a re-run continues
+/// exactly where it stopped.
 fn importTimestamps(ts_writer: *core.timestamps.TimestampWriter, rpc_url: []const u8, end: u64, page: std.mem.Allocator) !void {
     const start = ts_writer.first_block + ts_writer.count;
     if (start > end) {
@@ -207,9 +204,9 @@ fn importTimestamps(ts_writer: *core.timestamps.TimestampWriter, rpc_url: []cons
 }
 
 /// Fetch [lo, hi] in one `eth_getLogs` and write its blocks. Owns a per-batch
-/// arena so the (large) JSON-RPC response and a fresh HTTP client are freed on
-/// return; the writer and scratch live across batches. The provider and
-/// transport share the arena allocator — `getLogs` frees the transport's
+/// arena so the large JSON-RPC response and a fresh HTTP client are freed on
+/// return. The writer and scratch live across batches. The provider and
+/// transport share the arena allocator, `getLogs` frees the transport's
 /// response with the provider's allocator, so they must be the same.
 fn importBatch(
     writer: *FlatStoreWriter,
@@ -238,9 +235,9 @@ fn importBatch(
 
 /// Fetch and write timestamps for every block in [lo, hi] via one batched
 /// `eth_getBlockByNumber`. Owns a per-call arena (the batch body, response, and
-/// a fresh client). Strict: returns `error.MissingTimestamps` unless every
-/// block in the range came back with a timestamp, so a partial node response
-/// surfaces rather than silently leaving holes.
+/// a fresh client). Strict, returns `error.MissingTimestamps` unless every block
+/// in the range came back with a timestamp, so a partial node response surfaces
+/// rather than silently leaving holes.
 fn timestampBatch(
     rpc_url: []const u8,
     ts_writer: *core.timestamps.TimestampWriter,
@@ -261,7 +258,7 @@ fn timestampBatch(
     while (b <= hi) : (b += 1) {
         if (b > lo) try body.append(a, ',');
         var item_buf: [128]u8 = undefined;
-        // id = block - lo, so the (possibly reordered) batch response maps back to a block.
+        // id = block - lo, so the possibly-reordered batch response maps back to a block.
         const item = try std.fmt.bufPrint(&item_buf, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"eth_getBlockByNumber\",\"params\":[\"0x{x}\",false]}}", .{ b - lo, b });
         try body.appendSlice(a, item);
     }
@@ -274,7 +271,7 @@ fn timestampBatch(
 
 /// Parse a JSON-RPC batch response of `eth_getBlockByNumber` results and write
 /// each `result.timestamp` (hex) to `ts_writer` at block `lo + id`. Returns the
-/// number of timestamps written; items without a result (an error or a missing
+/// number of timestamps written. Items without a result (an error or a missing
 /// block) are not counted, so the caller can enforce completeness. A disk write
 /// error propagates (fail loud).
 fn parseTimestampBatch(
@@ -326,13 +323,13 @@ fn httpPost(http: *eth.http_transport.HttpTransport, body: []const u8, alloc: st
     }
 }
 
-/// Group already-fetched range logs by block and append every block in
-/// [lo, hi] — including those with no logs — keeping `blocks.idx` dense.
-/// Relies on `eth_getLogs` returning logs in ascending (block, log_index)
-/// order (universal across Geth/Nethermind/Erigon); any log left unconsumed
-/// means out-of-range or out-of-order data and fails loud rather than landing
-/// a misgrouped block. Returns the log count written. Pure — no network — so
-/// the grouping/dense-emit logic is unit-testable.
+/// Group already-fetched range logs by block and append every block in [lo, hi],
+/// including those with no logs, keeping `blocks.idx` dense. Relies on
+/// `eth_getLogs` returning logs in ascending (block, log_index) order (universal
+/// across Geth/Nethermind/Erigon). Any log left unconsumed means out-of-range or
+/// out-of-order data and fails loud rather than landing a misgrouped block.
+/// Returns the log count written. Pure (no network) so the grouping/dense-emit
+/// logic is unit-testable.
 fn writeBatch(
     writer: *FlatStoreWriter,
     logs: []const eth.receipt.Log,
@@ -371,7 +368,7 @@ fn writeBatch(
 }
 
 /// Convert an eth.zig log to a `RawLog`, borrowing `log.data` (consumed by
-/// `serializeLogs` before the batch arena is freed — no copy needed).
+/// `serializeLogs` before the batch arena is freed, no copy needed).
 fn toRawLog(log: eth.receipt.Log, block_number: u64) types.RawLog {
     var topics: [types.MAX_TOPICS][32]u8 = std.mem.zeroes([types.MAX_TOPICS][32]u8);
     var topic_count: u8 = 0;
@@ -442,7 +439,7 @@ test "writeBatch groups range logs by block, emits empty blocks, stays dense" {
         testing.allocator.free(scratch.compress_buf);
     }
 
-    // Range [100, 102]: block 100 has two logs, 101 has none (empty), 102 has one.
+    // Range [100, 102]: block 100 has two logs, 101 is empty, 102 has one.
     const logs = [_]eth.receipt.Log{
         testLog(100, 0, 0x11, &.{}),
         testLog(100, 1, 0x22, &.{ 0xDE, 0xAD }),
@@ -493,8 +490,8 @@ test "writeBatch fails loud on out-of-range or unordered logs" {
         testing.allocator.free(scratch.compress_buf);
     }
 
-    // A log for block 105 while the requested range is [100, 102]: it can never
-    // be consumed by the lo..hi walk, so the leftover trips the guard.
+    // A log for block 105 while the range is [100, 102] can never be consumed by
+    // the lo..hi walk, so the leftover trips the guard.
     const logs = [_]eth.receipt.Log{testLog(105, 0, 0x11, &.{})};
     try testing.expectError(error.UnexpectedLogOrder, writeBatch(&writer, &logs, 100, 102, scratch));
 }
@@ -505,20 +502,20 @@ test "parseTimestampBatch writes hex timestamps keyed by lo + id, skips missing"
     var tw = try core.timestamps.TimestampWriter.open(tmp.dir, 100);
     defer tw.deinit();
 
-    // id 0 → block 100, id 2 → block 102 (real results); id 1 → block 101 is an
-    // error item with no result. Response order is shuffled to prove id-keying.
+    // id 0 -> block 100, id 2 -> block 102 (real results). id 1 -> block 101 is
+    // an error item with no result. Response order shuffled to prove id-keying.
     const raw =
         \\[{"jsonrpc":"2.0","id":2,"result":{"timestamp":"0x65432118"}},
         \\ {"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"missing"}},
         \\ {"jsonrpc":"2.0","id":0,"result":{"number":"0x64","timestamp":"0x65432100","hash":"0xabcd"}}]
     ;
     const applied = try parseTimestampBatch(raw, 100, &tw, testing.allocator);
-    try testing.expectEqual(@as(usize, 2), applied); // ids 0 and 2 had results; id 1 was an error
+    try testing.expectEqual(@as(usize, 2), applied); // ids 0 and 2 had results, id 1 was an error
     tw.sync() catch {};
 
     var r = (try core.timestamps.TimestampReader.open(tmp.dir)).?;
     defer r.deinit();
     try testing.expectEqual(@as(?u64, 0x65432100), r.get(100));
-    try testing.expectEqual(@as(?u64, null), r.get(101)); // error item → unknown → formula
+    try testing.expectEqual(@as(?u64, null), r.get(101)); // error item -> unknown -> formula
     try testing.expectEqual(@as(?u64, 0x65432118), r.get(102));
 }

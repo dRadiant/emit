@@ -1,7 +1,7 @@
-/// SDK head-following loop: reads the engine's pending ring on each
-/// inotify wakeup, classifies the diff against the prior tick, dispatches
-/// new blocks through the per-block overlay, commits finalized blocks
-/// via state.snap, and recovers from reorgs.
+/// SDK head-following loop. Reads the engine's pending ring on each inotify
+/// wakeup, classifies the diff against the prior tick, dispatches new blocks
+/// through the per-block overlay, commits finalized blocks via state.snap,
+/// recovers from reorgs.
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -21,7 +21,7 @@ const log_serial = core.log_serial;
 const pending_format = core.pending_format;
 const types = core.types;
 
-/// Linux-only: `Watcher` falls back to a sleep-based stub elsewhere.
+/// Linux-only. `Watcher` falls back to a sleep-based stub elsewhere.
 const inotify_supported = builtin.target.os.tag == .linux;
 
 const Entry = pending_format.Entry;
@@ -29,7 +29,7 @@ const Entry = pending_format.Entry;
 const PENDING_FILE = "pending.bin";
 const META_FILE = "meta.bin";
 
-/// Entries view into `buf`; both must stay alive together.
+/// Entries view into `buf`. Both must stay alive together.
 const PendingSnapshot = struct {
     buf: []u8,
     entries: []Entry,
@@ -41,7 +41,7 @@ const PendingSnapshot = struct {
     }
 };
 
-/// Missing or empty pending.bin returns an empty snapshot — the engine
+/// Missing or empty pending.bin returns an empty snapshot. The engine
 /// may not have written anything yet.
 fn readPending(allocator: std.mem.Allocator, engine_data_dir: []const u8) !PendingSnapshot {
     var dir = try std.fs.cwd().openDir(engine_data_dir, .{});
@@ -61,7 +61,7 @@ fn readPending(allocator: std.mem.Allocator, engine_data_dir: []const u8) !Pendi
     _ = try file.readAll(buf);
 
     const entries = pending_format.parse(allocator, buf) catch |err| switch (err) {
-        // An old (pre-magic) or unrecognized pending.bin reads as empty; the
+        // An old (pre-magic) or unrecognized pending.bin reads as empty. The
         // engine rewrites it in the current format on its next ingest. Genuine
         // truncation of a current-format file still surfaces.
         error.InvalidMagic => {
@@ -73,7 +73,7 @@ fn readPending(allocator: std.mem.Allocator, engine_data_dir: []const u8) !Pendi
     return .{ .buf = buf, .entries = entries };
 }
 
-/// Missing or malformed meta degrades to 0 — the safe default for
+/// Missing or malformed meta degrades to 0. Safe default for
 /// `classifyChanges` (every disappeared block routes to `reorged_out`).
 pub fn readMeta(engine_data_dir: []const u8) !u64 {
     var dir = try std.fs.cwd().openDir(engine_data_dir, .{});
@@ -95,11 +95,11 @@ pub fn readMeta(engine_data_dir: []const u8) !u64 {
 /// Four-bucket diff between two pending snapshots.
 ///
 /// `reorg_from`: lowest block where prev and curr disagree on hash.
-/// `new_blocks`: tail of curr beyond prev's max block — borrowed from curr.
+/// `new_blocks`: tail of curr beyond prev's max block, borrowed from curr.
 /// `finalized`: blocks in prev, absent from curr, ≤ `last_finalized`.
 /// `reorged_out`: blocks in prev, absent from curr, > `last_finalized`.
 ///
-/// The finalized/reorged_out split needs the meta.bin cross-check —
+/// The finalized/reorged_out split needs the meta.bin cross-check.
 /// pending.bin alone can't distinguish age-out from `truncateFrom`.
 const Classification = struct {
     reorg_from: ?u64 = null,
@@ -120,7 +120,7 @@ fn classifyChanges(
     curr: []const Entry,
     last_finalized: u64,
 ) !Classification {
-    // Lowest same-block hash mismatch wins — deeper forks must converge there.
+    // Lowest same-block hash mismatch wins. Deeper forks must converge there.
     var reorg_from: ?u64 = null;
     for (prev) |p| {
         for (curr) |c| {
@@ -181,16 +181,16 @@ pub const RunOptions = struct {
     /// sleeps for this duration before every tick.
     tick_timeout_ms: u32 = 500,
     /// Optional Multicall3 pointer for per-block prefetch of factory
-    /// children. `null` keeps the live loop offline — handlers that hit
+    /// children. `null` keeps the live loop offline. Handlers that hit
     /// uncached `ethCall` get `error.NotPrefetched`.
     multicall: ?*eth.multicall.Multicall = null,
     multicall_batch_size: usize = ethcall.DEFAULT_BATCH_SIZE,
 };
 
-/// Resources that persist across ticks: the watcher, the last-seen
-/// pending snapshot, and the per-block decompress + log buffers. Held
-/// here so `tick` doesn't reallocate per call. `run` constructs one
-/// session and loops; tests drive `tick` directly.
+/// Resources that persist across ticks: watcher, last-seen pending
+/// snapshot, per-block decompress + log buffers. Held here so `tick`
+/// doesn't reallocate per call. `run` constructs one session and loops.
+/// Tests drive `tick` directly.
 const LiveSession = struct {
     allocator: std.mem.Allocator,
     engine_data_dir: []const u8,
@@ -232,8 +232,7 @@ const LiveSession = struct {
         self.watcher.deinit();
     }
 
-    /// One pass of the live loop: wait, classify, dispatch new blocks,
-    /// commit.
+    /// One pass of the live loop: wait, classify, dispatch new blocks, commit.
     pub fn tick(
         self: *LiveSession,
         comptime m: sdk_manifest.Manifest,
@@ -243,7 +242,7 @@ const LiveSession = struct {
     ) !void {
         try self.watcher.wait(timeout_ms);
 
-        // Lock the mutation body only — not the wait above (that would stall
+        // Lock the mutation body only, not the wait above (that would stall
         // API readers for up to timeout_ms).
         lockCtx(ctx);
         defer unlockCtx(ctx);
@@ -271,8 +270,8 @@ const LiveSession = struct {
                 if (rf <= ctx._last_dispatched_block) return error.ReorgExceedsFinalityDepth;
             }
             discardAllOverlays(ctx);
-            // Re-dispatch every block in fresh pending oldest to newest;
-            // re-applying mutations against an empty overlay is idempotent.
+            // Re-dispatch every block in fresh pending oldest to newest.
+            // Re-applying mutations against an empty overlay is idempotent.
             for (curr.entries) |entry| {
                 setLiveBlock(ctx, entry.block_number);
                 try self.dispatchBlock(m, Handler, ctx, entry);
@@ -302,12 +301,12 @@ const LiveSession = struct {
             log.block_number = entry.block_number;
         }
 
-        // Pending blocks are raw — unlike the backfill path, nothing filtered
+        // Pending blocks are raw. Unlike the backfill path, nothing filtered
         // them by address. Discover factory children spawned in this block
         // first (a create-event is emitted by the factory, which always
         // passes the gate), then compact to the dispatchable logs so prefetch
-        // and dispatch both operate on a trusted slice — the same
-        // filter→prefetch→dispatch order the historical pipeline uses.
+        // and dispatch both operate on a trusted slice. Same
+        // filter→prefetch→dispatch order as the historical pipeline.
         try discoverChildren(m, ctx, self.log_buf[0..log_count]);
 
         var keep: usize = 0;
@@ -320,8 +319,8 @@ const LiveSession = struct {
         try self.maybePrefetchBlock(m, ctx, self.log_buf[0..keep]);
 
         ctx.block_number = entry.block_number;
-        // The follower carries the exact header timestamp in pending.bin; use it
-        // directly. timestamps.bin (mmap'd at init) can't see blocks appended
+        // The follower carries the exact header timestamp in pending.bin. Use
+        // it directly. timestamps.bin (mmap'd at init) can't see blocks appended
         // past the import cutoff, so the formula fallback would otherwise drift
         // for live blocks. 0 = unknown (pre-magic engine) → derive as before.
         ctx.timestamp = if (entry.timestamp != 0)
@@ -337,7 +336,7 @@ const LiveSession = struct {
     /// Stage-1 address gate for raw live logs. Mirrors `filter_builder`'s
     /// per-log address predicate: keep emitters that are statically declared
     /// (contracts + factories) or runtime-discovered factory children. A
-    /// manifest declaring no addresses keeps nothing — correct, since its
+    /// manifest declaring no addresses keeps nothing, correct since its
     /// dispatcher matches no event either.
     fn shouldDispatch(comptime m: sdk_manifest.Manifest, ctx: anytype, address: [20]u8) bool {
         const known = comptime sdk_manifest.knownAddresses(m);
@@ -457,7 +456,7 @@ pub fn run(
     }
 }
 
-/// `deinit` sets `_stop`; the loop exits within one `tick`. Test contexts have
+/// `deinit` sets `_stop`. The loop exits within one `tick`. Test contexts have
 /// no `_stop` field and never stop here.
 fn stopRequested(ctx: anytype) bool {
     const T = std.meta.Child(@TypeOf(ctx));
@@ -477,7 +476,7 @@ fn unlockCtx(ctx: anytype) void {
 }
 
 /// Flip `live = true` on every entity store. Saves from this point go
-/// to the per-block overlay instead of the dirty cache; `commitBlock` is
+/// to the per-block overlay instead of the dirty cache. `commitBlock` is
 /// the only path that drains overlay state into the cache/append queue
 /// for the next `state.snap` commit. Counter-shaped test contexts without
 /// a `stores` field are skipped.
@@ -621,7 +620,7 @@ test "classifyChanges: hash mismatch at depth 1 sets reorg_from" {
 }
 
 test "classifyChanges: deepest fork wins on multi-block reorg" {
-    // Three blocks diverge; reorg_from must point at the lowest disagreement.
+    // Three blocks diverge. reorg_from must point at the lowest disagreement.
     const prev = [_]Entry{ mkEntry(100, 0xAA), mkEntry(101, 0xAA), mkEntry(102, 0xAA), mkEntry(103, 0xAA) };
     const curr = [_]Entry{ mkEntry(100, 0xAA), mkEntry(101, 0xBB), mkEntry(102, 0xBB), mkEntry(103, 0xBB) };
 
@@ -646,7 +645,7 @@ test "classifyChanges: finalization promotes the disappeared oldest block" {
 }
 
 test "classifyChanges: reorg-truncation routes through reorged_out, not finalized" {
-    // Block 102 disappeared but meta says last_finalized=99 — engine
+    // Block 102 disappeared but meta says last_finalized=99. Engine
     // truncated the tail mid-reorg, not aged it out of pending.
     const prev = [_]Entry{ mkEntry(100, 0xAA), mkEntry(101, 0xAA), mkEntry(102, 0xAA) };
     const curr = [_]Entry{ mkEntry(100, 0xAA), mkEntry(101, 0xAA) };
@@ -754,7 +753,7 @@ const TestManifest: sdk_manifest.Manifest = .{
     .contracts = &.{.{ .name = "T", .address = TEST_CONTRACT, .events = &.{TestTransfer} }},
 };
 
-/// Counter-shaped ctx + handler: cheap stand-in for a real Context that
+/// Counter-shaped ctx + handler. Cheap stand-in for a real Context that
 /// still exercises the dispatch pipeline. No entity stores, so the
 /// overlay path is a no-op via the @hasField gate on `enter` / `tick`.
 const TestRunner = struct {
@@ -798,7 +797,7 @@ test "tick dispatches a pending block ingested by FakeEngine" {
     const engine_path = try engine_tmp.dir.realpath(".", &path_buf);
 
     // Session must initialize BEFORE the ingest so its `prev` snapshot
-    // starts empty — otherwise the planted block would already be in
+    // starts empty. Otherwise the planted block would already be in
     // `prev` and the diff would report no new blocks.
     var session = try LiveSession.init(testing.allocator, engine_path);
     defer session.deinit();
@@ -816,9 +815,8 @@ test "tick dispatches a pending block ingested by FakeEngine" {
 }
 
 test "tick drops a pending log whose emitter is not in the manifest" {
-    // Regression: the live path used to dispatch every topic0 match in a raw
-    // pending block, counting Ethereum-wide ERC-20 Transfers as if they were
-    // the manifest contract. shouldDispatch must reject foreign emitters.
+    // Regression: foreign emitters must be rejected. A raw pending block can
+    // carry Ethereum-wide ERC-20 Transfers. Only manifest contracts dispatch.
     var engine_tmp = testing.tmpDir(.{});
     defer engine_tmp.cleanup();
     var fake = fake_engine.FakeEngine.init(engine_tmp.dir, testing.allocator);
@@ -889,7 +887,7 @@ test "tick discovers a factory child spawned live and dispatches its events" {
     var session = try LiveSession.init(testing.allocator, engine_path);
     defer session.deinit();
 
-    // Empty runtime child set: the child is unknown until the create-event in
+    // Empty runtime child set. The child is unknown until the create-event in
     // this very block adds it (the warm-start set starts empty here).
     var children = std.AutoHashMap([20]u8, void).init(testing.allocator);
     defer children.deinit();
@@ -1011,7 +1009,7 @@ test "tick routes saves through the per-block overlay, not the slab" {
     try testing.expectEqual(@as(u32, 1), block_102.count());
     try testing.expectEqual(@as(u64, 300), block_102.get(CARL).?.balance);
 
-    // Nothing committed to disk — the slab is empty, only the overlay holds the data.
+    // Nothing committed to disk. The slab is empty, only the overlay holds the data.
     try testing.expectEqual(@as(u32, 0), ctx.stores.accounts.count());
 
     // `load` returns the overlay value (not the slab).
@@ -1042,7 +1040,7 @@ test "reorg recovery drops overlay and re-dispatches fresh pending" {
     try testing.expectEqual(@as(u32, 3), runner.transfers);
 
     // Reorg block 102 to a different hash. classifyChanges sees the
-    // mismatch → tick drops overlay (no-op for counter ctx) and
+    // mismatch, tick drops overlay (no-op for counter ctx) and
     // re-dispatches all three curr blocks.
     try fake.reorg(102);
     var buf_b: [32]u8 = undefined;
@@ -1071,7 +1069,7 @@ test "reorg below the cursor raises ReorgExceedsFinalityDepth" {
     try fake.ingest(100, [_]u8{0xAA} ** 32, &.{makeTransferLog([_]u8{0} ** 20, ALICE, 1, &buf_a)});
     try session.tick(TestManifest, TestRunner, &runner, 200);
 
-    // Reorg below cursor: engine truncates and re-ingests block 100 with a
+    // Reorg below cursor. Engine truncates and re-ingests block 100 with a
     // new hash. The bound check refuses recovery.
     try fake.reorg(100);
     var buf_b: [32]u8 = undefined;
@@ -1087,7 +1085,7 @@ test "live prefetch hits warm cache, issues no Multicall" {
     // A pending block carrying a PairCreated factory event runs through
     // `maybePrefetchBlock`. With the cache pre-warmed for the expected
     // decimals() call, `filterUncached` returns empty and no Multicall
-    // round-trip is attempted — proven by passing `multicall = null`
+    // round-trip is attempted. Proven by passing `multicall = null`
     // (any attempt would have been a null deref).
     var engine_tmp = testing.tmpDir(.{});
     defer engine_tmp.cleanup();
@@ -1148,7 +1146,7 @@ test "live prefetch hits warm cache, issues no Multicall" {
 
     var session = try LiveSession.init(testing.allocator, engine_path);
     defer session.deinit();
-    // session.multicall stays null — the warm cache must satisfy every
+    // session.multicall stays null. The warm cache must satisfy every
     // prefetch call. A miss would surface here.
 
     // Plant a PairCreated log with the pair address in data[0..32].
@@ -1261,8 +1259,8 @@ test "finalized blocks commit to state.snap and advance the cursor" {
     try fake.finalize(100);
     try session.tick(Manifest, OverlayHandler, ctx, 200);
 
-    // Block 100's entry made it to the cache (dirty=false after refresh);
-    // block 101 still pending.
+    // Block 100's entry made it to the cache (dirty=false after refresh).
+    // Block 101 still pending.
     try testing.expectEqual(@as(u32, 1), ctx.stores.accounts.pendingCount());
     try testing.expectEqual(@as(u64, 100), ctx._last_dispatched_block);
 

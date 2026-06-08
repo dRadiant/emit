@@ -1,22 +1,20 @@
-/// Flat-file cache for immutable eth_call results, kept at
-/// `<data_dir>/ethcall.dat` so wiping the entity state doesn't invalidate it.
+/// Flat-file cache for immutable eth_call results at `<data_dir>/ethcall.dat`.
+/// Survives entity-state wipes (separate file).
 ///
 /// On-disk record (length-prefixed):
 ///   target           [20]u8
-///   calldata_hash    [32]u8       keccak256(calldata), forms the cache key suffix
+///   calldata_hash    [32]u8       keccak256(calldata), cache key suffix
 ///   status           u8           0 = success, 1 = reverted
 ///   value_len        u32 LE
 ///   value            [value_len]u8
 ///
-/// Entries never expire: results are immutable at the call site (decimals,
-/// symbol, factory address, etc.) and we always call at `latest`. The cache
-/// is advisory; corruption is detected on open, the file is reset, and the
-/// next prefetch pass repopulates from RPC.
+/// Entries never expire. Results are immutable at the call site (decimals,
+/// symbol, factory address) and always called at `latest`. Advisory cache.
+/// Corruption detected on open, file reset, next prefetch repopulates from RPC.
 ///
-/// Lookups are O(1) via an in-memory hash map built on open. Writes append
-/// to the file and update the map; an out-of-band crash leaves a truncated
-/// last record which `open` detects and truncates away, so the next append
-/// continues from a clean boundary.
+/// O(1) lookups via in-memory hash map built on open. Writes append to file
+/// and update the map. A crashed append leaves a truncated last record which
+/// `open` truncates away so the next append continues from a clean boundary.
 const std = @import("std");
 
 const core = @import("core");
@@ -33,9 +31,9 @@ pub const Call = struct {
     calldata: []const u8,
 };
 
-/// Borrowed view of a cached entry. `bytes` is owned by the cache and
-/// remains valid until the next overwrite (rare; entries are upserted) or
-/// `close`. Callers must not free.
+/// Borrowed view of a cached entry. `bytes` is owned by the cache, valid
+/// until the next overwrite (rare, entries are upserted) or `close`.
+/// Callers must not free.
 pub const CachedEntry = struct {
     status: u8,
     bytes: []const u8,
@@ -49,10 +47,10 @@ pub fn selectorOf(comptime method: []const u8) [4]u8 {
     };
 }
 
-/// Comptime-precomputed `keccak256(selector_of(method))`. This is the
-/// 32-byte tail of the cache key for a no-arg method call. Hoisting it
-/// to comptime saves a keccak per `ctx.ethCall` invocation — meaningful
-/// when handlers fire on every block.
+/// Comptime-precomputed `keccak256(selector_of(method))`. The 32-byte tail
+/// of the cache key for a no-arg method call. Hoisting to comptime saves a
+/// keccak per `ctx.ethCall` invocation, meaningful when handlers fire on
+/// every block.
 pub fn calldataHashOf(comptime method: []const u8) [32]u8 {
     return comptime blk: {
         @setEvalBranchQuota(400_000);
@@ -110,8 +108,8 @@ pub const Cache = struct {
     entries: std.AutoHashMapUnmanaged([52]u8, OwnedEntry),
 
     /// Open or create `<dir>/ethcall.dat`. A corrupted-on-disk file (bad
-    /// magic, truncated record) is reset to empty; the next prefetch pass
-    /// rebuilds the relevant entries from RPC.
+    /// magic, truncated record) is reset to empty. Next prefetch rebuilds
+    /// the relevant entries from RPC.
     pub fn open(allocator: std.mem.Allocator, dir: std.fs.Dir) !Cache {
         var self = Cache{
             .allocator = allocator,
@@ -123,7 +121,7 @@ pub const Cache = struct {
         };
 
         self.loadFromFile() catch {
-            // Corruption past the magic: reset to empty.
+            // Corruption past the magic. Reset to empty.
             self.clearEntries();
             self.file.close();
             self.file = try core.flat_format.createWithMagic(dir, "ethcall.dat", MAGIC);
@@ -131,11 +129,10 @@ pub const Cache = struct {
         return self;
     }
 
-    /// Scan records past the magic into the in-memory map. A truncated
-    /// last record is detected and the file is truncated back to the last
-    /// good boundary so the next append continues cleanly. Any unrecoverable
-    /// corruption (mid-record garbage, impossible value_len) raises so the
-    /// caller's reset-to-empty path fires.
+    /// Scan records past the magic into the in-memory map. A truncated last
+    /// record is truncated back to the last good boundary so the next append
+    /// continues cleanly. Unrecoverable corruption (mid-record garbage,
+    /// impossible value_len) raises so the caller's reset-to-empty path fires.
     fn loadFromFile(self: *Cache) !void {
         const stat = try self.file.stat();
         if (stat.size < HEADER_SIZE) return error.Truncated;
@@ -213,15 +210,15 @@ pub const Cache = struct {
         gop.value_ptr.* = .{ .status = status, .bytes = owned };
     }
 
-    /// Borrow the cached entry for `(target, calldata)`. The returned slice
-    /// is valid until the next `put` for the same key, or `close`.
+    /// Borrow the cached entry for `(target, calldata)`. Returned slice valid
+    /// until the next `put` for the same key, or `close`.
     pub fn get(self: *const Cache, target: [20]u8, calldata: []const u8) ?CachedEntry {
         return self.getByHash(target, eth.keccak.hash(calldata));
     }
 
-    /// Borrow the cached entry for `(target, keccak(calldata))`. Use this
-    /// when the calldata hash is already known (e.g. precomputed at
-    /// comptime via `calldataHashOf`) to skip the per-call keccak.
+    /// Borrow the cached entry for `(target, keccak(calldata))`. Use when the
+    /// calldata hash is already known (e.g. comptime via `calldataHashOf`) to
+    /// skip the per-call keccak.
     pub fn getByHash(self: *const Cache, target: [20]u8, calldata_hash: [32]u8) ?CachedEntry {
         const key = cacheKeyFromHash(target, calldata_hash);
         if (self.entries.getPtr(key)) |e| {
@@ -236,7 +233,7 @@ pub const Cache = struct {
 
     /// Chunk `calls` through Multicall3, writing each result via `put`.
     /// One HTTP RTT per `batch_size`. On network or decode failure the
-    /// in-flight batch is dropped; prior batches retain their writes.
+    /// in-flight batch is dropped. Prior batches retain their writes.
     pub fn preload(
         self: *Cache,
         allocator: std.mem.Allocator,
@@ -259,10 +256,9 @@ pub const Cache = struct {
                 const status: u8 = if (r.success) 0 else 1;
                 try self.put(c.target, c.calldata, status, r.return_data);
             }
-            // One fsync per batch instead of per record: 500 individual
-            // fsyncs (~13 ms each) would dominate a cold prefetch. The
-            // batched calls share a single Multicall3 RTT and a single
-            // durability boundary.
+            // One fsync per batch, not per record. 500 individual fsyncs
+            // (~13 ms each) would dominate a cold prefetch. Batched calls
+            // share a single Multicall3 RTT and durability boundary.
             try self.file.sync();
         }
     }
@@ -462,18 +458,18 @@ test "truncated last record is dropped on open without raising" {
         cache.deinit();
     }
 
-    // Simulate a crashed append: tack on a partial record (missing payload bytes).
+    // Simulate a crashed append. Partial record missing payload bytes.
     {
         const f = try tmp.dir.openFile("ethcall.dat", .{ .mode = .read_write });
         defer f.close();
         const end = try f.getEndPos();
         var partial: [RECORD_HEADER_SIZE]u8 = undefined;
         @memset(&partial, 0xAA);
-        std.mem.writeInt(u32, partial[53..57], 100, .little); // claim 100 bytes that don't follow
+        std.mem.writeInt(u32, partial[53..57], 100, .little); // claims 100 bytes that don't follow
         try f.pwriteAll(&partial, end);
     }
 
-    // Reopen: the partial record gets truncated; the good entry survives.
+    // Reopen drops the partial record, the good entry survives.
     var cache = try Cache.open(testing.allocator, tmp.dir);
     defer cache.deinit();
     const entry = cache.get(TARGET, &CALLDATA) orelse return error.TestUnexpectedNull;

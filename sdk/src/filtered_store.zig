@@ -5,17 +5,15 @@
 ///   <base>.dat    magic "EMITFDAT" + LZ4-compressed log entries appended sequentially
 ///   <base>.idx    magic "EMITFIDX" + dense [(block_number u64 BE, timestamp u32 LE, offset u64 LE, length u32 LE)]
 ///
-/// The idx file's authoritative entry count is `(idx_size - MAGIC_SIZE) / ENTRY_SIZE`.
-/// A crashed append may leave the dat file longer than the idx claims; the
+/// Authoritative entry count is `(idx_size - MAGIC_SIZE) / ENTRY_SIZE`.
+/// A crashed append may leave the dat file longer than the idx claims. The
 /// next append seeks past the prior offset+length boundary and overwrites
-/// orphan bytes. A partial trailing idx entry is detected on open and
-/// truncated; the corresponding dat bytes become orphan and get overwritten
-/// the same way.
+/// orphan bytes. A partial trailing idx entry is truncated on open, its dat
+/// bytes become orphan and get overwritten the same way.
 ///
-/// The filtered index has no durability requirement (rebuildable from the
-/// engine's flat store), so the open path may detect any inconsistency the
-/// caller can resolve by rebuilding. `error.IndexInconsistent` is the signal
-/// — caller deletes both files and re-runs the build.
+/// No durability requirement (rebuildable from the engine's flat store), so
+/// the open path may raise `error.IndexInconsistent` for any inconsistency.
+/// Caller deletes both files and re-runs the build.
 const std = @import("std");
 
 const core = @import("core");
@@ -29,8 +27,8 @@ pub const Error = error{ OutOfOrder, IndexInconsistent, Truncated, BufferTooSmal
 
 pub const IndexEntry = struct {
     block_number: u64,
-    /// Exact block time (u32 epoch-seconds). 0 = unknown: local builds leave it
-    /// 0 and the scanner falls back to the engine's `timestamps.bin`; the remote
+    /// Exact block time (u32 epoch-seconds). 0 = unknown. Local builds leave it
+    /// 0 and the scanner falls back to the engine's `timestamps.bin`. The remote
     /// client fills it from the PUSH frame so an off-engine store is self-timed.
     timestamp: u32,
     offset: u64,
@@ -50,8 +48,7 @@ pub const FilteredStore = struct {
 
     /// Open or create the `<base>.dat`/`<base>.idx` pair under `dir`.
     /// A trailing partial idx entry is truncated. A last idx entry whose
-    /// `offset + length` exceeds the dat file's size raises
-    /// `IndexInconsistent` so the caller can delete both files and rebuild.
+    /// `offset + length` exceeds the dat file's size is dropped.
     pub fn open(
         allocator: std.mem.Allocator,
         dir: std.fs.Dir,
@@ -77,9 +74,8 @@ pub const FilteredStore = struct {
         if (entry_count > 0) {
             const last = try readEntryAt(idx_file, entry_count - 1);
             if (last.offset + last.length > dat_size) {
-                // The last recorded entry references bytes past the dat tail.
-                // Drop it; the next append overwrites whatever dat orphan
-                // bytes remain (if any).
+                // Last entry references bytes past the dat tail. Drop it.
+                // The next append overwrites any remaining dat orphan bytes.
                 entry_count -= 1;
                 try idx_file.setEndPos(HEADER_SIZE + entry_count * ENTRY_SIZE);
             }
@@ -90,7 +86,7 @@ pub const FilteredStore = struct {
             .dat_file = dat_file,
             .idx_file = idx_file,
             .dat_size = if (entry_count == 0)
-                @as(u64, HEADER_SIZE) // dat magic still occupies header bytes; appends start after
+                @as(u64, HEADER_SIZE) // dat magic occupies header bytes, appends start after
             else blk: {
                 const last = try readEntryAt(idx_file, entry_count - 1);
                 break :blk last.offset + last.length;
@@ -106,8 +102,8 @@ pub const FilteredStore = struct {
 
     /// Append `(block_number, timestamp, lz4_entry)`. Block numbers MUST be
     /// strictly increasing (mirrors the engine's flat-store monotonic
-    /// invariant). `timestamp` is the exact block time, or 0 when unknown —
-    /// local builds pass 0 and the scanner falls back to `timestamps.bin`; the
+    /// invariant). `timestamp` is the exact block time, or 0 when unknown.
+    /// Local builds pass 0 and the scanner falls back to `timestamps.bin`. The
     /// remote client passes the PUSH timestamp so the store is self-timed.
     pub fn appendEntry(
         self: *Self,
@@ -154,7 +150,7 @@ pub const FilteredStore = struct {
     }
 
     /// Read the payload for an already-known index entry. Skips the
-    /// idx-file lookup; use when peek + consume share the same entry.
+    /// idx-file lookup. Use when peek + consume share the same entry.
     pub fn readPayloadFor(self: *const Self, entry: IndexEntry, buf: []u8) ![]const u8 {
         if (buf.len < entry.length) return error.BufferTooSmall;
         if ((try self.dat_file.pread(buf[0..entry.length], entry.offset)) != entry.length) return error.Truncated;
@@ -332,7 +328,7 @@ test "last idx entry referencing past-dat-end is dropped on open" {
 
     var s = try FilteredStore.open(testing.allocator, tmp.dir, "primary");
     defer s.deinit();
-    // Forged entry dropped; only the real entry remains.
+    // Forged entry dropped. Only the real entry remains.
     try testing.expectEqual(@as(u64, 1), s.count());
 }
 

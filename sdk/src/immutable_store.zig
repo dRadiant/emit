@@ -1,15 +1,14 @@
-/// ImmutableStore(T): append-only entity store backed by an `EventLog(T)`
-/// over `<entity>.events.dat`. `load` is a `@compileError` so a
-/// MutableStore/ImmutableStore mixup fails at compile time.
+/// ImmutableStore(T): append-only entity store backed by `EventLog(T)` over
+/// `<entity>.events.dat`. `load` is a `@compileError` so a Mutable/Immutable
+/// store mixup fails at compile time.
 ///
-/// Keys are big-endian (via `entity_serial.serialize`'s first-field rule)
-/// so sorted-by-bytes equals sorted-by-numeric.
+/// Keys are big-endian (first-field rule), so sorted-by-bytes equals
+/// sorted-by-numeric.
 ///
-/// In live mode, saves accumulate in a per-block buffer; `commitBlock`
-/// drains one block's list into a regular append queue; `flushAppends`
-/// writes the queue to `events.dat`. The authoritative record count is
-/// owned by `state.snap`; this store tracks it locally so out-of-order
-/// `save` is caught before the disk write.
+/// Live mode: saves accumulate per-block. `commitBlock` drains one block into
+/// the append queue. `flushAppends` writes the queue to `events.dat`.
+/// Authoritative count is owned by `state.snap`, tracked locally to catch
+/// out-of-order `save` before the disk write.
 const std = @import("std");
 
 const event_log_mod = @import("event_log.zig");
@@ -36,8 +35,8 @@ pub fn ImmutableStore(comptime T: type) type {
 
         allocator: std.mem.Allocator,
         log: *Log,
-        /// Authoritative count from `state.snap.immutable_counts`. Updated
-        /// in lockstep with the matching `state_snap.commit`.
+        /// Authoritative count from `state.snap.immutable_counts`. Advanced in
+        /// lockstep with `state_snap.commit`.
         committed_count: u64,
         /// Largest key already in the log (or pending), for monotonic checks.
         last_key: ?[KEY_SIZE]u8 = null,
@@ -49,8 +48,8 @@ pub fn ImmutableStore(comptime T: type) type {
         live_block: u64 = 0,
         block_pending: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(T)) = .{},
 
-        /// `log` is owned by the caller (typically the SDK Context). The
-        /// store does not close it on deinit; it only frees its own buffers.
+        /// `log` is caller-owned (typically the SDK Context). `deinit` frees
+        /// only this store's buffers, never the log.
         pub fn open(
             allocator: std.mem.Allocator,
             log: *Log,
@@ -89,16 +88,15 @@ pub fn ImmutableStore(comptime T: type) type {
             self.pending_appended.append(self.allocator, entity) catch return error.OutOfMemory;
         }
 
-        /// Immutable entities are never loaded during backfill. The cache
-        /// in MutableStore exists for the mutable case; calling `load` on
-        /// an ImmutableStore is almost always a MutableStore/ImmutableStore
-        /// mixup, so catch it at compile time.
+        /// Immutable entities are never loaded during backfill. A `load` call
+        /// here is almost always a Mutable/Immutable store mixup, caught at
+        /// compile time.
         pub fn load(_: Self, _: anytype) !?T {
             @compileError("ImmutableStore.load is not supported: cannot load immutable entities during backfill");
         }
 
-        /// Drain one block's overlay into the pending-append queue. The
-        /// actual disk write happens later via `flushAppends`.
+        /// Drain one block's overlay into the pending-append queue. Disk write
+        /// happens later via `flushAppends`.
         pub fn commitBlock(self: *Self, block: u64) AppendError!void {
             const entry = self.block_pending.getPtr(block) orelse return;
             // Reserve capacity before draining so a partial OOM can't strand entries.
@@ -108,9 +106,9 @@ pub fn ImmutableStore(comptime T: type) type {
             removed.value.deinit(self.allocator);
         }
 
-        /// Append every queued record to `events.dat`. Caller must follow
-        /// with `state_snap.commit` to publish the new authoritative count,
-        /// then call `markCommitted` to advance this store's view.
+        /// Append every queued record to `events.dat`. Caller must then
+        /// `state_snap.commit` to publish the new count, then `markCommitted`
+        /// to advance this store's view.
         pub fn flushAppends(self: *Self) !void {
             if (self.pending_appended.items.len == 0) return;
             try self.log.append(self.pending_appended.items, self.committed_count);
@@ -121,8 +119,7 @@ pub fn ImmutableStore(comptime T: type) type {
             return self.committed_count + self.pending_appended.items.len;
         }
 
-        /// Advance the local committed-count view after `state_snap.commit`
-        /// publishes the new count.
+        /// Advance the local committed-count view after `state_snap.commit`.
         pub fn markCommitted(self: *Self) void {
             self.committed_count += self.pending_appended.items.len;
             self.pending_appended.clearRetainingCapacity();
@@ -151,10 +148,9 @@ pub fn ImmutableStore(comptime T: type) type {
         }
 
         // ── In-process read surface ────────────────────────────────────────
-        // Overlay-aware so an API reader sees the live tip.
-        // Callers take the Context lock
-        // Reader never straddles a commit, so `committed_count`
-        // and the overlay are mutually consistent
+        // Overlay-aware so an API reader sees the live tip. Callers hold the
+        // Context lock, so a reader never straddles a commit and
+        // `committed_count` stays consistent with the overlay.
 
         /// Live record count: finalized records plus the live overlay.
         pub fn count(self: *const Self) u64 {
@@ -172,12 +168,12 @@ pub fn ImmutableStore(comptime T: type) type {
             return self.overlayGet(&target);
         }
 
-        /// Fill `out` with up to `out.len` records starting at logical index
-        /// `start` (0 = oldest) in ascending key order, returning the filled
-        /// prefix. Spans the finalized log then the live overlay. The overlay
-        /// is collected and sorted once per call (bounded by the pending-ring
-        /// depth), so a page costs one sort, not one per record. Build a
-        /// newest-first page with `start = count() - n`.
+        /// Fill `out` with up to `out.len` records from logical index `start`
+        /// (0 = oldest) in ascending key order, returning the filled prefix.
+        /// Spans the finalized log then the live overlay. Overlay is collected
+        /// and sorted once per call (bounded by pending-ring depth), so a page
+        /// costs one sort, not one per record. Newest-first page:
+        /// `start = count() - n`.
         pub fn range(self: *Self, start: u64, out: []T) ![]T {
             const total = self.count();
             if (start >= total or out.len == 0) return out[0..0];
@@ -191,7 +187,7 @@ pub fn ImmutableStore(comptime T: type) type {
             }
             if (i >= end) return out[0..n];
 
-            // The window reaches the overlay: sort it once, then index in.
+            // Window reaches the overlay. Sort it once, then index in.
             const tmp = try self.allocator.alloc(T, self.pendingCount());
             defer self.allocator.free(tmp);
             const ordered = self.collectOverlaySorted(tmp);
@@ -204,9 +200,8 @@ pub fn ImmutableStore(comptime T: type) type {
             return out[0..n];
         }
 
-        /// Scan the live overlay (drained-append queue, then per-block buffers)
-        /// for a record whose key matches `target`. Keys are unique, so the
-        /// first match wins.
+        /// Scan the live overlay (append queue, then per-block buffers) for a
+        /// record matching `target`. Keys are unique, so first match wins.
         fn overlayGet(self: *Self, target: *const [KEY_SIZE]u8) ?T {
             for (self.pending_appended.items) |e| {
                 if (keyMatches(e, target)) return e;
@@ -339,7 +334,7 @@ test "live save buffers per block; commitBlock moves into the append queue" {
     try testing.expectEqual(@as(u32, 3), store.pendingCount());
 
     try store.commitBlock(100);
-    // Block 100's entries are now in the append queue; block 101 still in overlay.
+    // Block 100's entries are now in the append queue. Block 101 still in overlay.
     try testing.expectEqual(@as(u32, 3), store.pendingCount());
     try testing.expectEqual(@as(usize, 2), store.pending_appended.items.len);
     try testing.expectEqual(@as(usize, 1), (store.block_pending.get(101).?).items.len);
@@ -379,7 +374,7 @@ test "backfill leaves the overlay empty" {
 
     try store.save(.{ .id = idKey(1, 0), .value = 1 });
     try store.save(.{ .id = idKey(1, 1), .value = 2 });
-    // pendingCount includes the append queue; the block_pending overlay alone is empty.
+    // pendingCount includes the append queue. The block_pending overlay alone is empty.
     try testing.expectEqual(@as(usize, 0), store.block_pending.count());
 }
 
@@ -454,7 +449,7 @@ test "count, get, range span the finalized log and the live overlay" {
     try testing.expectEqual(@as(u64, 20), tail[0].value);
     try testing.expectEqual(@as(u64, 30), tail[1].value);
 
-    // Newest-first page of size 2 (start = count - 2); caller reverses.
+    // Newest-first page of size 2 (start = count - 2). Caller reverses.
     const page = try store.range(store.count() - 2, buf[0..2]);
     try testing.expectEqual(@as(u64, 20), page[0].value);
     try testing.expectEqual(@as(u64, 30), page[1].value);

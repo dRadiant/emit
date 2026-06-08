@@ -1,4 +1,4 @@
-/// emit-engine — imports EVM logs and follows chain head.
+/// emit-engine. Imports EVM logs, follows chain head.
 ///
 /// Commands:
 ///   import --rocksdb <path> --data-dir <path>   Bulk import from Nethermind receipts DB
@@ -53,10 +53,9 @@ pub fn main() !void {
         const data_dir = getFlag(args, "--data-dir") orelse return usage();
 
         if (getFlag(args, "--rocksdb")) |rocksdb_path| {
-            // RocksDB import is a separate binary (avoids linking ~20MB of C into engine).
-            // Exec it directly once built. Pass --rpc through so the importer can
-            // resolve the canonical receipt row for blocks that carry reorg-history
-            // duplicates (Nethermind keeps orphan rows even past finality).
+            // RocksDB import is a separate binary, avoids linking ~20MB of C into engine.
+            // Pass --rpc through so the importer can resolve the canonical receipt row
+            // for blocks with reorg-history duplicates (Nethermind keeps orphan rows past finality).
             const argv: []const []const u8 = if (getFlag(args, "--rpc")) |rpc_url|
                 &.{ "rocksdb-import", rocksdb_path, data_dir, "--rpc", rpc_url }
             else

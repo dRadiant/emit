@@ -1,11 +1,11 @@
 /// Pre-finality block buffer persisted as a single file via atomic rewrite.
 ///
-/// Holds the last ≤64 blocks before they're finalized to the immutable flat
-/// store. All mutations operate on an in-memory ArrayList; after each mutation
-/// the list is serialized to pending.bin via tmp + rename (crash-safe).
+/// Holds the last ≤64 blocks before finalization to the immutable flat store.
+/// Mutations operate on an in-memory ArrayList. After each mutation the list is
+/// serialized to pending.bin via tmp + rename (crash-safe).
 ///
-/// Flat files are NEVER mutated — this is the only mutable state in the engine.
-/// See ADR-001 for the decision rationale.
+/// Flat files are NEVER mutated. This is the only mutable state in the engine.
+/// See ADR-001 for the rationale.
 ///
 /// File format:
 ///   count(u32 LE)
@@ -27,8 +27,8 @@ pub const FINALITY_DEPTH = pending_format.FINALITY_DEPTH;
 
 const HASH_SIZE = pending_format.HASH_SIZE;
 
-/// Same shape as `core.pending_format.Entry` but owns `lz4_entry` —
-/// the engine writes and frees these bytes.
+/// Same shape as `core.pending_format.Entry` but owns `lz4_entry`.
+/// The engine writes and frees these bytes.
 pub const Entry = struct {
     block_number: u64,
     timestamp: u32 = 0,
@@ -44,9 +44,9 @@ pub const PendingRing = struct {
     alloc: std.mem.Allocator,
 
     /// Open or create a pending ring in the given directory.
-    /// Loads existing pending.bin if present; missing file is fine, but
-    /// any other I/O or corruption error surfaces so the engine fails loud
-    /// instead of silently starting from an empty ring on a populated dir.
+    /// Loads existing pending.bin if present. Missing file is fine. Any other
+    /// I/O or corruption error surfaces so the engine fails loud rather than
+    /// silently starting from an empty ring on a populated dir.
     pub fn open(dir: std.fs.Dir, alloc: std.mem.Allocator) !PendingRing {
         var ring = PendingRing{
             .entries = .{},
@@ -55,7 +55,7 @@ pub const PendingRing = struct {
         };
         ring.load() catch |err| switch (err) {
             error.FileNotFound => {},
-            // An old (pre-magic) or unrecognized pending.bin is discarded: the
+            // Old (pre-magic) or unrecognized pending.bin is discarded. The
             // follower re-baselines from meta and rewrites it in the current
             // format. Genuine corruption of a current-format file still fails
             // loud (Truncated / NonDense).
@@ -97,8 +97,8 @@ pub const PendingRing = struct {
         try self.persist();
     }
 
-    /// Get the block hash for reorg detection. O(1) via index arithmetic
-    /// since entries are dense (sequential block numbers, no gaps).
+    /// Block hash for reorg detection. O(1) via index arithmetic since entries
+    /// are dense (sequential block numbers, no gaps).
     pub fn getHash(self: *const PendingRing, block_number: u64) ?[HASH_SIZE]u8 {
         const oldest = self.oldestBlock() orelse return null;
         if (block_number < oldest) return null;
@@ -127,9 +127,9 @@ pub const PendingRing = struct {
         return current_head >= oldest + FINALITY_DEPTH;
     }
 
-    /// Borrow the oldest entry without removing it. Lets the caller commit
-    /// to durable storage first and only pop after the commit succeeds, so
-    /// a failed flat-store append leaves the block on the ring for retry.
+    /// Borrow the oldest entry without removing it. Caller commits to durable
+    /// storage first and pops only after the commit succeeds, so a failed
+    /// flat-store append leaves the block on the ring for retry.
     pub fn peekOldest(self: *const PendingRing) ?*const Entry {
         if (self.entries.items.len == 0) return null;
         return &self.entries.items[0];
@@ -149,7 +149,7 @@ pub const PendingRing = struct {
 
     /// Walk backwards from `from` comparing stored hashes against `canonical`.
     /// Returns the first block number where they diverge (the fork point).
-    /// `canonical[0]` is the hash for `from - 1`, `canonical[1]` for `from - 2`, etc.
+    /// `canonical[0]` is the hash for `from - 1`, `canonical[1]` for `from - 2`.
     pub fn findForkPoint(self: *const PendingRing, from: u64, canonical: []const [32]u8) u64 {
         const oldest = self.oldestBlock() orelse return from;
         var fork = from;
@@ -184,8 +184,8 @@ pub const PendingRing = struct {
         try core.atomic_file.write(self.dir, "pending.bin.tmp", "pending.bin", buf);
     }
 
-    /// Load pending.bin on startup via `core.pending_format.parse`, then
-    /// dupe each `lz4_entry` into ring-owned memory.
+    /// Load pending.bin on startup via `core.pending_format.parse`.
+    /// Dupes each `lz4_entry` into ring-owned memory.
     fn load(self: *PendingRing) !void {
         const file = try self.dir.openFile("pending.bin", .{});
         defer file.close();
@@ -417,8 +417,8 @@ test "findForkPoint on empty ring returns from" {
     try testing.expectEqual(@as(u64, 100), ring.findForkPoint(100, &canonical));
 }
 
-// Verifies the dense-ring invariant that head_follower's reorg recovery depends on:
-// after truncate + canonical re-insert, getHash() returns the canonical hash for
+// Dense-ring invariant that head_follower's reorg recovery depends on. After
+// truncate + canonical re-insert, getHash() returns the canonical hash for
 // every block.
 test "truncate + re-insert restores dense ring with canonical hashes" {
     var tmp = testing.tmpDir(.{});

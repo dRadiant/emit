@@ -1,7 +1,7 @@
 /// Read-only access to the flat log store (blocks.dat + blocks.idx + blooms.bin).
-/// Thread-safe — multiple readers can operate concurrently via pread + mmap.
-/// Writer lives in engine; this module is read-only infrastructure shared by
-/// engine (status/validation) and sdk (filtered index builds).
+/// Thread-safe. Multiple readers operate concurrently via pread + mmap.
+/// Writer lives in engine. Read-only infrastructure shared by engine
+/// (status/validation) and sdk (filtered index builds).
 const std = @import("std");
 
 const bloom = @import("bloom.zig");
@@ -22,8 +22,8 @@ pub const META_SIZE = 40;
 // ── Meta ─────────────────────────────────────────────────────────────────
 
 /// Flat store checkpoint persisted to meta.bin via atomic write (tmp + rename).
-/// Enables crash recovery: on restart, resume from last_finalized_block + 1.
-/// Checksum is XOR of all fields with a magic constant — detects partial writes.
+/// Crash recovery resumes from last_finalized_block + 1.
+/// Checksum is XOR of all fields with a magic constant, detecting partial writes.
 pub const Meta = struct {
     last_finalized_block: u64,
     blocks_dat_size: u64,
@@ -65,7 +65,7 @@ const MmapSlice = []align(std.heap.page_size_min) const u8;
 pub const BlockLoc = struct { offset: u64, length: u32 };
 
 /// Read-only handle to the flat log store. blocks.idx and blooms.bin are
-/// mmap'd for O(1) lookups; blocks.dat is read via pread (or io_uring in
+/// mmap'd for O(1) lookups. blocks.dat is read via pread (or io_uring in
 /// block_filter). All fields are pub for in-memory test construction.
 pub const FlatStoreReader = struct {
     blocks_file: std.fs.File, // pread target for block data
@@ -157,8 +157,7 @@ pub const FlatStoreReader = struct {
     }
 
     /// Binary search for the first bloom entry with block_number >= target.
-    /// Bloom entries are sorted ascending by block number (big-endian).
-    /// Skips ~33% of entries when start_block > 0. O(log N).
+    /// Bloom entries are sorted ascending by block number (big-endian). O(log N).
     pub fn findBloomStart(self: *const FlatStoreReader, target_block: u64) usize {
         const base = self.blooms_map[BLOOM_HEADER_SIZE..];
         var lo: usize = 0;

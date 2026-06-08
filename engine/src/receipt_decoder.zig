@@ -1,6 +1,5 @@
 /// Decode Nethermind CompactReceiptStore format (0x7F marker + compact RLP).
-/// Extracts log entries from receipt byte arrays. Used by rocksdb_import
-/// and potentially rpc_import (if receipts arrive in compact form).
+/// Extracts log entries from receipt byte arrays.
 const std = @import("std");
 
 const core = @import("core");
@@ -12,9 +11,9 @@ const types = core.types;
 const COMPACT_MARKER: u8 = 0x7F;
 
 /// Decode all logs from a Nethermind CompactReceiptStore value.
-/// Topics are right-padded from zero-stripped form. Data is reconstructed
-/// from (zero_prefix, data_remainder). tx_hash is zeroed (not stored in
-/// compact format — Nethermind strips it to save space).
+/// Topics right-padded from zero-stripped form. Data reconstructed from
+/// (zero_prefix, data_remainder). tx_hash zeroed: Nethermind strips it from
+/// compact format to save space.
 pub fn decodeReceipts(
     block_number: u64,
     value: []const u8,
@@ -49,7 +48,7 @@ pub fn decodeReceipts(
             const addr_raw = try rlp.bytes();
             const address: [20]u8 = if (addr_raw.len == 20) addr_raw[0..20].* else std.mem.zeroes([20]u8);
 
-            // Topics: Nethermind strips leading zeros, we right-align to 32
+            // Nethermind strips leading zeros from topics. Right-align to 32.
             const topics_end = try rlp.enterList();
             var topics: [types.MAX_TOPICS][32]u8 = undefined;
             var topic_count: u8 = 0;

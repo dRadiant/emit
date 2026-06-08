@@ -1,9 +1,7 @@
-/// Follows the chain head, appending new blocks to the pending ring
-/// and finalizing to the flat store.
-///
-/// Prefers WebSocket (push via eth_subscribe newHeads, <1s latency).
-/// Falls back to HTTP polling (~1s interval) if --ws not provided.
-/// Both use eth.zig for transport and JSON-RPC parsing.
+/// Follows the chain head, appending new blocks to the pending ring and
+/// finalizing to the flat store. Prefers WebSocket (push via eth_subscribe
+/// newHeads, <1s latency). Falls back to HTTP polling (~1s interval) when
+/// --ws absent. Both use eth.zig for transport and JSON-RPC parsing.
 const std = @import("std");
 
 const core = @import("core");
@@ -21,15 +19,15 @@ pub const FollowConfig = struct {
     ws_url: ?[]const u8 = null,
     data_dir: []const u8,
     poll_interval_ms: u64 = 1000,
-    /// Accept a multi-hour RPC catch-up if the baseline is more than
-    /// `GAP_REFUSE_THRESHOLD` blocks behind chain tip. Default refuses
-    /// loud and points the operator at `import --rocksdb`.
+    /// Accept a multi-hour RPC catch-up when baseline is more than
+    /// `GAP_REFUSE_THRESHOLD` blocks behind tip. Default refuses loud and
+    /// points the operator at `import --rocksdb`.
     allow_rpc_catchup: bool = false,
 };
 
-/// Block count above which the engine refuses an RPC-only catch-up on
-/// `follow` start. 1000 blocks ≈ 3.3 hours via serial `eth_getLogs`;
-/// past that, `rocksdb-import` is the right tool (~30 s at this scale).
+/// Block count above which `follow` start refuses an RPC-only catch-up.
+/// 1000 blocks ≈ 3.3 hours via serial `eth_getLogs`. Past that,
+/// `rocksdb-import` is the right tool (~30 s at this scale).
 const GAP_REFUSE_THRESHOLD: u64 = 1000;
 
 pub fn run(config: FollowConfig) !void {
@@ -47,11 +45,11 @@ pub fn run(config: FollowConfig) !void {
         ring.deinit();
     }
 
-    // Resume the importer's timestamps.bin so blocks finalized after the import
-    // keep exact times for cold re-backfills (a live SDK already gets them via
-    // pending.bin). Keyed off the flat store's first_block, so it aligns with
-    // the importer's dense indexing. A fresh follow-only store (no import,
-    // first_block == 0) skips this and falls back to the formula until imported.
+    // Resume the importer's timestamps.bin so blocks finalized post-import keep
+    // exact times for cold re-backfills (a live SDK already gets them via
+    // pending.bin). Keyed off first_block to align with the importer's dense
+    // indexing. Fresh follow-only store (first_block == 0) skips this and falls
+    // back to the formula until imported.
     var ts_writer: ?core.timestamps.TimestampWriter =
         if (writer.first_block != 0)
             core.timestamps.TimestampWriter.open(dir, writer.first_block) catch null
@@ -59,10 +57,10 @@ pub fn run(config: FollowConfig) !void {
             null;
     defer if (ts_writer) |*w| w.deinit();
 
-    // Refuse follow against a stale baseline. The check uses the highest
-    // known block — pending tip if any, else the last finalized — and
-    // compares to current chain tip. Skipped when the dir is fresh
-    // (baseline = 0) or when the operator opts in to RPC catch-up.
+    // Refuse follow against a stale baseline. Baseline is the highest known
+    // block (pending tip if any, else last finalized), compared to chain tip.
+    // Skipped when the dir is fresh (baseline = 0) or the operator opts into
+    // RPC catch-up.
     const baseline: u64 = if (ring.latestBlock()) |t| t else writer.meta.last_finalized_block;
     if (baseline > 0 and !config.allow_rpc_catchup) {
         const tip = try provider.getBlockNumber();
@@ -124,18 +122,18 @@ fn followWs(
         defer alloc.free(msg);
         const block_number = parseBlockNumber(msg) orelse continue;
 
-        // Cold-start fallback matches followPoll so an empty ring after
-        // import or pending-wipe doesn't skip last_finalized..block_number-1.
+        // Cold-start fallback matches followPoll so an empty ring after import
+        // or pending-wipe doesn't skip last_finalized..block_number-1.
         const tip = ring.latestBlock() orelse blk: {
             if (writer.meta.last_finalized_block > 0) break :blk writer.meta.last_finalized_block;
             break :blk block_number -| 1;
         };
 
-        // Providers occasionally re-broadcast. Dense-ring invariant breaks if re-appended.
+        // Providers occasionally re-broadcast. Re-appending breaks the dense-ring invariant.
         if (block_number <= tip) continue;
 
-        // Partial gap-fill would leave the ring non-dense and break getHash —
-        // abort on any failure and let the next notification retry from the tip.
+        // Partial gap-fill would leave the ring non-dense and break getHash.
+        // Abort on any failure and let the next notification retry from the tip.
         var bn = tip + 1;
         var gap_ok = true;
         while (bn < block_number) : (bn += 1) {
@@ -180,11 +178,10 @@ fn followPoll(
 
 // ── Shared ───────────────────────────────────────────────────────────────
 
-/// Fetch block hash + logs from node, serialize, compress, insert into pending ring.
-/// On reorg detection, truncate divergent entries and re-ingest the canonical
-/// chain from the fork point up to `block_number`. The replay is required
-/// because WS newHeads will only push `block_number + 1` next, never re-emitting
-/// the fork-point span.
+/// Fetch block hash + logs, serialize, compress, insert into pending ring.
+/// On reorg, truncate divergent entries and re-ingest the canonical chain from
+/// the fork point up to `block_number`. Replay is required because WS newHeads
+/// will only push `block_number + 1` next, never re-emitting the fork-point span.
 fn ingestBlock(
     block_number: u64,
     provider: *eth.provider.Provider,
@@ -197,7 +194,7 @@ fn ingestBlock(
 
     const header = try provider.getBlock(block_number) orelse return error.BlockNotFound;
 
-    // Reorg check: does this block's parent hash match what we stored?
+    // Reorg check: this block's parent hash vs the stored hash.
     if (ring.getHash(block_number - 1)) |stored_hash| {
         if (!std.mem.eql(u8, &stored_hash, &header.parent_hash)) {
             std.debug.print("Reorg detected at block {d}\n", .{block_number});
@@ -213,8 +210,8 @@ fn ingestBlock(
     try ingestBlockCore(block_number, header, provider, ring, alloc);
 }
 
-/// Recovery-path ingest: skip the reorg check (we're restoring canonical state,
-/// the parent-hash comparison against an already-truncated ring is meaningless).
+/// Recovery-path ingest: skips the reorg check. Restoring canonical state, so
+/// the parent-hash comparison against an already-truncated ring is meaningless.
 fn ingestBlockNoReorgCheck(
     block_number: u64,
     provider: *eth.provider.Provider,
@@ -229,7 +226,7 @@ fn ingestBlockNoReorgCheck(
     try ingestBlockCore(block_number, header, provider, ring, alloc);
 }
 
-/// Shared core: fetch logs for `block_number`, build blooms, compress, insert.
+/// Fetch logs for `block_number`, build blooms, compress, insert.
 fn ingestBlockCore(
     block_number: u64,
     header: anytype,
@@ -241,7 +238,7 @@ fn ingestBlockCore(
     const hex = try std.fmt.bufPrint(&num_buf, "0x{x}", .{block_number});
     const eth_logs = try provider.getLogs(.{ .fromBlock = hex, .toBlock = hex });
 
-    // Fail loud per the contract in core/src/types.zig — a silent truncate
+    // Fail loud per the contract in core/src/types.zig. A silent truncate
     // would land an incomplete block in pending + flat store.
     if (eth_logs.len > types.MAX_LOGS_PER_BLOCK) {
         std.debug.print(
@@ -264,7 +261,7 @@ fn ingestBlockCore(
     const compress_buf = try alloc.alloc(u8, types.BLOCK_BUF_SIZE);
     const entry_len = try log_serial.compressEntry(serialize_buf[0..serialized_len], compress_buf);
 
-    const ts: u32 = std.math.cast(u32, header.timestamp) orelse 0; // exact block time; valid until 2106
+    const ts: u32 = std.math.cast(u32, header.timestamp) orelse 0; // exact block time, valid until 2106
     try ring.insert(block_number, ts, header.hash, &topic_bloom.bits, &addr_bloom.bits, compress_buf[0..entry_len]);
     std.debug.print("Block {d}: {d} logs\n", .{ block_number, raw_logs.len });
 }
@@ -272,7 +269,7 @@ fn ingestBlockCore(
 /// Truncate divergent pending entries down to the fork point and return it,
 /// so the caller can re-ingest the canonical chain from `fork..from`.
 fn resolveReorg(ring: *PendingRing, from: u64, provider: *eth.provider.Provider) !u64 {
-    // Walk backwards; most reorgs are 1-2 blocks.
+    // Walk backwards. Most reorgs are 1-2 blocks.
     var canonical: [pending_ring.FINALITY_DEPTH][32]u8 = undefined;
     const oldest = ring.oldestBlock() orelse return from;
     const depth = @min(from - oldest, pending_ring.FINALITY_DEPTH);
@@ -283,7 +280,7 @@ fn resolveReorg(ring: *PendingRing, from: u64, provider: *eth.provider.Provider)
         filled += 1;
     }
 
-    // Pass only the filled prefix; uninitialized slots would corrupt the comparison.
+    // Pass only the filled prefix. Uninitialized slots would corrupt the comparison.
     const fork = ring.findForkPoint(from, canonical[0..filled]);
     const removed = try ring.truncateFrom(fork);
     try ring.flush();
@@ -292,9 +289,9 @@ fn resolveReorg(ring: *PendingRing, from: u64, provider: *eth.provider.Provider)
 }
 
 /// Move blocks with 64+ confirmations from pending ring to flat store.
-/// Peek-then-pop: appendBlock failure must leave the entry on the ring so
-/// the next finalize attempt retries — popping first would orphan the
-/// block (pending forgets it, flat never recorded it).
+/// Peek-then-pop: appendBlock failure must leave the entry on the ring so the
+/// next finalize attempt retries. Popping first would orphan the block (pending
+/// forgets it, flat never recorded it).
 fn finalizeReady(
     ring: *PendingRing,
     writer: *FlatStoreWriter,
@@ -312,8 +309,8 @@ fn finalizeReady(
             break;
         };
         // Mirror the flat-store append into timestamps.bin so cold re-backfills
-        // over post-import blocks stay exact. Advisory: a write error degrades
-        // to the formula via the reader's zero-is-unknown rule, never blocks
+        // over post-import blocks stay exact. Advisory: a write error degrades to
+        // the formula via the reader's zero-is-unknown rule, never blocks
         // finalization. count is published after the batch via `sync`.
         if (ts_writer) |w| {
             if (oldest.timestamp != 0) w.set(oldest.block_number, oldest.timestamp) catch {};
@@ -327,8 +324,8 @@ fn finalizeReady(
         writer.commitMeta() catch {};
         if (ts_writer) |w| w.sync() catch {};
     }
-    // Flush ring on any pop, including idempotent skips, so a crash-recovery
-    // pass doesn't keep re-presenting the same finalized blocks.
+    // Flush ring on any pop, including idempotent skips, so crash recovery
+    // doesn't keep re-presenting the same finalized blocks.
     if (popped_count > 0) ring.flush() catch {};
     if (finalized > 0) std.debug.print("Finalized {d} blocks\n", .{finalized});
 }
@@ -356,7 +353,7 @@ fn toRawLog(log: eth.receipt.Log, block_number: u64, alloc: std.mem.Allocator) !
     };
 }
 
-/// Extract block number from a newHeads notification: "number":"0x..."
+/// Extract block number from a newHeads notification ("number":"0x...").
 fn parseBlockNumber(msg: []const u8) ?u64 {
     const marker = "\"number\":\"0x";
     const start = std.mem.indexOf(u8, msg, marker) orelse return null;
@@ -401,7 +398,7 @@ test "finalizeReady mirrors finalized timestamps into timestamps.bin" {
     var ts_writer = try core.timestamps.TimestampWriter.open(tmp.dir, 100);
     defer ts_writer.deinit();
 
-    // head = 100 + FINALITY_DEPTH finalizes only block 100; 101 stays pending.
+    // head = 100 + FINALITY_DEPTH finalizes only block 100. 101 stays pending.
     finalizeReady(&ring, &writer, 100 + pending_ring.FINALITY_DEPTH, alloc, &ts_writer);
 
     var reader = (try core.timestamps.TimestampReader.open(tmp.dir)).?;

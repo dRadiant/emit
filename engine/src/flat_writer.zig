@@ -1,5 +1,5 @@
 /// Append-only writer for the flat log store (blocks.dat + blocks.idx + blooms.bin + meta.bin).
-/// Single-threaded — the import pipeline feeds it from one writer thread.
+/// Single-threaded. Fed by one writer thread in the import pipeline.
 /// Counterpart to core's FlatStoreReader.
 const std = @import("std");
 
@@ -46,12 +46,10 @@ pub const FlatStoreWriter = struct {
             }
         } else |_| {}
 
-        // Read first_block from index header, or pre-initialize empty
-        // headers so a `FlatStoreReader` can open this dir before the
-        // first block is finalized. Without this the SDK's `--follow`
-        // path fails with `error.InvalidIndex` when an engine has only
-        // been writing pending.bin (no finalizations yet, ~13 min cold
-        // start at 12 s/block × FINALITY_DEPTH = 64).
+        // Read first_block from index header, or pre-init empty headers so a
+        // FlatStoreReader can open this dir before the first block finalizes.
+        // Otherwise --follow fails with error.InvalidIndex when an engine has
+        // only written pending.bin (no finalizations yet).
         {
             var hdr: [flat_reader.INDEX_HEADER_SIZE]u8 = undefined;
             const n = index_file.pread(&hdr, 0) catch 0;
@@ -59,7 +57,7 @@ pub const FlatStoreWriter = struct {
                 first_block = std.mem.readInt(u64, hdr[0..8], .little);
             } else if (n == 0) {
                 // Zero-init header: first_block placeholder=0, count=0.
-                // `appendBlock` rewrites the header on the first append.
+                // appendBlock rewrites the header on the first append.
                 @memset(&hdr, 0);
                 _ = try index_file.pwrite(&hdr, 0);
             }
@@ -92,7 +90,6 @@ pub const FlatStoreWriter = struct {
         topic_bloom: *const [bloom.BLOOM_SIZE]u8,
         addr_bloom: *const [bloom.ADDR_BLOOM_SIZE]u8,
     ) !void {
-        // Write index header on first block
         if (self.meta.blocks_idx_count == 0 and self.first_block == 0) {
             self.first_block = block_number;
             var hdr: [flat_reader.INDEX_HEADER_SIZE]u8 = undefined;
@@ -101,37 +98,35 @@ pub const FlatStoreWriter = struct {
             _ = try self.index_file.pwrite(&hdr, 0);
         }
 
-        // Index uses block_number - first_block as a dense slot; underflow would scribble.
+        // Index uses block_number - first_block as a dense slot. Underflow would scribble.
         if (block_number < self.first_block) return error.BlockBeforeFirst;
 
         // Idempotent on already-finalized blocks. A crash between commitMeta
         // and ring.flush leaves pending.bin re-presenting them on restart.
         if (self.meta.blocks_idx_count > 0 and block_number <= self.meta.last_finalized_block) return;
 
-        // Dense-append invariant: blocks.idx is indexed by block_number - first_block,
-        // so any gap would leave slots zero-filled and reads would silently return empty.
+        // Dense-append invariant: blocks.idx is indexed by block_number - first_block.
+        // A gap leaves slots zero-filled and reads silently return empty.
         const expected = self.first_block + self.meta.blocks_idx_count;
         if (block_number != expected) return error.NonDenseAppend;
 
-        // Append to blocks.dat
         const offset = self.meta.blocks_dat_size;
         _ = try self.blocks_file.pwrite(lz4_entry, offset);
 
-        // Write dense index entry: block_number maps to (offset, length)
+        // Dense index entry: block_number maps to (offset, length).
         const idx = block_number - self.first_block;
         var idx_entry: [flat_reader.INDEX_ENTRY_SIZE]u8 = undefined;
         std.mem.writeInt(u64, idx_entry[0..8], offset, .little);
         std.mem.writeInt(u32, idx_entry[8..12], @intCast(lz4_entry.len), .little);
         _ = try self.index_file.pwrite(&idx_entry, flat_reader.INDEX_HEADER_SIZE + idx * flat_reader.INDEX_ENTRY_SIZE);
 
-        // Append bloom entry: [block_number:8 BE][topic_bloom][addr_bloom]
+        // Bloom entry: [block_number:8 BE][topic_bloom][addr_bloom]
         var bloom_entry: [flat_reader.BLOOM_ENTRY_SIZE]u8 = undefined;
         std.mem.writeInt(u64, bloom_entry[0..8], block_number, .big);
         @memcpy(bloom_entry[flat_reader.TOPIC_BLOOM_OFFSET..][0..bloom.BLOOM_SIZE], topic_bloom);
         @memcpy(bloom_entry[flat_reader.ADDR_BLOOM_OFFSET..][0..bloom.ADDR_BLOOM_SIZE], addr_bloom);
         _ = try self.blooms_file.pwrite(&bloom_entry, flat_reader.BLOOM_HEADER_SIZE + self.meta.blooms_count * flat_reader.BLOOM_ENTRY_SIZE);
 
-        // Update counters
         self.meta.blocks_dat_size += lz4_entry.len;
         if (idx + 1 > self.meta.blocks_idx_count) self.meta.blocks_idx_count = idx + 1;
         self.meta.blooms_count += 1;
@@ -145,20 +140,19 @@ pub const FlatStoreWriter = struct {
 
     /// Flush file headers and persist meta atomically (tmp + rename).
     pub fn commitMeta(self: *FlatStoreWriter) !void {
-        // Update index header entry_count
+        // index header entry_count at offset 8
         var count_buf: [8]u8 = undefined;
         std.mem.writeInt(u64, &count_buf, self.meta.blocks_idx_count, .little);
         _ = try self.index_file.pwrite(&count_buf, 8);
 
-        // Update blooms header entry_count
+        // blooms header entry_count at offset 0
         var bloom_count_buf: [8]u8 = undefined;
         std.mem.writeInt(u64, &bloom_count_buf, self.meta.blooms_count, .little);
         _ = try self.blooms_file.pwrite(&bloom_count_buf, 0);
 
-        // Flush data files so meta.bin doesn't durably reference bytes that
-        // are still in the kernel page cache. Without this a power-loss
-        // window between the data writes and the meta rename can leave
-        // meta pointing at non-existent offsets.
+        // Flush data files before the meta rename so meta.bin never durably
+        // references bytes still in the page cache. A power-loss window would
+        // otherwise leave meta pointing at non-existent offsets.
         try self.blocks_file.sync();
         try self.index_file.sync();
         try self.blooms_file.sync();
@@ -234,8 +228,7 @@ test "appendBlock rejects block_number below first_block" {
 
     // First write sets first_block = 100.
     try writer.appendBlock(100, &entry, &topic, &addr);
-    // Below first_block: would underflow `block_number - first_block` and
-    // scribble somewhere far past the file end without the guard.
+    // Below first_block underflows block_number - first_block without the guard.
     try std.testing.expectError(error.BlockBeforeFirst, writer.appendBlock(99, &entry, &topic, &addr));
 }
 
@@ -339,8 +332,8 @@ test "bloom scan finds written blocks" {
 
 // ── Test helpers ─────────────────────────────────────────────────────────
 
-/// Open a FlatStoreWriter against a dir handle. Does NOT own the dir —
-/// use closeFilesOnly() instead of close() to avoid invalidating the handle.
+/// Open a FlatStoreWriter against a dir handle. Does NOT own the dir.
+/// Use closeFilesOnly() instead of close() to keep the handle valid.
 fn openFromDir(dir: std.fs.Dir) FlatStoreWriter {
     const blocks_file = dir.createFile("blocks.dat", .{ .truncate = false, .read = true }) catch unreachable;
     const index_file = dir.createFile("blocks.idx", .{ .truncate = false, .read = true }) catch unreachable;

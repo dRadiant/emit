@@ -2,8 +2,8 @@
 /// `pub const storage: sdk.StorageMode = .mutable | .immutable;`.
 ///
 /// First field is the primary key (fixed-size). Field types restricted to
-/// integers and fixed-size arrays per the SDK's comptime serializer.
-/// Identical to `examples/erc20`; the API in `main.zig` reads these stores
+/// integers and fixed-size arrays by the SDK comptime serializer.
+/// Identical to `examples/erc20`. The API in `main.zig` reads these stores
 /// in-process via `ctx.read` / `ctx.count` / `ctx.range`.
 const sdk = @import("sdk");
 
@@ -22,7 +22,7 @@ pub const Allowance = struct {
 };
 
 /// Immutable. Keyed by `block_number(BE u64) ++ tx_index(BE u32) ++ log_index(BE u32)`.
-/// Monotonic in (block, tx, log) — required by `ImmutableStore`'s append-only contract.
+/// Monotonic in (block, tx, log). Required by `ImmutableStore`'s append-only contract.
 pub const Transfer = struct {
     pub const storage: sdk.StorageMode = .immutable;
     id: [16]u8,

@@ -1,33 +1,31 @@
-/// Per-block log filtering
-/// filter after bloom scan rejects non-matching blocks.
-/// Given one block's decompressed packed logs, keep only
-/// the logs matching a `Filter` and re-emit them as a fresh
-/// LZ4 entry in the same packed wire format.
+/// Per-block log filtering after bloom scan rejects non-matching blocks.
+/// Keeps the logs in one block's decompressed packed logs that match a
+/// `Filter`, re-emits them as a fresh LZ4 entry in the same packed wire format.
 ///
 /// Shared by two callers that must produce byte-identical output:
-///   - sdk `filter_builder` worker — backfill filtered-index build.
-///   - engine `tcp_server` — streams filtered blocks to remote indexers.
-/// The engine cannot import the sdk, so the shared primitive lives in core.
+///   sdk `filter_builder` worker (backfill filtered-index build)
+///   engine `tcp_server` (streams filtered blocks to remote indexers)
+/// Engine cannot import sdk, so the shared primitive lives in core.
 ///
-/// Trust model: `decompressed` comes from the importer-produced flat store
-/// (LZ4-validated upstream), so the in-place walk trusts the packed layout.
+/// `decompressed` comes from the importer-produced flat store (LZ4-validated
+/// upstream), so the in-place walk trusts the packed layout.
 ///
-/// Safe builds still bounds-check the slice accesses; ReleaseFast does not.
+/// Safe builds bounds-check the slice accesses, ReleaseFast does not.
 const std = @import("std");
 
 const log_serial = @import("log_serial.zig");
 
 /// Per-log keep predicate. `match_addrs` and `match_topics` are positive
-/// match sets; `exclude_addrs` is a negative filter applied after the
-/// positives pass (lets a phase suppress addresses already covered elsewhere).
+/// match sets. `exclude_addrs` is a negative filter applied after the positives
+/// pass, letting a phase suppress addresses already covered elsewhere.
 pub const Filter = struct {
     match_addrs: []const [20]u8,
     match_topics: []const [32]u8,
     exclude_addrs: []const [20]u8,
 };
 
-/// Result of a successful filter: the recompressed LZ4 entry (a slice into
-/// the caller's `compress_buf`) plus the number of logs it carries.
+/// Recompressed LZ4 entry (a slice into the caller's `compress_buf`) plus the
+/// number of logs it carries.
 pub const Filtered = struct {
     entry: []const u8,
     log_count: u32,
@@ -46,16 +44,16 @@ pub inline fn containsTopic(haystack: []const [32]u8, needle: *const [32]u8) boo
     return contains(32, haystack, needle);
 }
 
-/// Filter `decompressed` (one block's packed logs: `u32` count then logs) to
+/// Filter `decompressed` (one block's packed logs, `u32` count then logs) to
 /// the logs matching `filter`, repacking the keepers and recompressing into
 /// `compress_buf`. Returns `null` when no log matches (caller skips the block).
 ///
-/// Zero-copy walk: iterate logs in place, test the filter against raw bytes at
-/// known offsets, memcpy whole-log byte ranges of keepers into `serialize_buf`.
-/// Skips `deserializeLogs` and per-log `RawLog` materialization entirely.
-/// Both buffers must be at least `BLOCK_BUF_SIZE`. Propagates the compress
-/// error (`error.BufferTooSmall` on an oversize block); the caller decides
-/// whether that is a recoverable drop or fatal.
+/// Zero-copy walk. Iterates logs in place, tests the filter against raw bytes
+/// at known offsets, memcpies whole-log byte ranges of keepers into
+/// `serialize_buf`. Skips `deserializeLogs` and per-log `RawLog`
+/// materialization entirely. Both buffers must be at least `BLOCK_BUF_SIZE`.
+/// Propagates the compress error (`error.BufferTooSmall` on an oversize block),
+/// caller decides whether that is a recoverable drop or fatal.
 pub fn filterBlockEntry(
     decompressed: []const u8,
     filter: Filter,
@@ -128,7 +126,7 @@ fn packLogs(logs: []const RawLog, buf: []u8) []const u8 {
     return buf[0..log_serial.serializeLogs(logs, buf)];
 }
 
-/// Decompress + deserialize a `Filtered.entry` back into RawLogs for assertions.
+/// Decompress and deserialize a `Filtered.entry` back into RawLogs for assertions.
 fn unpack(entry: []const u8, decompress_buf: []u8, log_buf: []RawLog) ![]RawLog {
     const decoded = try log_serial.decompressEntry(entry, decompress_buf);
     const n = log_serial.deserializeLogs(decoded, log_buf);
@@ -214,8 +212,8 @@ test "filterBlockEntry skips logs with zero topics" {
     var serialize_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
     var compress_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
 
-    // A topic-less log at a matched address must not survive (topic0 is the
-    // dispatch key; an anonymous event has nothing to match on).
+    // Topic-less log at a matched address must not survive. topic0 is the
+    // dispatch key, an anonymous event has nothing to match on.
     const logs = [_]RawLog{rawLog(ADDR_A, TOPIC_X, 0, 0)};
     const packed_logs = packLogs(&logs, &pack_buf);
 

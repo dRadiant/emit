@@ -7,12 +7,11 @@ const MERGE_BLOCK = core.types.MERGE_BLOCK;
 const MERGE_TIMESTAMP: u64 = 1_663_224_162;
 
 /// Approximate block timestamp from block number alone (`MERGE_TS + n*12`).
-/// This is the FALLBACK used when no `timestamps.bin` is present. It is not
-/// exact: 12s is the *slot* interval, but missed slots make block number lag
-/// slot number, so the estimate drifts by the accumulated miss count (~10
-/// days at the chain tip, ~0.75% of slots). Pre-merge it is rougher still
-/// (~13s mean). For exact times the engine writes `timestamps.bin` and
-/// `timestampOf` prefers it. Saturating subtract guards overflow at block 0.
+/// Fallback when no `timestamps.bin` present. Inexact: 12s is the slot
+/// interval, missed slots make block number lag slot number, drift accumulates
+/// (~10 days at chain tip, ~0.75% of slots). Pre-merge rougher (~13s mean).
+/// `timestampOf` prefers exact `timestamps.bin`. Saturating subtract guards
+/// overflow at block 0.
 pub fn blockTimestamp(block_number: u64) u64 {
     if (block_number >= MERGE_BLOCK) {
         return MERGE_TIMESTAMP + (block_number - MERGE_BLOCK) * 12;
@@ -20,10 +19,10 @@ pub fn blockTimestamp(block_number: u64) u64 {
     return MERGE_TIMESTAMP -| (MERGE_BLOCK - block_number) * 13;
 }
 
-/// Exact block timestamp from the engine's `timestamps.bin` when the context
-/// carries a reader and the block is covered, else the `blockTimestamp`
-/// approximation. Comptime-guarded so counter-shaped test contexts (which have
-/// no `_timestamps` field) compile straight to the formula path.
+/// Exact block timestamp from `timestamps.bin` when the context carries a
+/// reader and the block is covered, else the `blockTimestamp` approximation.
+/// Comptime-guarded so contexts lacking a `_timestamps` field compile straight
+/// to the formula path.
 pub fn timestampOf(ctx: anytype, block_number: u64) u64 {
     const T = std.meta.Child(@TypeOf(ctx));
     if (comptime @hasField(T, "_timestamps")) {
@@ -85,10 +84,10 @@ test "timestampOf prefers the reader and falls back to the formula" {
     try std.testing.expectEqual(blockTimestamp(100), timestampOf(&counter, 100));
 }
 
-/// Zero-alloc fixed-point renderer for token amounts. Pair with a `decimals`
-/// pulled from `ctx.ethCall(u8, token, "decimals()")`. Trailing fractional
-/// zeros and the decimal point itself are omitted when redundant, so
-/// `amount(2_000…000, 18)` prints `"2"` rather than `"2.000000000000000000"`.
+/// Zero-alloc fixed-point renderer for token amounts. Pair `decimals` with
+/// `ctx.ethCall(u8, token, "decimals()")`. Redundant trailing fractional zeros
+/// and the decimal point are omitted, so `amount(2_000…000, 18)` prints `"2"`
+/// not `"2.000000000000000000"`.
 pub const Amount = struct {
     value: u256,
     decimals: u8,
@@ -105,8 +104,8 @@ pub const Amount = struct {
         try writer.print("{d}", .{integer_part});
         if (fractional_part == 0) return;
 
-        // Render fractional left-padded to `decimals` width, then trim
-        // trailing zeros. 78 digits covers u256.MAX (10^78 > 2^256).
+        // Fractional left-padded to `decimals` width, trailing zeros trimmed.
+        // 78 digits covers u256.MAX (10^78 > 2^256).
         var buf: [78]u8 = undefined;
         const slice = buf[0..self.decimals];
         var remainder = fractional_part;
