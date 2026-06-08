@@ -42,11 +42,17 @@ const ServeCtx = struct {
     reader: *const FlatStoreReader,
     ts: ?*const TimestampReader,
     allocator: std.mem.Allocator,
+    // Connections to serve before the thread returns. A factory backfill opens
+    // two (primary REGISTER, then children REGISTER).
+    conns: usize = 1,
 
     fn run(self: *ServeCtx) void {
-        const conn = self.server.accept() catch return;
-        defer conn.stream.close();
-        tcp_server.serveConnection(conn.stream, self.reader, self.ts, self.allocator) catch {};
+        var n: usize = 0;
+        while (n < self.conns) : (n += 1) {
+            const conn = self.server.accept() catch return;
+            defer conn.stream.close();
+            tcp_server.serveConnection(conn.stream, self.reader, self.ts, self.allocator) catch {};
+        }
     }
 };
 
@@ -204,4 +210,111 @@ test "remote init produces the same entity state as a local init" {
         try std.testing.expectEqual(l.block, r.block);
         try std.testing.expectEqual(l.ts, r.ts);
     }
+}
+
+// ── Factory streaming ──────────────────────────────────────────────────────
+
+const Create = struct {
+    pub const signature = "Create(address child)";
+};
+const Ping = struct {
+    pub const signature = "Ping(uint256)";
+};
+const FACTORY_ADDR: [20]u8 = [_]u8{0xF0} ** 20;
+const CHILD_ADDR: [20]u8 = [_]u8{0xC1} ** 20;
+
+const FactoryManifest: sdk_manifest.Manifest = .{
+    .name = "factory",
+    .chain_id = 1,
+    .start_block = 0,
+    .factories = &.{.{
+        .name = "F",
+        .address = FACTORY_ADDR,
+        .create_event = Create,
+        .spawn_param = "child",
+        .child_events = &.{Ping},
+    }},
+};
+
+// One immutable record per child Ping, to compare local vs remote factory backfill.
+const PingHit = struct {
+    pub const storage: sdk.StorageMode = .immutable;
+    id: [16]u8,
+    block: u64,
+};
+
+const FacHandler = struct {
+    pub fn handleCreate(log: sdk.handler.Log(Create), ctx: anytype) !void {
+        _ = log;
+        _ = ctx;
+    }
+    pub fn handlePing(log: sdk.handler.Log(Ping), ctx: anytype) !void {
+        try ctx.stores.pingHits.save(.{ .id = log.eventId(), .block = ctx.block_number });
+    }
+};
+
+test "remote factory backfill discovers children and matches a local build" {
+    const allocator = std.testing.allocator;
+
+    // Block 200: factory creation, child address in the non-indexed data word.
+    // Block 201: the created child emits Ping. Only the child pass should catch it.
+    var child_word: [32]u8 = [_]u8{0} ** 32;
+    @memcpy(child_word[12..], &CHILD_ADDR);
+    const blocks = [_]TestBlock{
+        .{ .block_number = 200, .timestamp = 1_700_000_000, .logs = &.{.{ .address = FACTORY_ADDR, .topic0 = sdk_manifest.eventTopic0(Create), .data = &child_word }} },
+        .{ .block_number = 201, .timestamp = 1_700_000_012, .logs = &.{.{ .address = CHILD_ADDR, .topic0 = sdk_manifest.eventTopic0(Ping) }} },
+    };
+
+    var src = std.testing.tmpDir(.{});
+    defer src.cleanup();
+    try writeTestStore(src.dir, &blocks, allocator);
+    var src_path: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try src.dir.realpath(".", &src_path);
+
+    // Local factory build (build + scanCreations + appendChildren + replay).
+    var local_data = std.testing.tmpDir(.{});
+    defer local_data.cleanup();
+    var ld: [std.fs.max_path_bytes]u8 = undefined;
+    const local_ctx = try sdk.entry.init(FactoryManifest, FacHandler, .{PingHit}, .{
+        .engine_data_dir = path,
+        .data_dir = try local_data.dir.realpath(".", &ld),
+    }, allocator);
+    defer local_ctx.deinit();
+
+    // Remote: two REGISTERs (primary, then the discovered children).
+    var reader = try FlatStoreReader.open(path);
+    defer reader.deinit();
+    var ts_reader = try TimestampReader.open(src.dir);
+    defer if (ts_reader) |*r| r.deinit();
+    const ts_ptr: ?*const TimestampReader = if (ts_reader) |*r| r else null;
+
+    var server = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+    var sctx = ServeCtx{ .server = &server, .reader = &reader, .ts = ts_ptr, .allocator = allocator, .conns = 2 };
+    const th = try std.Thread.spawn(.{}, ServeCtx.run, .{&sctx});
+
+    var remote_data = std.testing.tmpDir(.{});
+    defer remote_data.cleanup();
+    var rd: [std.fs.max_path_bytes]u8 = undefined;
+    const remote_ctx = try sdk.entry.init(FactoryManifest, FacHandler, .{PingHit}, .{
+        .engine_data_dir = path,
+        .data_dir = try remote_data.dir.realpath(".", &rd),
+        .remote_engine = .{ .host = "127.0.0.1", .port = port },
+    }, allocator);
+    defer remote_ctx.deinit();
+    th.join();
+
+    // The child was discovered remotely and its Ping dispatched, same as local.
+    try std.testing.expectEqual(@as(u32, 1), remote_ctx.stats.discovered_children);
+    try std.testing.expectEqual(local_ctx.count(PingHit), remote_ctx.count(PingHit));
+    try std.testing.expectEqual(@as(u64, 1), remote_ctx.count(PingHit));
+
+    var lrec: [4]PingHit = undefined;
+    var rrec: [4]PingHit = undefined;
+    const ls = try local_ctx.range(PingHit, 0, &lrec);
+    const rs = try remote_ctx.range(PingHit, 0, &rrec);
+    try std.testing.expectEqual(ls.len, rs.len);
+    for (ls, rs) |l, r| try std.testing.expectEqual(l.block, r.block);
+    try std.testing.expectEqual(@as(u64, 201), rs[0].block);
 }
