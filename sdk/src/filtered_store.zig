@@ -62,7 +62,7 @@ pub const FilteredStore = struct {
         var idx_file = try core.flat_format.openOrCreateWithMagic(dir, idx_name, MAGIC_IDX);
         errdefer idx_file.close();
 
-        const dat_size = try dat_file.getEndPos();
+        const dat_file_size = try dat_file.getEndPos();
         const idx_size = try idx_file.getEndPos();
         const idx_body_size = idx_size - HEADER_SIZE;
 
@@ -71,26 +71,27 @@ pub const FilteredStore = struct {
             try idx_file.setEndPos(HEADER_SIZE + entry_count * ENTRY_SIZE);
         }
 
+        // Logical append position: the end of the last valid entry, or the
+        // header (dat magic occupies it, appends start after) when empty. Read
+        // the last entry once. Re-read only when a drop changes which is last.
+        var append_pos: u64 = HEADER_SIZE;
         if (entry_count > 0) {
-            const last = try readEntryAt(idx_file, entry_count - 1);
-            if (last.offset + last.length > dat_size) {
+            var last = try readEntryAt(idx_file, entry_count - 1);
+            if (last.offset + last.length > dat_file_size) {
                 // Last entry references bytes past the dat tail. Drop it.
                 // The next append overwrites any remaining dat orphan bytes.
                 entry_count -= 1;
                 try idx_file.setEndPos(HEADER_SIZE + entry_count * ENTRY_SIZE);
+                if (entry_count > 0) last = try readEntryAt(idx_file, entry_count - 1);
             }
+            if (entry_count > 0) append_pos = last.offset + last.length;
         }
 
         return .{
             .allocator = allocator,
             .dat_file = dat_file,
             .idx_file = idx_file,
-            .dat_size = if (entry_count == 0)
-                @as(u64, HEADER_SIZE) // dat magic occupies header bytes, appends start after
-            else blk: {
-                const last = try readEntryAt(idx_file, entry_count - 1);
-                break :blk last.offset + last.length;
-            },
+            .dat_size = append_pos,
             .entry_count = entry_count,
         };
     }
@@ -102,9 +103,8 @@ pub const FilteredStore = struct {
 
     /// Append `(block_number, timestamp, lz4_entry)`. Block numbers MUST be
     /// strictly increasing (mirrors the engine's flat-store monotonic
-    /// invariant). `timestamp` is the exact block time, or 0 when unknown.
-    /// Local builds pass 0 and the scanner falls back to `timestamps.bin`. The
-    /// remote client passes the PUSH timestamp so the store is self-timed.
+    /// invariant). `timestamp` is the exact block time, or 0 when unknown (see
+    /// `IndexEntry.timestamp`).
     pub fn appendEntry(
         self: *Self,
         block_number: u64,

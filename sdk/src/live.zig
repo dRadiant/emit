@@ -489,7 +489,7 @@ fn enter(ctx: anytype) void {
     }
 }
 
-inline fn setLiveBlock(ctx: anytype, block: u64) void {
+fn setLiveBlock(ctx: anytype, block: u64) void {
     const T = std.meta.Child(@TypeOf(ctx));
     if (comptime !@hasField(T, "stores")) return;
     const Stores = @FieldType(T, "stores");

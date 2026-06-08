@@ -82,6 +82,15 @@ fn writeEmptyEntry(slot: *Slot, serialize_buf: []u8) void {
     slot.log_count = 0;
 }
 
+/// Mark `slot` failed: write a canonical empty entry (so the dense index stays
+/// aligned), flag the error, and publish DONE. Both worker error paths (decode,
+/// compress) share this so the failure protocol has a single definition.
+fn failSlot(slot: *Slot, serialize_buf: []u8) void {
+    writeEmptyEntry(slot, serialize_buf);
+    slot.has_error = true;
+    slot.state.store(Slot.DONE, .release);
+}
+
 /// Worker: decode RLP receipts, build blooms, serialize, LZ4 compress.
 /// Stack scratch is safe under the `core.parallel` buffer rule, spawned
 /// with `WORKER_STACK_SIZE`.
@@ -97,12 +106,13 @@ fn workerFn(args: *WorkerArgs) void {
             if (slot.state.load(.acquire) != Slot.FILLED) continue;
 
             const log_count = receipt_decoder.decodeReceipts(
-                slot.block_number, slot.raw_value[0..slot.raw_len], &log_buf, &data_buf,
+                slot.block_number,
+                slot.raw_value[0..slot.raw_len],
+                &log_buf,
+                &data_buf,
             ) catch |e| {
                 std.debug.print("decode error block {d}: {}\n", .{ slot.block_number, e });
-                writeEmptyEntry(slot, &serialize_buf);
-                slot.has_error = true;
-                slot.state.store(Slot.DONE, .release);
+                failSlot(slot, &serialize_buf);
                 continue;
             };
 
@@ -116,9 +126,7 @@ fn workerFn(args: *WorkerArgs) void {
 
             slot.entry_len = log_serial.compressEntry(serialize_buf[0..serialized_len], &slot.entry) catch {
                 std.debug.print("compress error block {d}\n", .{slot.block_number});
-                writeEmptyEntry(slot, &serialize_buf);
-                slot.has_error = true;
-                slot.state.store(Slot.DONE, .release);
+                failSlot(slot, &serialize_buf);
                 continue;
             };
 
@@ -278,7 +286,14 @@ fn runHeaderTimestamps(
     const cf_opts = [1]?*const c.rocksdb_options_t{opts};
     var cf_handles: [1]?*c.rocksdb_column_family_handle_t = .{null};
     const db = c.rocksdb_open_for_read_only_column_families(
-        opts, headers_path, 1, &cf_names, &cf_opts, &cf_handles, 0, @ptrCast(&err),
+        opts,
+        headers_path,
+        1,
+        &cf_names,
+        &cf_opts,
+        &cf_handles,
+        0,
+        @ptrCast(&err),
     );
     try rocksErr(&err);
     if (db == null) return error.RocksDBError;
@@ -399,7 +414,14 @@ fn runInner(
     var cf_handles: [3]?*c.rocksdb_column_family_handle_t = .{ null, null, null };
 
     const db = c.rocksdb_open_for_read_only_column_families(
-        opts, receipts_path, 3, &cf_names, &cf_opts, &cf_handles, 0, @ptrCast(&err),
+        opts,
+        receipts_path,
+        3,
+        &cf_names,
+        &cf_opts,
+        &cf_handles,
+        0,
+        @ptrCast(&err),
     );
     try rocksErr(&err);
     if (db == null) return error.RocksDBError;
@@ -562,9 +584,8 @@ fn runInner(
         if (blocks_processed % 100_000 == 0) {
             const elapsed_s = @as(f64, @floatFromInt(std.time.nanoTimestamp() - t_start)) / 1e9;
             std.debug.print("  {d:>10} blocks | {d:>12} logs | {d:.1}s | {d:.0} blk/s | {d:.0} logs/s\n", .{
-                blocks_processed, total_logs, elapsed_s,
-                @as(f64, @floatFromInt(blocks_processed)) / elapsed_s,
-                @as(f64, @floatFromInt(total_logs)) / elapsed_s,
+                blocks_processed,                                      total_logs,                                      elapsed_s,
+                @as(f64, @floatFromInt(blocks_processed)) / elapsed_s, @as(f64, @floatFromInt(total_logs)) / elapsed_s,
             });
         }
     }

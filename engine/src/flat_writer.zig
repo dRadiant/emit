@@ -21,8 +21,16 @@ pub const FlatStoreWriter = struct {
     blocks_since_commit: usize,
 
     pub fn open(dir_path: []const u8) !FlatStoreWriter {
-        var dir = try std.fs.cwd().openDir(dir_path, .{});
+        const dir = try std.fs.cwd().openDir(dir_path, .{});
+        return initFromDir(dir);
+    }
 
+    /// Construct a writer against an already-open `dir`, restoring meta +
+    /// first_block and pre-initializing empty headers so a `FlatStoreReader`
+    /// can open the dir before the first block finalizes. The returned writer
+    /// references `dir`: `deinit` closes it (the `open(path)` owner), while a
+    /// test passing a borrowed handle closes only the files via `closeFiles`.
+    fn initFromDir(dir: std.fs.Dir) !FlatStoreWriter {
         const blocks_file = try dir.createFile("blocks.dat", .{ .truncate = false, .read = true });
         const index_file = try dir.createFile("blocks.idx", .{ .truncate = false, .read = true });
         const blooms_file = try dir.createFile("blooms.bin", .{ .truncate = false, .read = true });
@@ -169,10 +177,17 @@ pub const FlatStoreWriter = struct {
         try self.commitMeta();
     }
 
-    pub fn deinit(self: *FlatStoreWriter) void {
+    /// Close the three data files, leaving `dir` open. `deinit` adds the dir
+    /// close (the `open(path)` owner). Test helpers that borrow a tmpDir handle
+    /// call this directly so the handle stays valid for cleanup.
+    fn closeFiles(self: *FlatStoreWriter) void {
         self.blocks_file.close();
         self.index_file.close();
         self.blooms_file.close();
+    }
+
+    pub fn deinit(self: *FlatStoreWriter) void {
+        self.closeFiles();
         self.dir.close();
     }
 };
@@ -332,56 +347,15 @@ test "bloom scan finds written blocks" {
 
 // ── Test helpers ─────────────────────────────────────────────────────────
 
-/// Open a FlatStoreWriter against a dir handle. Does NOT own the dir.
-/// Use closeFilesOnly() instead of close() to keep the handle valid.
+/// Open a FlatStoreWriter against a borrowed dir handle (shares the production
+/// constructor). Does NOT own the dir. Pair with closeFilesOnly().
 fn openFromDir(dir: std.fs.Dir) FlatStoreWriter {
-    const blocks_file = dir.createFile("blocks.dat", .{ .truncate = false, .read = true }) catch unreachable;
-    const index_file = dir.createFile("blocks.idx", .{ .truncate = false, .read = true }) catch unreachable;
-    const blooms_file = dir.createFile("blooms.bin", .{ .truncate = false, .read = true }) catch unreachable;
-
-    var meta = Meta{
-        .last_finalized_block = 0,
-        .blocks_dat_size = 0,
-        .blocks_idx_count = 0,
-        .blooms_count = 0,
-        .checksum = 0,
-    };
-    var first_block: u64 = 0;
-
-    if (dir.openFile("meta.bin", .{})) |meta_file| {
-        defer meta_file.close();
-        var buf: [flat_reader.META_SIZE]u8 = undefined;
-        const n = meta_file.pread(&buf, 0) catch 0;
-        if (n == flat_reader.META_SIZE) {
-            if (Meta.deserialize(&buf)) |m| meta = m;
-        }
-    } else |_| {}
-
-    {
-        var hdr: [flat_reader.INDEX_HEADER_SIZE]u8 = undefined;
-        const n = index_file.pread(&hdr, 0) catch 0;
-        if (n == flat_reader.INDEX_HEADER_SIZE) {
-            first_block = std.mem.readInt(u64, hdr[0..8], .little);
-        }
-    }
-
-    return .{
-        .blocks_file = blocks_file,
-        .index_file = index_file,
-        .blooms_file = blooms_file,
-        .dir = dir,
-        .meta = meta,
-        .first_block = first_block,
-        .commit_interval = core.types.COMMIT_INTERVAL,
-        .blocks_since_commit = 0,
-    };
+    return FlatStoreWriter.initFromDir(dir) catch unreachable;
 }
 
 /// Close file handles without closing the dir (owned by tmpDir).
 fn closeFilesOnly(writer: *FlatStoreWriter) void {
-    writer.blocks_file.close();
-    writer.index_file.close();
-    writer.blooms_file.close();
+    writer.closeFiles();
 }
 
 /// Open a core FlatStoreReader against a dir handle.
@@ -392,16 +366,24 @@ fn openReaderFromDir(dir: std.fs.Dir) core.FlatStoreReader {
     defer idx_file.close();
     const idx_size = (idx_file.stat() catch unreachable).size;
     const index_map = std.posix.mmap(
-        null, idx_size, std.posix.PROT.READ,
-        .{ .TYPE = .SHARED }, idx_file.handle, 0,
+        null,
+        idx_size,
+        std.posix.PROT.READ,
+        .{ .TYPE = .SHARED },
+        idx_file.handle,
+        0,
     ) catch unreachable;
 
     const blooms_file = dir.openFile("blooms.bin", .{}) catch unreachable;
     defer blooms_file.close();
     const blooms_size = (blooms_file.stat() catch unreachable).size;
     const blooms_map = std.posix.mmap(
-        null, blooms_size, std.posix.PROT.READ,
-        .{ .TYPE = .SHARED }, blooms_file.handle, 0,
+        null,
+        blooms_size,
+        std.posix.PROT.READ,
+        .{ .TYPE = .SHARED },
+        blooms_file.handle,
+        0,
     ) catch unreachable;
 
     return .{
