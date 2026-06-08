@@ -282,7 +282,7 @@ pub fn collectAllTopics(comptime m: sdk_manifest.Manifest) []const [32]u8 {
     }
 }
 
-fn collectChildTopics(comptime m: sdk_manifest.Manifest) []const [32]u8 {
+pub fn collectChildTopics(comptime m: sdk_manifest.Manifest) []const [32]u8 {
     comptime {
         var out: []const [32]u8 = &.{};
         for (m.factories) |f| {

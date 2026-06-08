@@ -479,13 +479,10 @@ pub fn init(
     const fp = comptime sdk_manifest.fingerprint(m);
 
     if (options.remote_engine) |re| {
-        // Remote streaming has no factory child pre-pass yet, so children would
-        // stay empty. Reject rather than silently drop child events.
-        if (comptime m.factories.len > 0) return error.RemoteFactoryUnsupported;
         // A manifest change invalidates the streamed store. Clear so the stream
         // restarts from cursor 0 instead of appending past a stale tail.
         if (!shouldSkipFilterBuild(filter_dh, allocator, fp)) try clearFilterFiles(filter_dh);
-        ctx.stats.filter_blocks_matched = try remoteBackfill(m, re, filter_dh, allocator);
+        try remoteBackfill(m, re, filter_dh, &ctx.stats, allocator);
         try writeFilterFingerprint(filter_dh, fp);
     } else if (shouldSkipFilterBuild(filter_dh, allocator, fp)) {
         ctx.stats.phases_skipped = true;
@@ -791,31 +788,78 @@ fn writeFilterFingerprint(filter_dh: std.fs.Dir, fp: [32]u8) !void {
     try core.atomic_file.write(filter_dh, "manifest.fingerprint.tmp", "manifest.fingerprint", &fp);
 }
 
-/// Stream the filtered backfill from the remote engine into the primary store.
-/// Returns the number of blocks written. The REGISTER cursor is the primary
-/// store's current tail, so a re-run extends it rather than restreaming.
-fn remoteBackfill(
-    comptime m: sdk_manifest.Manifest,
+/// Stream one filtered store from the remote engine. The REGISTER cursor is the
+/// store's current tail, so a re-run extends it rather than restreaming. Returns
+/// the number of blocks written.
+fn streamInto(
     re: RemoteEngine,
     filter_dh: std.fs.Dir,
+    comptime base: []const u8,
+    addresses: []const [20]u8,
+    topics: []const [32]u8,
+    exclude: []const [20]u8,
     allocator: std.mem.Allocator,
 ) !u64 {
-    var store = try filtered_store_mod.FilteredStore.open(allocator, filter_dh, filter_builder.BASE_PRIMARY);
+    var store = try filtered_store_mod.FilteredStore.open(allocator, filter_dh, base);
     defer store.deinit();
-
     const cursor = if (store.count() > 0)
         (try store.readEntry(store.count() - 1)).block_number
     else
         0;
-
-    const addrs = comptime filter_builder.collectKnownAddresses(m);
-    const topics = comptime filter_builder.collectAllTopics(m);
     const result = try tcp_client.backfill(re.host, re.port, .{
         .cursor = cursor,
-        .addresses = addrs,
+        .addresses = addresses,
         .topics = topics,
+        .exclude_addresses = exclude,
     }, &store, allocator);
     return result.blocks_received;
+}
+
+/// Remote analogue of the local build + scanCreations + appendChildren. Streams
+/// the primary, and for a factory manifest discovers children from the streamed
+/// creations and streams their events into the children store (excluding
+/// static∪factory, matching the local children filter). Populates `stats`.
+fn remoteBackfill(
+    comptime m: sdk_manifest.Manifest,
+    re: RemoteEngine,
+    filter_dh: std.fs.Dir,
+    stats: *RunStats,
+    allocator: std.mem.Allocator,
+) !void {
+    stats.filter_blocks_matched = try streamInto(
+        re,
+        filter_dh,
+        filter_builder.BASE_PRIMARY,
+        comptime filter_builder.collectKnownAddresses(m),
+        comptime filter_builder.collectAllTopics(m),
+        &.{},
+        allocator,
+    );
+
+    if (comptime m.factories.len > 0) {
+        const child_topics = comptime filter_builder.collectChildTopics(m);
+        var discovered = try scanner.scanCreations(filter_dh, m, allocator);
+        defer discovered.deinit();
+        stats.discovered_children = discovered.count();
+
+        if (discovered.count() > 0 and child_topics.len > 0) {
+            const child_addrs = try allocator.alloc([20]u8, discovered.count());
+            defer allocator.free(child_addrs);
+            var i: usize = 0;
+            var it = discovered.keyIterator();
+            while (it.next()) |a| : (i += 1) child_addrs[i] = a.*;
+
+            stats.children_blocks_matched = try streamInto(
+                re,
+                filter_dh,
+                filter_builder.BASE_CHILDREN,
+                child_addrs,
+                child_topics,
+                comptime filter_builder.collectKnownAddresses(m),
+                allocator,
+            );
+        }
+    }
 }
 
 /// Move `discovered` onto the heap and hand ownership to `ctx`. The set has
