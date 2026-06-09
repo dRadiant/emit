@@ -320,3 +320,122 @@ test "remote factory backfill discovers children and matches a local build" {
     for (ls, rs) |l, r| try std.testing.expectEqual(l.block, r.block);
     try std.testing.expectEqual(@as(u64, 201), rs[0].block);
 }
+
+// ── Live following ──────────────────────────────────────────────────────────
+
+const fake_engine = sdk.fake_engine;
+
+// A single fixed-key tally bumped per Transfer. A tip-inclusive read reflects
+// the backfilled block and any live-dispatched block in the overlay.
+const Counter = struct {
+    pub const storage: sdk.StorageMode = .mutable;
+    id: u64,
+    count: u64,
+};
+
+const CountHandler = struct {
+    pub fn handleTransfer(log: sdk.handler.Log(Transfer), ctx: anytype) !void {
+        _ = log;
+        var c = try ctx.stores.counters.loadOrInit(@as(u64, 0));
+        c.count += 1;
+        try ctx.stores.counters.save(c);
+    }
+};
+
+test "remote follow dispatches a live block injected after backfill" {
+    const allocator = std.testing.allocator;
+    const tt = sdk_manifest.eventTopic0(Transfer);
+
+    // One finalized block to backfill. The engine serves it from the flat store
+    // and live blocks from the pending ring, both in this dir.
+    const blocks = [_]TestBlock{
+        .{ .block_number = 100, .timestamp = 1_700_000_000, .logs = &.{.{ .address = ADDR_TOKEN, .topic0 = tt }} },
+    };
+    var src = std.testing.tmpDir(.{});
+    defer src.cleanup();
+    try writeTestStore(src.dir, &blocks, allocator);
+    var src_path: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try src.dir.realpath(".", &src_path);
+
+    var fake = fake_engine.FakeEngine.init(src.dir, allocator);
+    defer fake.deinit();
+
+    var reader = try FlatStoreReader.open(path);
+    defer reader.deinit();
+    var ts_reader = try TimestampReader.open(src.dir);
+    defer if (ts_reader) |*r| r.deinit();
+    const ts_ptr: ?*const TimestampReader = if (ts_reader) |*r| r else null;
+
+    var server = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+    // One-shot backfill connection, then the persistent follow. A short
+    // heartbeat lets the engine notice the client's disconnect promptly.
+    var sctx = ServeCtx{ .server = &server, .reader = &reader, .ts = ts_ptr, .allocator = allocator, .conns = 2, .data_dir = path, .heartbeat_ms = 100 };
+    const th = try std.Thread.spawn(.{}, ServeCtx.run, .{&sctx});
+    defer th.join();
+
+    var remote_data = std.testing.tmpDir(.{});
+    defer remote_data.cleanup();
+    var rd: [std.fs.max_path_bytes]u8 = undefined;
+    const ctx = try sdk.entry.spawn(TokenManifest, CountHandler, .{Counter}, .{
+        .engine_data_dir = path,
+        .data_dir = try remote_data.dir.realpath(".", &rd),
+        .remote_engine = .{ .host = "127.0.0.1", .port = port },
+    }, allocator);
+    // Runs first at scope exit: stops the follow thread and closes its socket,
+    // which unblocks the serve thread joined just after.
+    defer ctx.deinit();
+
+    // Backfill committed block 100.
+    {
+        const c = try ctx.read(Counter, @as(u64, 0));
+        try std.testing.expect(c != null);
+        try std.testing.expectEqual(@as(u64, 1), c.?.count);
+    }
+
+    // Inject a live block. The engine streams it, the follow loop dispatches it
+    // into the overlay, and a tip-inclusive read sees the second Transfer.
+    const live_log: core.RawLog = .{
+        .block_number = 101,
+        .tx_index = 0,
+        .log_index = 0,
+        .address = ADDR_TOKEN,
+        .topic_count = 1,
+        .topics = .{ tt, [_]u8{0} ** 32, [_]u8{0} ** 32, [_]u8{0} ** 32 },
+        .data = &.{},
+        .tx_hash = [_]u8{0xFE} ** 32,
+    };
+    try fake.ingest(101, [_]u8{0xBB} ** 32, &.{live_log});
+
+    var dispatched = false;
+    var waited: u64 = 0;
+    while (waited < 3000) : (waited += 20) {
+        const c = try ctx.read(Counter, @as(u64, 0));
+        if (c) |v| {
+            if (v.count == 2) {
+                dispatched = true;
+                break;
+            }
+        }
+        std.Thread.sleep(20 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(dispatched);
+}
+
+test "remote follow rejects factory manifests until live child registration lands" {
+    const allocator = std.testing.allocator;
+    var remote_data = std.testing.tmpDir(.{});
+    defer remote_data.cleanup();
+    var rd: [std.fs.max_path_bytes]u8 = undefined;
+
+    // Children discovered live need ADD_ADDRESS re-registration. The guard fires
+    // before any backfill, so no engine connection is attempted.
+    const r = sdk.entry.init(FactoryManifest, FacHandler, .{PingHit}, .{
+        .engine_data_dir = "/nonexistent",
+        .data_dir = try remote_data.dir.realpath(".", &rd),
+        .remote_engine = .{ .host = "127.0.0.1", .port = 1 },
+        .follow = true,
+    }, allocator);
+    try std.testing.expectError(error.RemoteFactoryFollowUnsupported, r);
+}

@@ -7,4 +7,5 @@ pub const filtered_store = @import("filtered_store.zig");
 pub const manifest = @import("manifest.zig");
 pub const entry = @import("entry.zig");
 pub const handler = @import("handler.zig");
+pub const fake_engine = @import("testing/fake_engine.zig");
 pub const StorageMode = @import("root.zig").StorageMode;

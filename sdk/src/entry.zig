@@ -405,8 +405,11 @@ pub fn init(
 ) !*Context(entities) {
     var timer = try std.time.Timer.start();
 
-    // The live loop reads the local pending ring, absent over a stream.
-    if (options.remote_engine != null and options.follow) return error.RemoteFollowUnsupported;
+    // Remote live following streams blocks instead of reading a local pending
+    // ring. Factory children discovered live need ADD_ADDRESS re-registration,
+    // a later step, so guard that combination rather than miss their events.
+    if (options.remote_engine != null and options.follow and m.factories.len > 0)
+        return error.RemoteFactoryFollowUnsupported;
 
     // Derive and mkdir the entity / filter / ethcall subdirs under `data_dir`.
     const entity_dir = try std.fs.path.join(allocator, &.{ options.data_dir, "entity" });
@@ -607,7 +610,9 @@ pub fn init(
     try ctx.commitCycle();
     ctx.stats.elapsed_ns = timer.read();
 
-    if (options.follow) {
+    // Remote follow handles the gap differently: the live REGISTER re-streams
+    // from the committed cursor, so the engine fills any advance during backfill.
+    if (options.follow and options.remote_engine == null) {
         // Gap fill. The engine may have advanced during backfill. Re-open
         // the reader so any flat-store entries added since the start of
         // init are visible (the original `reader` mmap was sized at open).
@@ -679,6 +684,18 @@ fn followLoop(
     ctx: anytype,
     options: Options,
 ) !void {
+    if (options.remote_engine) |re| {
+        return tcp_client.follow(
+            m,
+            Handler,
+            ctx,
+            re.host,
+            re.port,
+            comptime filter_builder.collectKnownAddresses(m),
+            comptime filter_builder.collectAllTopics(m),
+            ctx._allocator,
+        );
+    }
     if (options.node_rpc) |rpc_url| {
         var http = eth.http_transport.HttpTransport.init(ctx._allocator, rpc_url);
         var provider = eth.provider.Provider.init(ctx._allocator, &http);
