@@ -9,6 +9,7 @@ pub const bloom = @import("bloom.zig");
 pub const flat_reader = @import("flat_reader.zig");
 pub const block_filter = @import("block_filter.zig");
 pub const filter = @import("filter.zig");
+pub const head_watch = @import("head_watch.zig");
 pub const log_serial = @import("log_serial.zig");
 pub const io_pipeline = @import("io_pipeline.zig");
 pub const parallel = @import("parallel.zig");
@@ -32,6 +33,7 @@ test {
     _ = flat_reader;
     _ = block_filter;
     _ = filter;
+    _ = head_watch;
     _ = log_serial;
     _ = io_pipeline;
     _ = parallel;
