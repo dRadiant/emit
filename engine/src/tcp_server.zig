@@ -1,9 +1,11 @@
 /// Remote-engine TCP server. Streams server-side-filtered blocks to off-host
 /// indexers, removing the collocation requirement.
 ///
-/// Backfill only. A client sends one REGISTER (filter + cursor), the server
-/// replays every block in `(cursor, tip]` whose logs match as PUSH frames, then
-/// closes with GOAWAY. Accept loop serves one connection at a time.
+/// A client sends one REGISTER (filter, cursor, follow). The server replays
+/// every matching block in `(cursor, tip]` as PUSH frames. With follow=false it
+/// then closes with GOAWAY. With follow=true it stays open, watching pending.bin
+/// and streaming live blocks (plus REORG and HEARTBEAT) until the client
+/// disconnects. Accept loop serves one connection at a time.
 ///
 /// Stateless across connections: all subscription state rides in REGISTER, so a
 /// reconnect re-streams from the client's cursor. Filtered-entry bytes come from
@@ -19,6 +21,8 @@ const TimestampReader = core.TimestampReader;
 const log_serial = core.log_serial;
 const block_filter = core.block_filter;
 const types = core.types;
+const head_watch = core.head_watch;
+const Entry = core.pending_format.Entry;
 
 pub const Options = struct {
     data_dir: []const u8,
@@ -26,6 +30,13 @@ pub const Options = struct {
     /// Remote clients reach it through an SSH tunnel. `0.0.0.0` is opt-in.
     host: []const u8 = "127.0.0.1",
     port: u16,
+};
+
+/// Per-connection serving config. `data_dir` lets the live phase watch
+/// pending.bin. `heartbeat_ms` is the live-loop wait and heartbeat cadence.
+pub const ServeConfig = struct {
+    data_dir: []const u8,
+    heartbeat_ms: u32 = 30_000,
 };
 
 /// Open the flat store once (read-only, mmap'd, shared across connections) and
@@ -56,19 +67,21 @@ pub fn run(opts: Options) !void {
             continue;
         };
         defer conn.stream.close();
-        serveConnection(conn.stream, &reader, ts_ptr, alloc) catch |e| {
+        serveConnection(conn.stream, &reader, ts_ptr, .{ .data_dir = opts.data_dir }, alloc) catch |e| {
             std.debug.print("serve: connection ended: {s}\n", .{@errorName(e)});
         };
     }
 }
 
-/// Serve one client to completion: read REGISTER, stream the backfill, GOAWAY.
-/// `reader` is shared read-only. `ts_reader` supplies exact per-block times.
-/// Null means the client falls back to its own formula.
+/// Serve one client: read REGISTER, stream the backfill, then either GOAWAY
+/// (follow=false) or keep the connection open streaming live blocks
+/// (follow=true). `reader` is shared read-only. `ts_reader` supplies exact
+/// per-block times (null means the client falls back to its own formula).
 pub fn serveConnection(
     stream: std.net.Stream,
     reader: *const FlatStoreReader,
     ts_reader: ?*const TimestampReader,
+    cfg: ServeConfig,
     allocator: std.mem.Allocator,
 ) !void {
     const reg_payload = try readFrame(stream, .register, allocator);
@@ -85,7 +98,8 @@ pub fn serveConnection(
     }
 
     try streamBackfill(stream, reader, ts_reader, reg, allocator);
-    return sendGoaway(stream, .shutdown, "backfill complete", allocator);
+    if (!reg.follow) return sendGoaway(stream, .shutdown, "backfill complete", allocator);
+    try streamLive(stream, reg, tipOf(reader), cfg, allocator);
 }
 
 /// Bloom-scan `(cursor, tip]`, then PUSH every block whose logs match the
@@ -159,6 +173,106 @@ fn dedupAdjacent(list: *std.ArrayListUnmanaged(u64)) void {
         w += 1;
     }
     list.items.len = w;
+}
+
+// ── Live streaming ─────────────────────────────────────────────────────────
+
+/// After backfill, watch pending.bin and stream live blocks as they arrive.
+/// Each ring update is diffed: new blocks are filtered and PUSHed, a reorg
+/// emits REORG then re-streams the canonical tail, and every wake sends a
+/// HEARTBEAT carrying the tip and finality boundary. Returns when the client
+/// disconnects (a write fails) or the ring read errors.
+fn streamLive(
+    stream: std.net.Stream,
+    reg: tcp_frame.Register,
+    flat_tip: u64,
+    cfg: ServeConfig,
+    allocator: std.mem.Allocator,
+) !void {
+    var watcher = try head_watch.Watcher.init(cfg.data_dir);
+    defer watcher.deinit();
+    var prev = try head_watch.readPending(allocator, cfg.data_dir);
+    defer prev.deinit(allocator);
+
+    const filter: core.filter.Filter = .{
+        .match_addrs = reg.addresses,
+        .match_topics = reg.topics,
+        .exclude_addrs = reg.exclude_addresses,
+    };
+
+    const decompress_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
+    defer allocator.free(decompress_buf);
+    const serialize_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
+    defer allocator.free(serialize_buf);
+    const compress_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
+    defer allocator.free(compress_buf);
+
+    // Pending blocks above the backfill coverage (and the client's cursor)
+    // bridge the gap between the finalized tip and the live head. They may
+    // already be in the ring before the first wake, so stream them up front.
+    const live_start = @max(reg.cursor, flat_tip);
+    for (prev.entries) |e| {
+        if (e.block_number <= live_start) continue;
+        try filterAndPush(stream, e, filter, decompress_buf, serialize_buf, compress_buf);
+    }
+
+    while (true) {
+        try watcher.wait(cfg.heartbeat_ms);
+
+        var curr = try head_watch.readPending(allocator, cfg.data_dir);
+        var keep_curr = false;
+        defer if (!keep_curr) curr.deinit(allocator);
+
+        const last_finalized = try head_watch.readMeta(cfg.data_dir);
+        var classification = try head_watch.classifyChanges(allocator, prev.entries, curr.entries, last_finalized);
+        defer classification.deinit(allocator);
+
+        if (classification.reorg_from) |rf| {
+            try sendReorg(stream, rf);
+            // Re-stream the new canonical tail from the fork point.
+            for (curr.entries) |e| {
+                if (e.block_number < rf) continue;
+                try filterAndPush(stream, e, filter, decompress_buf, serialize_buf, compress_buf);
+            }
+        } else {
+            for (classification.new_blocks) |e| {
+                try filterAndPush(stream, e, filter, decompress_buf, serialize_buf, compress_buf);
+            }
+        }
+
+        const tip = if (curr.entries.len > 0) curr.entries[curr.entries.len - 1].block_number else last_finalized;
+        try sendHeartbeat(stream, tip, tip, last_finalized);
+
+        prev.deinit(allocator);
+        prev = curr;
+        keep_curr = true;
+    }
+}
+
+/// Decompress a pending block, filter to matching logs, PUSH when non-empty.
+/// A block with no matching log produces no frame.
+fn filterAndPush(
+    stream: std.net.Stream,
+    entry: Entry,
+    filter: core.filter.Filter,
+    decompress_buf: []u8,
+    serialize_buf: []u8,
+    compress_buf: []u8,
+) !void {
+    const decompressed = try log_serial.decompressEntry(entry.lz4_entry, decompress_buf);
+    const maybe = try core.filter.filterBlockEntry(decompressed, filter, serialize_buf, compress_buf);
+    const filtered = maybe orelse return;
+    try sendPush(stream, entry.block_number, entry.timestamp, filtered.entry);
+}
+
+fn sendReorg(stream: std.net.Stream, fork_point: u64) !void {
+    const payload = (tcp_frame.Reorg{ .fork_point = fork_point }).encode();
+    try writeFrame(stream, .reorg, &payload);
+}
+
+fn sendHeartbeat(stream: std.net.Stream, cursor: u64, tip: u64, last_finalized: u64) !void {
+    const payload = (tcp_frame.Heartbeat{ .cursor = cursor, .tip = tip, .last_finalized = last_finalized }).encode();
+    try writeFrame(stream, .heartbeat, &payload);
 }
 
 // ── Wire I/O ──────────────────────────────────────────────────────────────
@@ -241,11 +355,13 @@ const ServeCtx = struct {
     reader: *const FlatStoreReader,
     ts: ?*const TimestampReader,
     allocator: std.mem.Allocator,
+    data_dir: []const u8 = "",
+    heartbeat_ms: u32 = 30_000,
 
     fn accept(self: *ServeCtx) void {
         const conn = self.server.accept() catch return;
         defer conn.stream.close();
-        serveConnection(conn.stream, self.reader, self.ts, self.allocator) catch {};
+        serveConnection(conn.stream, self.reader, self.ts, .{ .data_dir = self.data_dir, .heartbeat_ms = self.heartbeat_ms }, self.allocator) catch {};
     }
 };
 
@@ -371,4 +487,102 @@ test "serve rejects an empty filter with GOAWAY" {
     th.join();
     try testing.expectEqual(tcp_frame.FrameType.goaway, f.type);
     try testing.expectEqual(tcp_frame.GoawayCode.shutdown, (try tcp_frame.Goaway.decode(f.payload)).code);
+}
+
+/// Atomic-write a single-block pending.bin (tmp + rename triggers the Watcher).
+fn writePendingBlock(dir: std.fs.Dir, block: u64, ts: u32, addr: [20]u8, topic: [32]u8, hash: [32]u8, allocator: std.mem.Allocator) !void {
+    const log: RawLog = .{
+        .block_number = block,
+        .tx_index = 0,
+        .log_index = 0,
+        .address = addr,
+        .topic_count = 1,
+        .topics = .{ topic, [_]u8{0} ** 32, [_]u8{0} ** 32, [_]u8{0} ** 32 },
+        .data = &.{},
+        .tx_hash = [_]u8{0xFE} ** 32,
+    };
+    var serialize_buf: [4096]u8 = undefined;
+    var compress_buf: [4096]u8 = undefined;
+    const written = log_serial.serializeLogs(&[_]RawLog{log}, &serialize_buf);
+    const entry_len = try log_serial.compressEntry(serialize_buf[0..written], &compress_buf);
+    const tb = log_serial.buildTopicBloom(&[_]RawLog{log});
+    const ab = log_serial.buildAddrBloom(&[_]RawLog{log});
+    const entry = core.pending_format.Entry{
+        .block_number = block,
+        .timestamp = ts,
+        .hash = hash,
+        .topic_bloom = tb.bits,
+        .addr_bloom = ab.bits,
+        .lz4_entry = compress_buf[0..entry_len],
+    };
+    const buf = try core.pending_format.serialize(allocator, &[_]core.pending_format.Entry{entry});
+    defer allocator.free(buf);
+    const tmp = try dir.createFile("pending.bin.tmp", .{});
+    try tmp.writeAll(buf);
+    tmp.close();
+    try dir.rename("pending.bin.tmp", "pending.bin");
+}
+
+test "serve follow streams a live block injected into pending.bin" {
+    const allocator = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Flat store with one matching block. Backfill streams it, then live.
+    const blocks = [_]TestBlock{
+        .{ .block_number = 100, .timestamp = 1_700_000_000, .logs = &.{.{ .address = ADDR_A, .topic0 = TOPIC_T }} },
+    };
+    try flat_reader.writeTestStore(tmp.dir, &blocks, allocator);
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpath(".", &path_buf);
+    var reader = try FlatStoreReader.open(path);
+    defer reader.deinit();
+    var ts_reader = try TimestampReader.open(tmp.dir);
+    defer if (ts_reader) |*r| r.deinit();
+    const ts_ptr: ?*const TimestampReader = if (ts_reader) |*r| r else null;
+
+    var server = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+
+    var ctx = ServeCtx{ .server = &server, .reader = &reader, .ts = ts_ptr, .allocator = allocator, .data_dir = path, .heartbeat_ms = 100 };
+    const th = try std.Thread.spawn(.{}, ServeCtx.accept, .{&ctx});
+
+    const client = try std.net.tcpConnectToAddress(try std.net.Address.parseIp("127.0.0.1", port));
+    // Closing the client ends the server's live loop. Close before join.
+    defer th.join();
+    defer client.close();
+
+    const reg = tcp_frame.Register{ .cursor = 0, .addresses = &.{ADDR_A}, .topics = &.{TOPIC_T}, .follow = true };
+    const reg_payload = try reg.encode(allocator);
+    defer allocator.free(reg_payload);
+    try writeFrame(client, .register, reg_payload);
+
+    // First PUSH is the backfilled block 100.
+    const f0 = try recvFrame(client, allocator);
+    defer allocator.free(f0.payload);
+    try testing.expectEqual(tcp_frame.FrameType.push, f0.type);
+    try testing.expectEqual(@as(u64, 100), (try tcp_frame.Push.decode(f0.payload)).block_number);
+
+    // Inject a live block. The Watcher wakes and the engine streams it.
+    try writePendingBlock(tmp.dir, 101, 1_700_000_012, ADDR_A, TOPIC_T, [_]u8{0xBB} ** 32, allocator);
+
+    // Read until the live PUSH for block 101 arrives (HEARTBEATs ignored).
+    var beats: u32 = 0;
+    while (true) {
+        const f = try recvFrame(client, allocator);
+        defer allocator.free(f.payload);
+        if (f.type == .heartbeat) {
+            beats += 1;
+            if (beats > 30) return error.NoLivePush;
+            continue;
+        }
+        try testing.expectEqual(tcp_frame.FrameType.push, f.type);
+        const p = try tcp_frame.Push.decode(f.payload);
+        try testing.expectEqual(@as(u64, 101), p.block_number);
+        try testing.expectEqual(@as(u32, 1_700_000_012), p.timestamp);
+        break;
+    }
 }

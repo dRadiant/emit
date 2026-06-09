@@ -51,7 +51,7 @@ pub fn parseHeader(buf: []const u8) Error!Header {
 // ── REGISTER (client → engine) ───────────────────────────────────────────────
 // version(u32 LE) ‖ token_len(u16 LE) ‖ token ‖ cursor(u64 LE)
 //   ‖ addr_count(u32 LE) ‖ addresses(20×N) ‖ topic_count(u32 LE) ‖ topics(32×M)
-//   ‖ exclude_count(u32 LE) ‖ exclude_addresses(20×K)
+//   ‖ exclude_count(u32 LE) ‖ exclude_addresses(20×K) ‖ follow(u8)
 // addresses/topics are the positive match sets. exclude_addresses is the
 // negative filter (children pass excludes static∪factory). One REGISTER maps to
 // one `core.filter.Filter`.
@@ -64,9 +64,12 @@ pub const Register = struct {
     addresses: []const [20]u8 = &.{}, // borrowed from the payload
     topics: []const [32]u8 = &.{}, // borrowed from the payload
     exclude_addresses: []const [20]u8 = &.{}, // borrowed from the payload
+    /// false: stream the backfill then GOAWAY. true: stream the backfill, then
+    /// keep the connection open and stream live blocks as they arrive.
+    follow: bool = false,
 
     pub fn encode(self: Register, alloc: std.mem.Allocator) ![]u8 {
-        const size = 4 + 2 + self.token.len + 8 + 4 + self.addresses.len * 20 + 4 + self.topics.len * 32 + 4 + self.exclude_addresses.len * 20;
+        const size = 4 + 2 + self.token.len + 8 + 4 + self.addresses.len * 20 + 4 + self.topics.len * 32 + 4 + self.exclude_addresses.len * 20 + 1;
         const buf = try alloc.alloc(u8, size);
         errdefer alloc.free(buf);
         var p: usize = 0;
@@ -96,6 +99,8 @@ pub const Register = struct {
             @memcpy(buf[p..][0..20], &a);
             p += 20;
         }
+        buf[p] = @intFromBool(self.follow);
+        p += 1;
         return buf;
     }
 
@@ -123,7 +128,10 @@ pub const Register = struct {
         p += 4;
         if (payload.len < p + exclude_bytes) return error.Truncated;
         const exclude_addresses = std.mem.bytesAsSlice([20]u8, payload[p .. p + exclude_bytes]);
-        return .{ .version = version, .token = token, .cursor = cursor, .addresses = addresses, .topics = topics, .exclude_addresses = exclude_addresses };
+        p += exclude_bytes;
+        // Trailing byte. Absent in a minimal/older payload, read as false.
+        const follow = p < payload.len and payload[p] != 0;
+        return .{ .version = version, .token = token, .cursor = cursor, .addresses = addresses, .topics = topics, .exclude_addresses = exclude_addresses, .follow = follow };
     }
 };
 
@@ -288,13 +296,14 @@ test "REGISTER round-trips addresses, topics, exclude, cursor" {
     const addrs = [_][20]u8{ [_]u8{0xAA} ** 20, [_]u8{0xBB} ** 20 };
     const tops = [_][32]u8{[_]u8{0xCC} ** 32};
     const excl = [_][20]u8{[_]u8{0xDD} ** 20};
-    const reg = Register{ .cursor = 18_600_000, .addresses = &addrs, .topics = &tops, .exclude_addresses = &excl };
+    const reg = Register{ .cursor = 18_600_000, .addresses = &addrs, .topics = &tops, .exclude_addresses = &excl, .follow = true };
 
     const payload = try reg.encode(testing.allocator);
     defer testing.allocator.free(payload);
 
     const got = try Register.decode(payload);
     try testing.expectEqual(PROTOCOL_VERSION, got.version);
+    try testing.expectEqual(true, got.follow);
     try testing.expectEqual(@as(u64, 18_600_000), got.cursor);
     try testing.expectEqual(@as(usize, 0), got.token.len);
     try testing.expectEqual(@as(usize, 2), got.addresses.len);

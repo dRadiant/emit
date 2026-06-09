@@ -45,13 +45,15 @@ const ServeCtx = struct {
     // Connections to serve before the thread returns. A factory backfill opens
     // two (primary REGISTER, then children REGISTER).
     conns: usize = 1,
+    data_dir: []const u8 = "",
+    heartbeat_ms: u32 = 30_000,
 
     fn run(self: *ServeCtx) void {
         var n: usize = 0;
         while (n < self.conns) : (n += 1) {
             const conn = self.server.accept() catch return;
             defer conn.stream.close();
-            tcp_server.serveConnection(conn.stream, self.reader, self.ts, self.allocator) catch {};
+            tcp_server.serveConnection(conn.stream, self.reader, self.ts, .{ .data_dir = self.data_dir, .heartbeat_ms = self.heartbeat_ms }, self.allocator) catch {};
         }
     }
 };
