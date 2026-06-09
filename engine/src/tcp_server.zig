@@ -130,6 +130,8 @@ pub fn serveConnection(
     cfg: ServeConfig,
     allocator: std.mem.Allocator,
 ) !void {
+    setNoDelay(stream);
+
     const reg_payload = try readFrame(stream, .register, allocator);
     defer allocator.free(reg_payload);
     const reg = try tcp_frame.Register.decode(reg_payload);
@@ -348,8 +350,13 @@ fn sendPush(stream: std.net.Stream, block_number: u64, timestamp: u32, entry: []
     var head: [tcp_frame.HEADER_SIZE + tcp_frame.Push.PREFIX]u8 = undefined;
     @memcpy(head[0..tcp_frame.HEADER_SIZE], &h);
     @memcpy(head[tcp_frame.HEADER_SIZE..], &pfx);
-    try stream.writeAll(&head);
-    try stream.writeAll(entry);
+    // One writev so the header and entry leave in a single syscall, and under
+    // NODELAY a single segment when they fit.
+    var iov = [_]std.posix.iovec_const{
+        .{ .base = &head, .len = head.len },
+        .{ .base = entry.ptr, .len = entry.len },
+    };
+    try stream.writevAll(&iov);
 }
 
 fn sendGoaway(stream: std.net.Stream, code: tcp_frame.GoawayCode, reason: []const u8, allocator: std.mem.Allocator) !void {
@@ -358,11 +365,22 @@ fn sendGoaway(stream: std.net.Stream, code: tcp_frame.GoawayCode, reason: []cons
     try writeFrame(stream, .goaway, payload);
 }
 
-/// Write a framed message: 5-byte header then payload.
+/// Write a framed message: 5-byte header then payload, in one writev.
 fn writeFrame(stream: std.net.Stream, t: tcp_frame.FrameType, payload: []const u8) !void {
     const h = tcp_frame.header(t, @intCast(payload.len));
-    try stream.writeAll(&h);
-    if (payload.len > 0) try stream.writeAll(payload);
+    if (payload.len == 0) return stream.writeAll(&h);
+    var iov = [_]std.posix.iovec_const{
+        .{ .base = &h, .len = h.len },
+        .{ .base = payload.ptr, .len = payload.len },
+    };
+    try stream.writevAll(&iov);
+}
+
+/// Disable Nagle so small frames (PUSH, HEARTBEAT) flush immediately rather than
+/// coalescing under a delay. Best-effort, a missing option is not fatal.
+fn setNoDelay(stream: std.net.Stream) void {
+    const one: c_int = 1;
+    std.posix.setsockopt(stream.handle, std.posix.IPPROTO.TCP, std.os.linux.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
 }
 
 /// Read one frame whose type must be `expect`. Returns the owned payload.

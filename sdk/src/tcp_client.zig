@@ -172,6 +172,7 @@ fn followOnce(
     const stream = try std.net.tcpConnectToHost(allocator, host, port);
     defer stream.close();
     try setRecvTimeout(stream, FOLLOW_RECV_TIMEOUT_MS);
+    setNoDelay(stream);
 
     live.lockCtx(ctx);
     live.discardAllOverlays(ctx);
@@ -361,6 +362,12 @@ fn readExact(stream: std.net.Stream, buf: []u8) !void {
 fn setRecvTimeout(stream: std.net.Stream, ms: i64) !void {
     const tv = std.posix.timeval{ .sec = @intCast(@divTrunc(ms, 1000)), .usec = @intCast(@mod(ms, 1000) * 1000) };
     try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+}
+
+/// Disable Nagle so an ADD_ADDRESS flushes without coalescing delay. Best-effort.
+fn setNoDelay(stream: std.net.Stream) void {
+    const one: c_int = 1;
+    std.posix.setsockopt(stream.handle, std.posix.IPPROTO.TCP, std.os.linux.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
 }
 
 /// Fill `buf`, distinguishing an idle timeout from a closed peer. `.timed_out`
