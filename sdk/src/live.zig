@@ -268,7 +268,7 @@ const LiveSession = struct {
 /// `_last_dispatched_block`, then `commitCycle` so the cursor + every
 /// store flushes via one `state.snap` rename. A crash mid-promotion rolls
 /// the whole batch back. Counter-shaped tests without `stores` skip.
-fn promoteFinalized(ctx: anytype, finalized: []const u64) !void {
+pub fn promoteFinalized(ctx: anytype, finalized: []const u64) !void {
     if (finalized.len == 0) return;
     const T = std.meta.Child(@TypeOf(ctx));
     if (comptime !@hasField(T, "stores")) return;
@@ -309,7 +309,7 @@ pub fn run(
 
 /// `deinit` sets `_stop`. The loop exits within one `tick`. Test contexts have
 /// no `_stop` field and never stop here.
-fn stopRequested(ctx: anytype) bool {
+pub fn stopRequested(ctx: anytype) bool {
     const T = std.meta.Child(@TypeOf(ctx));
     if (comptime @hasField(T, "_stop")) return ctx._stop.load(.seq_cst);
     return false;
@@ -317,11 +317,11 @@ fn stopRequested(ctx: anytype) bool {
 
 /// Guards a `tick`'s mutations against API readers. No-op for test contexts
 /// without a `_lock` field.
-fn lockCtx(ctx: anytype) void {
+pub fn lockCtx(ctx: anytype) void {
     const T = std.meta.Child(@TypeOf(ctx));
     if (comptime @hasField(T, "_lock")) ctx._lock.lock();
 }
-fn unlockCtx(ctx: anytype) void {
+pub fn unlockCtx(ctx: anytype) void {
     const T = std.meta.Child(@TypeOf(ctx));
     if (comptime @hasField(T, "_lock")) ctx._lock.unlock();
 }
@@ -331,7 +331,7 @@ fn unlockCtx(ctx: anytype) void {
 /// the only path that drains overlay state into the cache/append queue
 /// for the next `state.snap` commit. Counter-shaped test contexts without
 /// a `stores` field are skipped.
-fn enter(ctx: anytype) void {
+pub fn enter(ctx: anytype) void {
     const T = std.meta.Child(@TypeOf(ctx));
     if (comptime !@hasField(T, "stores")) return;
     const Stores = @FieldType(T, "stores");
@@ -340,7 +340,7 @@ fn enter(ctx: anytype) void {
     }
 }
 
-fn setLiveBlock(ctx: anytype, block: u64) void {
+pub fn setLiveBlock(ctx: anytype, block: u64) void {
     const T = std.meta.Child(@TypeOf(ctx));
     if (comptime !@hasField(T, "stores")) return;
     const Stores = @FieldType(T, "stores");
@@ -349,7 +349,7 @@ fn setLiveBlock(ctx: anytype, block: u64) void {
     }
 }
 
-fn discardAllOverlays(ctx: anytype) void {
+pub fn discardAllOverlays(ctx: anytype) void {
     const T = std.meta.Child(@TypeOf(ctx));
     if (comptime !@hasField(T, "stores")) return;
     const Stores = @FieldType(T, "stores");
