@@ -5,7 +5,7 @@
 /// every matching block in `(cursor, tip]` as PUSH frames. With follow=false it
 /// then closes with GOAWAY. With follow=true it stays open, watching pending.bin
 /// and streaming live blocks (plus REORG and HEARTBEAT) until the client
-/// disconnects. Accept loop serves one connection at a time.
+/// disconnects. A bounded worker pool serves connections concurrently.
 ///
 /// Stateless across connections: all subscription state rides in REGISTER, so a
 /// reconnect re-streams from the client's cursor. Filtered-entry bytes come from
@@ -30,6 +30,10 @@ pub const Options = struct {
     /// Remote clients reach it through an SSH tunnel. `0.0.0.0` is opt-in.
     host: []const u8 = "127.0.0.1",
     port: u16,
+    /// Worker threads, each serving one connection at a time. A follow holds
+    /// its worker until the client disconnects, so this caps concurrent
+    /// indexers. Further clients wait in the listen backlog.
+    max_connections: u32 = 16,
 };
 
 /// Per-connection serving config. `data_dir` lets the live phase watch
@@ -39,8 +43,24 @@ pub const ServeConfig = struct {
     heartbeat_ms: u32 = 30_000,
 };
 
+/// Accept timeout. Bounds how long a worker blocks in `accept` before it
+/// re-checks the stop flag, so the pool shuts down promptly. The daemon never
+/// stops, so this just wakes idle workers harmlessly.
+const ACCEPT_POLL_MS: i64 = 250;
+
+/// Shared, read-only context every worker serves from. The reader and timestamp
+/// store are mmaps, safe for concurrent preads. `stop` ends the pool.
+const WorkerCtx = struct {
+    server: *std.net.Server,
+    reader: *const FlatStoreReader,
+    ts: ?*const TimestampReader,
+    cfg: ServeConfig,
+    alloc: std.mem.Allocator,
+    stop: *std.atomic.Value(bool),
+};
+
 /// Open the flat store once (read-only, mmap'd, shared across connections) and
-/// serve forever. Accept loop is single-threaded.
+/// serve forever from a bounded pool of `max_connections` worker threads.
 pub fn run(opts: Options) !void {
     const alloc = std.heap.page_allocator;
 
@@ -56,21 +76,48 @@ pub fn run(opts: Options) !void {
     const address = try std.net.Address.parseIp(opts.host, opts.port);
     var server = try address.listen(.{ .reuse_address = true });
     defer server.deinit();
+    try setAcceptTimeout(server, ACCEPT_POLL_MS);
     std.debug.print(
-        "emit-engine serve: listening on {s}:{d} (data-dir {s}, tip {d})\n",
-        .{ opts.host, server.listen_address.getPort(), opts.data_dir, tipOf(&reader) },
+        "emit-engine serve: listening on {s}:{d} ({d} workers, data-dir {s}, tip {d})\n",
+        .{ opts.host, server.listen_address.getPort(), opts.max_connections, opts.data_dir, tipOf(&reader) },
     );
 
-    while (true) {
-        const conn = server.accept() catch |e| {
+    var stop = std.atomic.Value(bool).init(false);
+    const ctx = WorkerCtx{ .server = &server, .reader = &reader, .ts = ts_ptr, .cfg = .{ .data_dir = opts.data_dir }, .alloc = alloc, .stop = &stop };
+
+    const workers = try alloc.alloc(std.Thread, opts.max_connections);
+    defer alloc.free(workers);
+    var spawned: usize = 0;
+    errdefer {
+        stop.store(true, .release);
+        for (workers[0..spawned]) |w| w.join();
+    }
+    while (spawned < workers.len) : (spawned += 1) {
+        workers[spawned] = try std.Thread.spawn(.{}, acceptLoop, .{ctx});
+    }
+    for (workers) |w| w.join();
+}
+
+/// One worker: accept and fully serve connections until `stop` is set. The
+/// accept timeout surfaces as `error.WouldBlock`, the cue to re-check stop.
+fn acceptLoop(ctx: WorkerCtx) void {
+    while (!ctx.stop.load(.acquire)) {
+        const conn = ctx.server.accept() catch |e| {
+            if (e == error.WouldBlock) continue;
             std.debug.print("serve: accept failed: {s}\n", .{@errorName(e)});
             continue;
         };
         defer conn.stream.close();
-        serveConnection(conn.stream, &reader, ts_ptr, .{ .data_dir = opts.data_dir }, alloc) catch |e| {
+        serveConnection(conn.stream, ctx.reader, ctx.ts, ctx.cfg, ctx.alloc) catch |e| {
             std.debug.print("serve: connection ended: {s}\n", .{@errorName(e)});
         };
     }
+}
+
+/// Bound `accept` so workers periodically re-check the stop flag.
+fn setAcceptTimeout(server: std.net.Server, ms: i64) !void {
+    const tv = std.posix.timeval{ .sec = @intCast(@divTrunc(ms, 1000)), .usec = @intCast(@mod(ms, 1000) * 1000) };
+    try std.posix.setsockopt(server.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
 }
 
 /// Serve one client: read REGISTER, stream the backfill, then either GOAWAY
@@ -737,4 +784,57 @@ test "serve follow adds a child via ADD_ADDRESS and re-streams its block" {
             else => return error.UnexpectedFrame,
         }
     }
+}
+
+test "the worker pool serves concurrent follow connections" {
+    const allocator = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const blocks = [_]TestBlock{
+        .{ .block_number = 100, .timestamp = 1_700_000_000, .logs = &.{.{ .address = ADDR_A, .topic0 = TOPIC_T }} },
+    };
+    try flat_reader.writeTestStore(tmp.dir, &blocks, allocator);
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpath(".", &path_buf);
+    var reader = try FlatStoreReader.open(path);
+    defer reader.deinit();
+    var ts_reader = try TimestampReader.open(tmp.dir);
+    defer if (ts_reader) |*r| r.deinit();
+    const ts_ptr: ?*const TimestampReader = if (ts_reader) |*r| r else null;
+
+    var server = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+    try setAcceptTimeout(server, ACCEPT_POLL_MS);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const wctx = WorkerCtx{ .server = &server, .reader = &reader, .ts = ts_ptr, .cfg = .{ .data_dir = path, .heartbeat_ms = 100 }, .alloc = allocator, .stop = &stop };
+
+    // Two workers. A single-worker pool would block the second follow forever.
+    var w0 = try std.Thread.spawn(.{}, acceptLoop, .{wctx});
+    var w1 = try std.Thread.spawn(.{}, acceptLoop, .{wctx});
+    defer {
+        w0.join();
+        w1.join();
+    }
+    defer stop.store(true, .release);
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", port);
+    const c0 = try std.net.tcpConnectToAddress(addr);
+    defer c0.close();
+    const c1 = try std.net.tcpConnectToAddress(addr);
+    defer c1.close();
+
+    const reg = tcp_frame.Register{ .cursor = 0, .addresses = &.{ADDR_A}, .topics = &.{TOPIC_T}, .follow = true };
+    const reg_payload = try reg.encode(allocator);
+    defer allocator.free(reg_payload);
+    try writeFrame(c0, .register, reg_payload);
+    try writeFrame(c1, .register, reg_payload);
+
+    // Both follows are live at once, so both receive their backfill PUSH(100).
+    try expectLivePush(c0, allocator, 100, 1);
+    try expectLivePush(c1, allocator, 100, 1);
 }

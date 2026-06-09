@@ -46,6 +46,7 @@ pub fn main() !void {
             .data_dir = data_dir,
             .host = listen[0..colon],
             .port = try std.fmt.parseInt(u16, listen[colon + 1 ..], 10),
+            .max_connections = if (getFlag(args, "--max-connections")) |mc| try std.fmt.parseInt(u32, mc, 10) else 16,
         });
     }
 
@@ -135,8 +136,8 @@ fn usage() void {
         \\                                              Import via eth_getLogs (+ timestamps)
         \\  follow --rpc <url> [--ws <url>] --data-dir <path> [--catch-up-rpc]
         \\                                              Follow chain head
-        \\  serve [--listen <host:port>] --data-dir <path>
-        \\                                              Stream filtered blocks to remote indexers (default 127.0.0.1:9090)
+        \\  serve [--listen <host:port>] [--max-connections <n>] --data-dir <path>
+        \\                                              Stream filtered blocks to remote indexers (default 127.0.0.1:9090, 16 workers)
         \\  status --data-dir <path>                    Print store status
         \\
     , .{});
