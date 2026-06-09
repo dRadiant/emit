@@ -178,14 +178,25 @@ fn followOnce(
     live.unlockCtx(ctx);
     live_blocks.clearRetainingCapacity();
 
+    // Register the static match set plus every child discovered so far, so a
+    // reconnect keeps following children found during backfill or a prior
+    // session. Children found live are added mid-stream via ADD_ADDRESS.
+    var reg_addrs: std.ArrayListUnmanaged([20]u8) = .{};
+    defer reg_addrs.deinit(allocator);
+    try reg_addrs.appendSlice(allocator, addresses);
+    try appendChildAddresses(ctx, &reg_addrs, allocator);
+
     const reg_payload = try (tcp_frame.Register{
         .cursor = ctx._last_dispatched_block,
-        .addresses = addresses,
+        .addresses = reg_addrs.items,
         .topics = topics,
         .follow = true,
     }).encode(allocator);
     defer allocator.free(reg_payload);
     try writeFrame(stream, .register, reg_payload);
+
+    var new_children: std.ArrayListUnmanaged([20]u8) = .{};
+    defer new_children.deinit(allocator);
 
     var hdr: [tcp_frame.HEADER_SIZE]u8 = undefined;
     while (!live.stopRequested(ctx)) {
@@ -203,8 +214,12 @@ fn followOnce(
                 const p = try tcp_frame.Push.decode(payload_buf.*[0..h.len]);
                 live.lockCtx(ctx);
                 defer live.unlockCtx(ctx);
-                try dispatchPush(m, Handler, ctx, p, decompress_buf, log_buf);
+                new_children.clearRetainingCapacity();
+                try dispatchPush(m, Handler, ctx, p, decompress_buf, log_buf, &new_children, allocator);
                 try live_blocks.append(allocator, p.block_number);
+                // Register children spawned this block. The engine mini-backfills
+                // [block, tip] for each, catching their same-block events.
+                for (new_children.items) |child| try sendAddAddress(stream, child, p.block_number);
             },
             .heartbeat => {
                 const hb = try tcp_frame.Heartbeat.decode(payload_buf.*[0..h.len]);
@@ -248,16 +263,64 @@ fn dispatchPush(
     p: tcp_frame.Push,
     decompress_buf: []u8,
     log_buf: []core.RawLog,
+    new_children: *std.ArrayListUnmanaged([20]u8),
+    allocator: std.mem.Allocator,
 ) !void {
     const decoded = try core.log_serial.decompressEntry(p.lz4_entry, decompress_buf);
     const log_count = core.log_serial.deserializeLogs(decoded, log_buf);
     for (log_buf[0..log_count]) |*log| log.block_number = p.block_number;
+
+    // Factory children spawned in this block. Their same-block events were
+    // filtered out (the child wasn't registered yet), so the caller mini-
+    // backfills via ADD_ADDRESS.
+    if (comptime m.factories.len > 0) try discoverNewChildren(m, ctx, log_buf[0..log_count], new_children, allocator);
 
     live.setLiveBlock(ctx, p.block_number);
     ctx.block_number = p.block_number;
     ctx.timestamp = if (p.timestamp != 0) @as(u64, p.timestamp) else humanize.timestampOf(ctx, p.block_number);
 
     for (log_buf[0..log_count]) |log| try handler_mod.dispatchLog(m, Handler, ctx, log);
+}
+
+/// Append every runtime-discovered child address to `out`. No-op for a ctx
+/// with no child set (non-factory manifests, counter-shaped tests).
+fn appendChildAddresses(ctx: anytype, out: *std.ArrayListUnmanaged([20]u8), allocator: std.mem.Allocator) !void {
+    const T = std.meta.Child(@TypeOf(ctx));
+    if (comptime !@hasField(T, "_child_addresses")) return;
+    const set = ctx._child_addresses orelse return;
+    var it = set.keyIterator();
+    while (it.next()) |a| try out.append(allocator, a.*);
+}
+
+/// Add children spawned by create-events in `logs` to the runtime set,
+/// reporting the ones not seen before. Mirrors the local loop's discovery, but
+/// surfaces new entries so the caller can ADD_ADDRESS them mid-stream.
+fn discoverNewChildren(
+    comptime m: sdk_manifest.Manifest,
+    ctx: anytype,
+    logs: []const core.RawLog,
+    new_children: *std.ArrayListUnmanaged([20]u8),
+    allocator: std.mem.Allocator,
+) !void {
+    const T = std.meta.Child(@TypeOf(ctx));
+    if (comptime !@hasField(T, "_child_addresses")) return;
+    const set = ctx._child_addresses orelse return;
+    for (logs) |log| {
+        if (log.topic_count == 0) continue;
+        inline for (m.factories) |f| {
+            const create_topic = comptime sdk_manifest.eventTopic0(f.create_event);
+            if (std.mem.eql(u8, &log.address, &f.address) and std.mem.eql(u8, &log.topics[0], &create_topic)) {
+                const addr = sdk_manifest.extractFactoryAddress(f, &log.topics, log.data);
+                const gop = try set.getOrPut(addr);
+                if (!gop.found_existing) try new_children.append(allocator, addr);
+            }
+        }
+    }
+}
+
+fn sendAddAddress(stream: std.net.Stream, address: [20]u8, from_block: u64) !void {
+    const payload = (tcp_frame.AddAddress{ .address = address, .from_block = from_block }).encode();
+    try writeFrame(stream, .add_address, &payload);
 }
 
 /// Commit the overlay blocks at or below `last_finalized`, then drop them from

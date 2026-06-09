@@ -282,6 +282,20 @@ pub fn collectAllTopics(comptime m: sdk_manifest.Manifest) []const [32]u8 {
     }
 }
 
+/// Every topic a live follow must match: contract events, factory create
+/// events, and child events. `collectAllTopics` omits child topics (the
+/// backfill streams children in a separate pass), but a single follow
+/// connection carries both, so children registered via ADD_ADDRESS match.
+pub fn collectFollowTopics(comptime m: sdk_manifest.Manifest) []const [32]u8 {
+    comptime {
+        var out: []const [32]u8 = collectAllTopics(m);
+        for (collectChildTopics(m)) |t| {
+            if (!core.filter.containsTopic(out, &t)) out = out ++ &[_][32]u8{t};
+        }
+        return out;
+    }
+}
+
 pub fn collectChildTopics(comptime m: sdk_manifest.Manifest) []const [32]u8 {
     comptime {
         var out: []const [32]u8 = &.{};

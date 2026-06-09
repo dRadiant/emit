@@ -477,19 +477,101 @@ test "remote follow rolls back a reorged live block and applies the canonical on
     try std.testing.expect(try waitForCount(ctx, 3));
 }
 
-test "remote follow rejects factory manifests until live child registration lands" {
+const CHILD2_ADDR: [20]u8 = [_]u8{0xC2} ** 20;
+
+const FacCountHandler = struct {
+    pub fn handleCreate(log: sdk.handler.Log(Create), ctx: anytype) !void {
+        _ = log;
+        _ = ctx;
+    }
+    pub fn handlePing(log: sdk.handler.Log(Ping), ctx: anytype) !void {
+        _ = log;
+        var c = try ctx.stores.counters.loadOrInit(@as(u64, 0));
+        c.count += 1;
+        try ctx.stores.counters.save(c);
+    }
+};
+
+fn createLog(block: u64, child: [20]u8, word: *[32]u8) core.RawLog {
+    @memset(word, 0);
+    @memcpy(word[12..], &child);
+    return .{
+        .block_number = block,
+        .tx_index = 0,
+        .log_index = 0,
+        .address = FACTORY_ADDR,
+        .topic_count = 1,
+        .topics = .{ sdk_manifest.eventTopic0(Create), [_]u8{0} ** 32, [_]u8{0} ** 32, [_]u8{0} ** 32 },
+        .data = word,
+        .tx_hash = [_]u8{0xFE} ** 32,
+    };
+}
+
+fn pingLog(block: u64, log_index: u16, emitter: [20]u8) core.RawLog {
+    return .{
+        .block_number = block,
+        .tx_index = 0,
+        .log_index = log_index,
+        .address = emitter,
+        .topic_count = 1,
+        .topics = .{ sdk_manifest.eventTopic0(Ping), [_]u8{0} ** 32, [_]u8{0} ** 32, [_]u8{0} ** 32 },
+        .data = &.{},
+        .tx_hash = [_]u8{0xFE} ** 32,
+    };
+}
+
+test "remote follow tracks a backfilled child and registers a live-spawned one" {
     const allocator = std.testing.allocator;
+
+    // Block 100 spawns CHILD via the factory, so backfill discovers it.
+    var child_word: [32]u8 = undefined;
+    @memset(&child_word, 0);
+    @memcpy(child_word[12..], &CHILD_ADDR);
+    const blocks = [_]TestBlock{
+        .{ .block_number = 100, .timestamp = 1_700_000_000, .logs = &.{.{ .address = FACTORY_ADDR, .topic0 = sdk_manifest.eventTopic0(Create), .data = &child_word }} },
+    };
+    var src = std.testing.tmpDir(.{});
+    defer src.cleanup();
+    try writeTestStore(src.dir, &blocks, allocator);
+    var src_path: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try src.dir.realpath(".", &src_path);
+
+    var fake = fake_engine.FakeEngine.init(src.dir, allocator);
+    defer fake.deinit();
+
+    var reader = try FlatStoreReader.open(path);
+    defer reader.deinit();
+    var ts_reader = try TimestampReader.open(src.dir);
+    defer if (ts_reader) |*r| r.deinit();
+    const ts_ptr: ?*const TimestampReader = if (ts_reader) |*r| r else null;
+
+    var server = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+    // Backfill: primary + children REGISTERs. Then the persistent follow.
+    var sctx = ServeCtx{ .server = &server, .reader = &reader, .ts = ts_ptr, .allocator = allocator, .conns = 3, .data_dir = path, .heartbeat_ms = 100 };
+    const th = try std.Thread.spawn(.{}, ServeCtx.run, .{&sctx});
+    defer th.join();
+
     var remote_data = std.testing.tmpDir(.{});
     defer remote_data.cleanup();
     var rd: [std.fs.max_path_bytes]u8 = undefined;
-
-    // Children discovered live need ADD_ADDRESS re-registration. The guard fires
-    // before any backfill, so no engine connection is attempted.
-    const r = sdk.entry.init(FactoryManifest, FacHandler, .{PingHit}, .{
-        .engine_data_dir = "/nonexistent",
+    const ctx = try sdk.entry.spawn(FactoryManifest, FacCountHandler, .{Counter}, .{
+        .engine_data_dir = path,
         .data_dir = try remote_data.dir.realpath(".", &rd),
-        .remote_engine = .{ .host = "127.0.0.1", .port = 1 },
-        .follow = true,
+        .remote_engine = .{ .host = "127.0.0.1", .port = port },
     }, allocator);
-    try std.testing.expectError(error.RemoteFactoryFollowUnsupported, r);
+    defer ctx.deinit();
+
+    // The backfilled child CHILD emits live. It is in the follow REGISTER, so
+    // its Ping streams without an ADD_ADDRESS.
+    try fake.ingest(101, [_]u8{0xAA} ** 32, &.{pingLog(101, 0, CHILD_ADDR)});
+    try std.testing.expect(try waitForCount(ctx, 1));
+
+    // A new child CHILD2 is spawned live and emits in the same block. The client
+    // discovers it from the create-event, ADD_ADDRESSes it, and the engine
+    // mini-backfills the block so the same-block Ping is caught.
+    var word2: [32]u8 = undefined;
+    try fake.ingest(102, [_]u8{0xBB} ** 32, &.{ createLog(102, CHILD2_ADDR, &word2), pingLog(102, 1, CHILD2_ADDR) });
+    try std.testing.expect(try waitForCount(ctx, 2));
 }

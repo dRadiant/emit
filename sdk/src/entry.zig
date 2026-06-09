@@ -405,12 +405,6 @@ pub fn init(
 ) !*Context(entities) {
     var timer = try std.time.Timer.start();
 
-    // Remote live following streams blocks instead of reading a local pending
-    // ring. Factory children discovered live need ADD_ADDRESS re-registration,
-    // a later step, so guard that combination rather than miss their events.
-    if (options.remote_engine != null and options.follow and m.factories.len > 0)
-        return error.RemoteFactoryFollowUnsupported;
-
     // Derive and mkdir the entity / filter / ethcall subdirs under `data_dir`.
     const entity_dir = try std.fs.path.join(allocator, &.{ options.data_dir, "entity" });
     defer allocator.free(entity_dir);
@@ -485,7 +479,7 @@ pub fn init(
         // A manifest change invalidates the streamed store. Clear so the stream
         // restarts from cursor 0 instead of appending past a stale tail.
         if (!shouldSkipFilterBuild(filter_dh, allocator, fp)) try clearFilterFiles(filter_dh);
-        try remoteBackfill(m, re, filter_dh, &ctx.stats, allocator);
+        try remoteBackfill(m, C, re, ctx, filter_dh, allocator);
         try writeFilterFingerprint(filter_dh, fp);
     } else if (shouldSkipFilterBuild(filter_dh, allocator, fp)) {
         ctx.stats.phases_skipped = true;
@@ -692,7 +686,7 @@ fn followLoop(
             re.host,
             re.port,
             comptime filter_builder.collectKnownAddresses(m),
-            comptime filter_builder.collectAllTopics(m),
+            comptime filter_builder.collectFollowTopics(m),
             ctx._allocator,
         );
     }
@@ -835,15 +829,17 @@ fn streamInto(
 /// Remote analogue of the local build + scanCreations + appendChildren. Streams
 /// the primary, and for a factory manifest discovers children from the streamed
 /// creations and streams their events into the children store (excluding
-/// static∪factory, matching the local children filter). Populates `stats`.
+/// static∪factory, matching the local children filter). Populates `ctx.stats`
+/// and hands the discovered child set to `ctx` so the live follow admits them.
 fn remoteBackfill(
     comptime m: sdk_manifest.Manifest,
+    comptime C: type,
     re: RemoteEngine,
+    ctx: *C,
     filter_dh: std.fs.Dir,
-    stats: *RunStats,
     allocator: std.mem.Allocator,
 ) !void {
-    stats.filter_blocks_matched = try streamInto(
+    ctx.stats.filter_blocks_matched = try streamInto(
         re,
         filter_dh,
         filter_builder.BASE_PRIMARY,
@@ -856,8 +852,8 @@ fn remoteBackfill(
     if (comptime m.factories.len > 0) {
         const child_topics = comptime filter_builder.collectChildTopics(m);
         var discovered = try scanner.scanCreations(filter_dh, m, allocator);
-        defer discovered.deinit();
-        stats.discovered_children = discovered.count();
+        errdefer discovered.deinit();
+        ctx.stats.discovered_children = discovered.count();
 
         if (discovered.count() > 0 and child_topics.len > 0) {
             const child_addrs = try allocator.alloc([20]u8, discovered.count());
@@ -866,7 +862,7 @@ fn remoteBackfill(
             var it = discovered.keyIterator();
             while (it.next()) |a| : (i += 1) child_addrs[i] = a.*;
 
-            stats.children_blocks_matched = try streamInto(
+            ctx.stats.children_blocks_matched = try streamInto(
                 re,
                 filter_dh,
                 filter_builder.BASE_CHILDREN,
@@ -876,6 +872,10 @@ fn remoteBackfill(
                 allocator,
             );
         }
+
+        // The follow REGISTER and the live address gate read this set. Ownership
+        // moves to ctx, freed by Context.deinit.
+        try setChildAddresses(C, ctx, allocator, discovered);
     }
 }
 

@@ -221,6 +221,37 @@ pub const Watcher = struct {
             _ = std.posix.read(self.fd, &drain) catch {};
         }
     }
+
+    /// Which sources woke a `waitWith`. `pending`: pending.bin changed (or the
+    /// non-inotify fallback ticked). `extra`: the extra fd has data to read.
+    pub const Ready = struct { pending: bool = false, extra: bool = false };
+
+    /// Like `wait`, but also polls `extra_fd` (a client socket). Lets the engine
+    /// stream new blocks and read inbound frames on one thread. Drains inotify
+    /// records when they fire. The non-inotify fallback reports `pending` each
+    /// tick so callers still re-scan.
+    pub fn waitWith(self: *Watcher, extra_fd: i32, timeout_ms: u32) Ready {
+        if (!inotify_supported) {
+            std.Thread.sleep(@as(u64, timeout_ms) * std.time.ns_per_ms);
+            return .{ .pending = true };
+        }
+
+        var fds = [_]std.posix.pollfd{
+            .{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 },
+            .{ .fd = extra_fd, .events = std.posix.POLL.IN, .revents = 0 },
+        };
+        const r = std.posix.poll(&fds, @intCast(timeout_ms)) catch return .{};
+        if (r <= 0) return .{};
+
+        var ready = Ready{};
+        if ((fds[0].revents & std.posix.POLL.IN) != 0) {
+            var drain: [4096]u8 = undefined;
+            _ = std.posix.read(self.fd, &drain) catch {};
+            ready.pending = true;
+        }
+        if ((fds[1].revents & std.posix.POLL.IN) != 0) ready.extra = true;
+        return ready;
+    }
 };
 
 // ── Tests ────────────────────────────────────────────────────────────────
