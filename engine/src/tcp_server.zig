@@ -19,7 +19,6 @@ const tcp_frame = core.tcp_frame;
 const FlatStoreReader = core.FlatStoreReader;
 const TimestampReader = core.TimestampReader;
 const log_serial = core.log_serial;
-const block_filter = core.block_filter;
 const types = core.types;
 const head_watch = core.head_watch;
 const Entry = core.pending_format.Entry;
@@ -166,60 +165,35 @@ fn streamBackfill(
     const start = reg.cursor + 1; // cursor = last block the client already has
     if (start > tip) return; // already caught up
 
-    var matching = std.ArrayListUnmanaged(u64){};
-    defer matching.deinit(allocator);
-    var scanned: u64 = 0;
-    var dropped: u64 = 0;
-    try block_filter.scanBloomsParallel(reader, reg.addresses, reg.topics, start, tip, &matching, &scanned, &dropped, allocator);
-    if (dropped > 0) return error.BloomScanDropped;
-
-    dedupAdjacent(&matching); // blooms.bin can carry duplicate block rows (reorg collapse)
-
     const filter: core.filter.Filter = .{
         .match_addrs = reg.addresses,
         .match_topics = reg.topics,
         .exclude_addrs = reg.exclude_addresses,
     };
 
-    // One block's worth of scratch each, heap not stack (BLOCK_BUF_SIZE is 4 MB).
-    // Sequential pread per block. A parallel read pipeline like the SDK build's
-    // would overlap read and filter, the dominant backfill cost (measured ~2x).
-    const read_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
-    defer allocator.free(read_buf);
-    const decompress_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
-    defer allocator.free(decompress_buf);
-    const serialize_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
-    defer allocator.free(serialize_buf);
-    const compress_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
-    defer allocator.free(compress_buf);
-
-    for (matching.items) |bn| {
-        const entry_data = try reader.readBlock(bn, read_buf);
-        const decompressed = try log_serial.decompressEntry(entry_data, decompress_buf);
-        const maybe = try core.filter.filterBlockEntry(decompressed, filter, serialize_buf, compress_buf);
-        const filtered = maybe orelse continue; // bloom false positive, no log matched
-        const ts: u32 = if (ts_reader) |r| @intCast(r.get(bn) orelse 0) else 0;
-        try sendPush(stream, bn, ts, filtered.entry);
-    }
+    // Shared with the SDK builder: a parallel io_uring read + filter pipeline,
+    // chunked so each chunk's survivors PUSH before the next reads.
+    var sink = PushSink{ .stream = stream, .ts = ts_reader };
+    const r = try core.parallel_filter.run(reader, reg.addresses, filter, start, tip, PushSink, &sink, allocator);
+    // A dropped block (read/decompress failure) means a hole. Refuse to hand the
+    // client an incomplete index.
+    if (r.dropped_blocks > 0) return error.BloomScanDropped;
 }
+
+/// PUSHes each filtered survivor with its exact timestamp. The chunked pipeline
+/// emits in ascending block order, satisfying the client store's monotonic key.
+const PushSink = struct {
+    stream: std.net.Stream,
+    ts: ?*const TimestampReader,
+    pub fn emit(self: *PushSink, block_number: u64, entry: []const u8, _: u32) !void {
+        const ts: u32 = if (self.ts) |r| @intCast(r.get(block_number) orelse 0) else 0;
+        try sendPush(self.stream, block_number, ts, entry);
+    }
+};
 
 /// Highest block number stored (the last dense index slot).
 fn tipOf(reader: *const FlatStoreReader) u64 {
     return reader.first_block + reader.index_count - 1;
-}
-
-/// Collapse runs of equal block numbers in a sorted list, in place. Mirrors the
-/// sdk builder's dedup so a streamed index matches a locally-built one when
-/// `blooms.bin` holds duplicate rows for a reorged block.
-fn dedupAdjacent(list: *std.ArrayListUnmanaged(u64)) void {
-    if (list.items.len < 2) return;
-    var w: usize = 1;
-    for (1..list.items.len) |r| {
-        if (list.items[r] == list.items[r - 1]) continue;
-        list.items[w] = list.items[r];
-        w += 1;
-    }
-    list.items.len = w;
 }
 
 // ── Live streaming ─────────────────────────────────────────────────────────

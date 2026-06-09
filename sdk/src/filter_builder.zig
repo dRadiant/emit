@@ -15,9 +15,7 @@
 /// static contract that's also a factory child does not appear in both pairs.
 const std = @import("std");
 
-const builtin = @import("builtin");
 const core = @import("core");
-const lz4 = @import("lz4");
 
 const filtered_store_mod = @import("filtered_store.zig");
 const sdk_manifest = @import("manifest.zig");
@@ -26,15 +24,7 @@ const FilteredStore = filtered_store_mod.FilteredStore;
 const RawLog = core.RawLog;
 const FlatStoreReader = core.FlatStoreReader;
 const log_serial = core.log_serial;
-const block_filter = core.block_filter;
-const parallel = core.parallel;
-const io_pipeline = core.io_pipeline;
 const types = core.types;
-
-pub const WORKER_QUEUE_DEPTH = 16;
-/// Min matching blocks before spawning worker threads. Below this, thread
-/// spin-up cost exceeds the parallel speedup.
-pub const PARALLEL_THRESHOLD = 1_000;
 
 pub const BASE_PRIMARY: []const u8 = "primary";
 pub const BASE_CHILDREN: []const u8 = "children";
@@ -171,86 +161,33 @@ fn runPhase(
     comptime base: []const u8,
     allocator: std.mem.Allocator,
 ) !BuildResult {
-    var result = BuildResult{};
-    var timer = try std.time.Timer.start();
-
-    var matching = std.ArrayListUnmanaged(u64){};
-    defer matching.deinit(allocator);
-
-    try block_filter.scanBloomsParallel(
-        reader,
-        bloom_addresses,
-        filter.match_topics,
-        start_block,
-        end_block,
-        &matching,
-        &result.blocks_scanned,
-        &result.dropped_blocks,
-        allocator,
-    );
-
-    if (matching.items.len == 0) {
-        result.elapsed_ns = timer.read();
-        return result;
-    }
-
-    // blooms.bin can hold duplicate entries for one block_number when the
-    // importer's RocksDB key parsing collapses multi-byte discriminators (reorg
-    // entries) onto the same u64. The list is sorted, so adjacent dedup
-    // suffices. Without it, FilteredStore.appendEntry raises OutOfOrder on the
-    // second write and the build fails.
-    var write_idx: usize = 1;
-    for (1..matching.items.len) |read_idx| {
-        if (matching.items[read_idx] == matching.items[read_idx - 1]) continue;
-        matching.items[write_idx] = matching.items[read_idx];
-        write_idx += 1;
-    }
-    matching.items.len = write_idx;
-
-    const num_workers = parallel.workerCount(matching.items.len, PARALLEL_THRESHOLD);
-    const ranges = parallel.chunkRanges(matching.items.len, num_workers);
-
-    var worker_results: [parallel.MAX_WORKERS]std.ArrayListUnmanaged(FilteredBlock) = undefined;
-    var worker_args: [parallel.MAX_WORKERS]FilterWorkerArgs = undefined;
-    var worker_arenas: [parallel.MAX_WORKERS]std.heap.ArenaAllocator = undefined;
-
-    for (0..num_workers) |i| {
-        worker_arenas[i] = std.heap.ArenaAllocator.init(allocator);
-        worker_results[i] = .{};
-        worker_args[i] = .{
-            .reader = reader,
-            .matching_blocks = matching.items[ranges[i][0]..ranges[i][1]],
-            .filter = filter,
-            .results = &worker_results[i],
-            .allocator = worker_arenas[i].allocator(),
-        };
-    }
-    defer for (0..num_workers) |i| worker_arenas[i].deinit();
-
-    try parallel.run(FilterWorkerArgs, worker_args[0..num_workers], num_workers, filterWorker);
-
-    // Surface fatal pipeline errors before opening the writer. Per-block drops accumulate below.
-    for (0..num_workers) |i| if (worker_args[i].err) |e| return e;
-
     var store = try FilteredStore.open(allocator, dir, base);
     defer store.deinit();
 
-    for (0..num_workers) |i| {
-        for (worker_results[i].items) |fb| {
-            // Local build leaves the FilteredStore timestamp 0. The scanner
-            // falls back to the engine's timestamps.bin via `timestampOf`. Only
-            // the remote client fills it, from the PUSH frame.
-            try store.appendEntry(fb.block_number, 0, fb.entry);
-            result.blocks_matched += 1;
-            result.total_logs += fb.log_count;
-        }
-    }
+    var sink = StoreSink{ .store = &store };
+    const r = try core.parallel_filter.run(reader, bloom_addresses, filter, start_block, end_block, StoreSink, &sink, allocator);
     try store.syncAll();
 
-    for (0..num_workers) |i| result.dropped_blocks += worker_args[i].dropped_blocks;
-    result.elapsed_ns = timer.read();
-    return result;
+    return .{
+        .blocks_scanned = r.blocks_scanned,
+        .blocks_matched = r.blocks_matched,
+        .total_logs = r.total_logs,
+        .dropped_blocks = r.dropped_blocks,
+        .elapsed_ns = r.elapsed_ns,
+    };
 }
+
+/// Writes each filtered survivor to the FilteredStore pair. The chunked pipeline
+/// emits in ascending block order, satisfying `appendEntry`'s monotonic key.
+const StoreSink = struct {
+    store: *FilteredStore,
+    /// The local build leaves the timestamp 0. The scanner falls back to the
+    /// engine's timestamps.bin via `timestampOf`; only the remote client fills
+    /// it, from the PUSH frame.
+    pub fn emit(self: *StoreSink, block_number: u64, entry: []const u8, _: u32) !void {
+        try self.store.appendEntry(block_number, 0, entry);
+    }
+};
 
 // ── Manifest projections ─────────────────────────────────────────────────
 // Public so the remote client builds its REGISTER filter from the manifest.
@@ -307,151 +244,6 @@ pub fn collectChildTopics(comptime m: sdk_manifest.Manifest) []const [32]u8 {
         }
         return out;
     }
-}
-
-// ── Worker ───────────────────────────────────────────────────────────────
-
-const FilteredBlock = struct {
-    block_number: u64,
-    entry: []u8, // lz4_len(4) + lz4_data
-    log_count: u32,
-};
-
-const FilterWorkerArgs = struct {
-    reader: *const FlatStoreReader,
-    matching_blocks: []const u64,
-    filter: Filter,
-    results: *std.ArrayListUnmanaged(FilteredBlock),
-    allocator: std.mem.Allocator,
-    /// Per-block recoverable failures (alloc, lz4, etc.), surfaced via BuildResult.
-    dropped_blocks: u64 = 0,
-    /// First fatal pipeline-level error (init/wait/oversize). Aborts the build.
-    err: ?anyerror = null,
-};
-
-fn filterWorker(args: *FilterWorkerArgs) void {
-    // Stack scratch is safe: `parallel.run` always spawns workers at
-    // `WORKER_STACK_SIZE`.
-    var decompress_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
-    var serialize_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
-    var compress_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
-
-    const reader = args.reader;
-
-    if (comptime io_pipeline.supported) {
-        const Pipeline = io_pipeline.ReadPipeline(WORKER_QUEUE_DEPTH);
-        const pipeline = Pipeline.init(args.allocator, reader.blocks_file.handle) catch |e| {
-            args.err = e;
-            return;
-        };
-        defer pipeline.deinit();
-
-        var submitted: usize = 0;
-        var completed: usize = 0;
-        const total = args.matching_blocks.len;
-
-        while (completed < total) {
-            while (submitted < total) {
-                const slot = pipeline.claimSlot() orelse break;
-                const loc = reader.getBlockLoc(args.matching_blocks[submitted]) catch {
-                    pipeline.releaseSlot(slot);
-                    submitted += 1;
-                    completed += 1;
-                    args.dropped_blocks += 1;
-                    continue;
-                };
-                pipeline.submit(slot, args.matching_blocks[submitted], loc.offset, loc.length) catch |e| {
-                    pipeline.releaseSlot(slot);
-                    // EntryExceedsBuffer = corrupt store, fatal. Else SQE-full, drain and retry.
-                    if (e == error.EntryExceedsBuffer) {
-                        args.err = e;
-                        return;
-                    }
-                    break;
-                };
-                submitted += 1;
-            }
-            _ = pipeline.flush() catch |e| {
-                args.err = e;
-                return;
-            };
-
-            var done: [WORKER_QUEUE_DEPTH]*io_pipeline.Completion = undefined;
-            const n = pipeline.waitAtLeastOne(&done) catch |e| {
-                args.err = e;
-                return;
-            };
-            for (done[0..n]) |c| {
-                const entry_data = pipeline.getBuffer(c);
-                if (entry_data.len > 0) {
-                    processBlockEntry(entry_data, c.block_number, args, &decompress_buf, &serialize_buf, &compress_buf);
-                } else args.dropped_blocks += 1;
-                pipeline.releaseSlot(c.buf_slot);
-                completed += 1;
-            }
-        }
-        // io_uring completes in NVMe order, not submission order. Sort so the
-        // writer iterates worker outputs in ascending block order, satisfying
-        // FilteredStore.appendEntry's monotonic invariant.
-        std.mem.sort(FilteredBlock, args.results.items, {}, blockNumberLessThan);
-        return;
-    }
-
-    // pread fallback (non-Linux). Reads in matching_blocks order. Sort anyway
-    // for path-uniform output.
-    var read_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
-    for (args.matching_blocks) |bn| {
-        const entry_data = reader.readBlock(bn, &read_buf) catch {
-            args.dropped_blocks += 1;
-            continue;
-        };
-        processBlockEntry(entry_data, bn, args, &decompress_buf, &serialize_buf, &compress_buf);
-    }
-    std.mem.sort(FilteredBlock, args.results.items, {}, blockNumberLessThan);
-}
-
-fn blockNumberLessThan(_: void, a: FilteredBlock, b: FilteredBlock) bool {
-    return a.block_number < b.block_number;
-}
-
-fn processBlockEntry(
-    entry_data: []const u8,
-    block_number: u64,
-    args: *FilterWorkerArgs,
-    decompress_buf: []u8,
-    serialize_buf: []u8,
-    compress_buf: []u8,
-) void {
-    // Every error path counts the block as dropped, propagating to
-    // BuildResult.dropped_blocks so the entry point refuses to ship the index.
-    // No silent failures here.
-    const decompressed = log_serial.decompressEntry(entry_data, decompress_buf) catch {
-        args.dropped_blocks += 1;
-        return;
-    };
-
-    // Precision filter, shared with the engine's TCP server via core. Keeps
-    // only matching logs, recompresses into `compress_buf`. A compress failure
-    // on an oversize block counts as a drop. `null` = no match.
-    const maybe = core.filter.filterBlockEntry(decompressed, args.filter, serialize_buf, compress_buf) catch {
-        args.dropped_blocks += 1;
-        return;
-    };
-    const filtered = maybe orelse return;
-
-    const owned = args.allocator.alloc(u8, filtered.entry.len) catch {
-        args.dropped_blocks += 1;
-        return;
-    };
-    @memcpy(owned, filtered.entry);
-
-    args.results.append(args.allocator, .{
-        .block_number = block_number,
-        .entry = owned,
-        .log_count = filtered.log_count,
-    }) catch {
-        args.dropped_blocks += 1;
-    };
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -975,31 +767,4 @@ test "appendChildrenBlocks extends the children pair over a sub-range" {
     try testing.expectEqual(@as(usize, 10), decoded.items.len);
     try testing.expectEqual(@as(u64, 100), decoded.items[0].block_number);
     try testing.expectEqual(@as(u64, 109), decoded.items[9].block_number);
-}
-
-test "processBlockEntry: corrupt entry counts as dropped_block (fail-loud safety net)" {
-    const allocator = testing.allocator;
-
-    var results: std.ArrayListUnmanaged(FilteredBlock) = .{};
-    defer results.deinit(allocator);
-
-    var args: FilterWorkerArgs = .{
-        .reader = undefined,
-        .matching_blocks = &.{},
-        .filter = .{ .match_addrs = &.{}, .match_topics = &.{}, .exclude_addrs = &.{} },
-        .results = &results,
-        .allocator = allocator,
-    };
-
-    // lz4_len prefix claims more bytes than the entry holds, so decompressEntry
-    // returns error.InvalidEntry. A regression re-introducing a silent drop
-    // would leave dropped_blocks == 0 here.
-    const corrupt_entry = [_]u8{ 0xFF, 0xFF, 0xFF, 0x7F, 0x42 };
-    var decompress_buf: [256]u8 = undefined;
-    var serialize_buf: [256]u8 = undefined;
-    var compress_buf: [256]u8 = undefined;
-
-    processBlockEntry(&corrupt_entry, 100, &args, &decompress_buf, &serialize_buf, &compress_buf);
-    try testing.expectEqual(@as(u64, 1), args.dropped_blocks);
-    try testing.expectEqual(@as(usize, 0), results.items.len);
 }
