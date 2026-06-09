@@ -139,6 +139,51 @@ pub fn ImmutableStore(comptime T: type) type {
             }
         }
 
+        /// Drop overlay blocks at or above `block`, keeping finalized records
+        /// below the fork (committed plus the drained append queue). Re-anchor
+        /// `last_key` to the highest survivor so the re-dispatched canonical
+        /// chain stays monotonic. Partial reorg rollback for a streamed REORG.
+        /// Restart on each removal since `fetchRemove` invalidates the iterator.
+        pub fn discardFrom(self: *Self, block: u64) void {
+            outer: while (true) {
+                var it = self.block_pending.keyIterator();
+                while (it.next()) |k| {
+                    if (k.* >= block) {
+                        var removed = self.block_pending.fetchRemove(k.*).?;
+                        removed.value.deinit(self.allocator);
+                        continue :outer;
+                    }
+                }
+                break;
+            }
+            self.last_key = self.highestRetainedKey();
+        }
+
+        /// Largest key still held after a `discardFrom`. Overlay blocks carry
+        /// the highest keys (monotonic by block), then the append queue, then
+        /// the durable boundary.
+        fn highestRetainedKey(self: *Self) ?[KEY_SIZE]u8 {
+            var hi: ?u64 = null;
+            var it = self.block_pending.keyIterator();
+            while (it.next()) |k| {
+                if (hi == null or k.* > hi.?) hi = k.*;
+            }
+            if (hi) |hb| {
+                const recs = self.block_pending.get(hb).?;
+                if (recs.items.len > 0) return serializedKey(recs.items[recs.items.len - 1]);
+            }
+            if (self.pending_appended.items.len > 0)
+                return serializedKey(self.pending_appended.items[self.pending_appended.items.len - 1]);
+            if (self.committed_count > 0) return self.log.readKey(self.committed_count - 1) catch null;
+            return null;
+        }
+
+        fn serializedKey(entity: T) [KEY_SIZE]u8 {
+            var buf: [KEY_SIZE]u8 = undefined;
+            entity_serial.serializeKey(T, entity, &buf);
+            return buf;
+        }
+
         /// Total entries across every per-block buffer plus the append queue.
         pub fn pendingCount(self: *const Self) u32 {
             var total: u32 = @intCast(self.pending_appended.items.len);
@@ -360,6 +405,37 @@ test "discardAll drops the overlay and the append queue" {
     store.discardAll();
     try testing.expectEqual(@as(u32, 0), store.pendingCount());
     try testing.expectEqual(@as(?[8]u8, null), store.last_key);
+}
+
+test "discardFrom rolls back the reorged tail and re-anchors last_key" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var log = try event_log_mod.EventLog(E).open(testing.allocator, tmp.dir, "ev.events.dat");
+    defer log.deinit();
+
+    var store = try ImmutableStore(E).open(testing.allocator, &log, 0);
+    defer store.deinit();
+    store.live = true;
+
+    store.live_block = 100;
+    try store.save(.{ .id = idKey(100, 0), .value = 1 });
+    try store.save(.{ .id = idKey(100, 1), .value = 2 });
+    store.live_block = 101;
+    try store.save(.{ .id = idKey(101, 0), .value = 3 });
+    store.live_block = 102;
+    try store.save(.{ .id = idKey(102, 0), .value = 4 });
+    try testing.expectEqual(@as(u32, 4), store.pendingCount());
+
+    // Fork at 101: blocks 101 and 102 roll back, block 100 survives.
+    store.discardFrom(101);
+    try testing.expectEqual(@as(u32, 2), store.pendingCount());
+
+    // last_key re-anchored to block 100's last record, so re-dispatching the
+    // canonical block 101 reuses its keys without a monotonic violation.
+    store.live_block = 101;
+    try store.save(.{ .id = idKey(101, 0), .value = 99 });
+    try testing.expectEqual(@as(u32, 3), store.pendingCount());
 }
 
 test "backfill leaves the overlay empty" {

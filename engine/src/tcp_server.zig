@@ -227,7 +227,9 @@ fn streamLive(
         var classification = try head_watch.classifyChanges(allocator, prev.entries, curr.entries, last_finalized);
         defer classification.deinit(allocator);
 
-        if (classification.reorg_from) |rf| {
+        // A reorg surfaces as a same-block hash change (reorg_from) or a
+        // truncated tail (reorged_out). Both fork at the lowest divergent block.
+        if (reorgFork(classification)) |rf| {
             try sendReorg(stream, rf);
             // Re-stream the new canonical tail from the fork point.
             for (curr.entries) |e| {
@@ -263,6 +265,17 @@ fn filterAndPush(
     const maybe = try core.filter.filterBlockEntry(decompressed, filter, serialize_buf, compress_buf);
     const filtered = maybe orelse return;
     try sendPush(stream, entry.block_number, entry.timestamp, filtered.entry);
+}
+
+/// Lowest divergent block across both reorg signals, or null when the head
+/// only grew. `reorg_from` is a same-block hash change, `reorged_out` a
+/// disappeared tail. The fork is the minimum of either.
+fn reorgFork(c: head_watch.Classification) ?u64 {
+    var fork = c.reorg_from;
+    for (c.reorged_out) |b| {
+        fork = if (fork) |f| @min(f, b) else b;
+    }
+    return fork;
 }
 
 fn sendReorg(stream: std.net.Stream, fork_point: u64) !void {

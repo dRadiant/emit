@@ -6,7 +6,8 @@
 ///
 /// `backfill` is the one-shot path (REGISTER, stream, GOAWAY). `follow` keeps
 /// the connection open after backfill and dispatches live blocks through the
-/// per-block overlay. Reorg handling and factory ADD_ADDRESS are separate.
+/// per-block overlay, rolling back the reorged tail on REORG. Factory
+/// ADD_ADDRESS is separate.
 const std = @import("std");
 
 const core = @import("core");
@@ -39,7 +40,7 @@ pub const BackfillResult = struct {
     goaway: tcp_frame.GoawayCode,
 };
 
-pub const Error = error{ UnexpectedFrame, UnexpectedReorg, RemoteReorgUnsupported, ConnectionClosed };
+pub const Error = error{ UnexpectedFrame, UnexpectedReorg, ConnectionClosed };
 
 /// Connect to `host:port`, REGISTER `filter`, and stream PUSH frames into
 /// `store` until GOAWAY. Returns the received count, the final cursor, and the
@@ -141,7 +142,10 @@ pub fn follow(
     defer live_blocks.deinit(allocator);
 
     while (!live.stopRequested(ctx)) {
-        followOnce(m, Handler, ctx, host, port, addresses, topics, decompress_buf, log_buf, &payload_buf, &live_blocks, allocator) catch {
+        followOnce(m, Handler, ctx, host, port, addresses, topics, decompress_buf, log_buf, &payload_buf, &live_blocks, allocator) catch |e| {
+            // A fork below finality can't be recovered by reconnecting. Surface
+            // it. Everything else is a dropped connection: back off and retry.
+            if (e == error.ReorgExceedsFinalityDepth) return e;
             std.Thread.sleep(RECONNECT_BACKOFF_NS);
         };
     }
@@ -208,8 +212,25 @@ fn followOnce(
                 defer live.unlockCtx(ctx);
                 try promoteUpTo(ctx, live_blocks, hb.last_finalized);
             },
-            // Reorg recovery is a later step. Fail loudly rather than drift.
-            .reorg => return Error.RemoteReorgUnsupported,
+            .reorg => {
+                const r = try tcp_frame.Reorg.decode(payload_buf.*[0..h.len]);
+                live.lockCtx(ctx);
+                defer live.unlockCtx(ctx);
+                // A fork at or below the committed cursor would rewrite finalized
+                // state. Beyond the recoverable window, so fail fatally.
+                if (r.fork_point <= ctx._last_dispatched_block) return error.ReorgExceedsFinalityDepth;
+                // Roll back the reorged tail. The engine re-streams the canonical
+                // blocks at/above the fork as PUSH frames, which re-dispatch.
+                live.discardOverlaysFrom(ctx, r.fork_point);
+                var keep: usize = 0;
+                for (live_blocks.items) |b| {
+                    if (b < r.fork_point) {
+                        live_blocks.items[keep] = b;
+                        keep += 1;
+                    }
+                }
+                live_blocks.items.len = keep;
+            },
             // The engine is closing this connection. Reconnect from the cursor.
             .goaway => return,
             else => return Error.UnexpectedFrame,
@@ -309,6 +330,8 @@ const MockServer = struct {
     server: *std.net.Server,
     pushes: []const PushFixture,
     allocator: std.mem.Allocator,
+    // When set, a REORG with this fork point is sent after the pushes.
+    reorg_fork: ?u64 = null,
     // When set, a HEARTBEAT with this `last_finalized` follows the pushes.
     heartbeat_last_finalized: ?u64 = null,
     // Filled from the REGISTER the client sends, for assertions.
@@ -338,6 +361,10 @@ const MockServer = struct {
             const payload = (tcp_frame.Push{ .block_number = p.block, .timestamp = p.ts, .lz4_entry = p.entry }).encode(self.allocator) catch return;
             defer self.allocator.free(payload);
             writeFrame(conn.stream, .push, payload) catch return;
+        }
+        if (self.reorg_fork) |fork| {
+            const payload = (tcp_frame.Reorg{ .fork_point = fork }).encode();
+            writeFrame(conn.stream, .reorg, &payload) catch return;
         }
         if (self.heartbeat_last_finalized) |lf| {
             const hb = (tcp_frame.Heartbeat{ .cursor = lf, .tip = lf, .last_finalized = lf }).encode();
@@ -485,4 +512,34 @@ test "follow dispatches streamed live blocks and finalizes a heartbeat prefix" {
     // Heartbeat finalized 101: it drains, 102 stays pending in the overlay.
     try testing.expectEqual(@as(usize, 1), live_blocks.items.len);
     try testing.expectEqual(@as(u64, 102), live_blocks.items[0]);
+}
+
+test "follow treats a reorg below the committed cursor as fatal" {
+    const allocator = testing.allocator;
+
+    var server = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+
+    // Fork at 50 while the client has committed through 100: a finality
+    // violation no reconnect can fix.
+    var mock = MockServer{ .server = &server, .pushes = &.{}, .allocator = allocator, .reorg_fork = 50 };
+    const th = try std.Thread.spawn(.{}, MockServer.serve, .{&mock});
+
+    var runner = FollowRunner{ ._allocator = allocator, ._last_dispatched_block = 100 };
+    const addrs = [_][20]u8{FOLLOW_CONTRACT};
+    const topics = [_][32]u8{sdk_manifest.eventTopic0(FollowTransfer)};
+
+    const decompress_buf = try allocator.alloc(u8, core.types.BLOCK_BUF_SIZE);
+    defer allocator.free(decompress_buf);
+    const log_buf = try allocator.alloc(core.RawLog, core.types.MAX_LOGS_PER_BLOCK);
+    defer allocator.free(log_buf);
+    var payload_buf = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(payload_buf);
+    var live_blocks: std.ArrayListUnmanaged(u64) = .{};
+    defer live_blocks.deinit(allocator);
+
+    const r = followOnce(FollowManifest, FollowRunner, &runner, "127.0.0.1", port, &addrs, &topics, decompress_buf, log_buf, &payload_buf, &live_blocks, allocator);
+    th.join();
+    try testing.expectError(error.ReorgExceedsFinalityDepth, r);
 }

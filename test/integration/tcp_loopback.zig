@@ -342,6 +342,31 @@ const CountHandler = struct {
     }
 };
 
+// Poll the tip-inclusive counter until it reaches `target`, bounded by a
+// timeout. The follow loop dispatches on a background thread, so reads race it.
+fn waitForCount(ctx: anytype, target: u64) !bool {
+    var waited: u64 = 0;
+    while (waited < 3000) : (waited += 20) {
+        const c = try ctx.read(Counter, @as(u64, 0));
+        if (c) |v| if (v.count == target) return true;
+        std.Thread.sleep(20 * std.time.ns_per_ms);
+    }
+    return false;
+}
+
+fn transferLog(block: u64, log_index: u16) core.RawLog {
+    return .{
+        .block_number = block,
+        .tx_index = 0,
+        .log_index = log_index,
+        .address = ADDR_TOKEN,
+        .topic_count = 1,
+        .topics = .{ sdk_manifest.eventTopic0(Transfer), [_]u8{0} ** 32, [_]u8{0} ** 32, [_]u8{0} ** 32 },
+        .data = &.{},
+        .tx_hash = [_]u8{0xFE} ** 32,
+    };
+}
+
 test "remote follow dispatches a live block injected after backfill" {
     const allocator = std.testing.allocator;
     const tt = sdk_manifest.eventTopic0(Transfer);
@@ -396,31 +421,60 @@ test "remote follow dispatches a live block injected after backfill" {
 
     // Inject a live block. The engine streams it, the follow loop dispatches it
     // into the overlay, and a tip-inclusive read sees the second Transfer.
-    const live_log: core.RawLog = .{
-        .block_number = 101,
-        .tx_index = 0,
-        .log_index = 0,
-        .address = ADDR_TOKEN,
-        .topic_count = 1,
-        .topics = .{ tt, [_]u8{0} ** 32, [_]u8{0} ** 32, [_]u8{0} ** 32 },
-        .data = &.{},
-        .tx_hash = [_]u8{0xFE} ** 32,
-    };
-    try fake.ingest(101, [_]u8{0xBB} ** 32, &.{live_log});
+    try fake.ingest(101, [_]u8{0xBB} ** 32, &.{transferLog(101, 0)});
+    try std.testing.expect(try waitForCount(ctx, 2));
+}
 
-    var dispatched = false;
-    var waited: u64 = 0;
-    while (waited < 3000) : (waited += 20) {
-        const c = try ctx.read(Counter, @as(u64, 0));
-        if (c) |v| {
-            if (v.count == 2) {
-                dispatched = true;
-                break;
-            }
-        }
-        std.Thread.sleep(20 * std.time.ns_per_ms);
-    }
-    try std.testing.expect(dispatched);
+test "remote follow rolls back a reorged live block and applies the canonical one" {
+    const allocator = std.testing.allocator;
+    const tt = sdk_manifest.eventTopic0(Transfer);
+
+    const blocks = [_]TestBlock{
+        .{ .block_number = 100, .timestamp = 1_700_000_000, .logs = &.{.{ .address = ADDR_TOKEN, .topic0 = tt }} },
+    };
+    var src = std.testing.tmpDir(.{});
+    defer src.cleanup();
+    try writeTestStore(src.dir, &blocks, allocator);
+    var src_path: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try src.dir.realpath(".", &src_path);
+
+    var fake = fake_engine.FakeEngine.init(src.dir, allocator);
+    defer fake.deinit();
+
+    var reader = try FlatStoreReader.open(path);
+    defer reader.deinit();
+    var ts_reader = try TimestampReader.open(src.dir);
+    defer if (ts_reader) |*r| r.deinit();
+    const ts_ptr: ?*const TimestampReader = if (ts_reader) |*r| r else null;
+
+    var server = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+    var sctx = ServeCtx{ .server = &server, .reader = &reader, .ts = ts_ptr, .allocator = allocator, .conns = 2, .data_dir = path, .heartbeat_ms = 100 };
+    const th = try std.Thread.spawn(.{}, ServeCtx.run, .{&sctx});
+    defer th.join();
+
+    var remote_data = std.testing.tmpDir(.{});
+    defer remote_data.cleanup();
+    var rd: [std.fs.max_path_bytes]u8 = undefined;
+    const ctx = try sdk.entry.spawn(TokenManifest, CountHandler, .{Counter}, .{
+        .engine_data_dir = path,
+        .data_dir = try remote_data.dir.realpath(".", &rd),
+        .remote_engine = .{ .host = "127.0.0.1", .port = port },
+    }, allocator);
+    defer ctx.deinit();
+
+    // Backfill committed block 100, then a live block with one Transfer.
+    try std.testing.expect(try waitForCount(ctx, 1));
+    try fake.ingest(101, [_]u8{0xAA} ** 32, &.{transferLog(101, 0)});
+    try std.testing.expect(try waitForCount(ctx, 2));
+
+    // Reorg block 101: the canonical replacement carries two Transfers. The
+    // engine emits REORG then re-streams it. The client must drop the reorged
+    // overlay (back to 1) before applying the canonical block (to 3), never 4.
+    try fake.reorg(101);
+    try fake.ingest(101, [_]u8{0xBB} ** 32, &.{ transferLog(101, 0), transferLog(101, 1) });
+    try std.testing.expect(try waitForCount(ctx, 3));
 }
 
 test "remote follow rejects factory manifests until live child registration lands" {

@@ -142,6 +142,26 @@ pub fn MutableStore(comptime T: type) type {
             self.pending.clearRetainingCapacity();
         }
 
+        /// Drop overlay submaps at or above `block`, keeping canonical blocks
+        /// below the fork. Partial reorg rollback for a streamed REORG, where
+        /// finalized-but-uncommitted blocks below the fork must survive. The
+        /// committed cache (finalized mutations) is untouched. Restart on each
+        /// removal since `fetchRemove` invalidates the live iterator. Overlay is
+        /// bounded by FINALITY_DEPTH, so convergence is quick.
+        pub fn discardFrom(self: *Self, block: u64) void {
+            outer: while (true) {
+                var it = self.pending.keyIterator();
+                while (it.next()) |k| {
+                    if (k.* >= block) {
+                        var removed = self.pending.fetchRemove(k.*).?;
+                        removed.value.deinit(self.allocator);
+                        continue :outer;
+                    }
+                }
+                break;
+            }
+        }
+
         pub fn count(self: *const Self) u32 {
             return self.cache.count();
         }
@@ -379,6 +399,31 @@ test "discardAll drops the overlay" {
 
     store.discardAll();
     try testing.expectEqual(@as(u32, 0), store.pendingCount());
+}
+
+test "discardFrom drops overlay at or above the fork, keeps blocks below" {
+    const S = MutableStore(Account);
+    var store = S.open(testing.allocator, &.{});
+    defer store.deinit();
+    store.live = true;
+
+    const alice = [_]u8{0xAA} ** 20;
+    const bob = [_]u8{0xBB} ** 20;
+    const carol = [_]u8{0xCC} ** 20;
+    store.live_block = 100;
+    try store.save(.{ .id = alice, .balance = 100 });
+    store.live_block = 101;
+    try store.save(.{ .id = bob, .balance = 200 });
+    store.live_block = 102;
+    try store.save(.{ .id = carol, .balance = 300 });
+    try testing.expectEqual(@as(u32, 3), store.pendingCount());
+
+    // Fork at 101: blocks 101 and 102 roll back, block 100 survives.
+    store.discardFrom(101);
+    try testing.expectEqual(@as(u32, 1), store.pendingCount());
+    try testing.expectEqual(@as(u256, 100), (try store.load(alice)).?.balance);
+    try testing.expect((try store.load(bob)) == null);
+    try testing.expect((try store.load(carol)) == null);
 }
 
 test "loadOrInit returns existing or fresh zero-init entity" {

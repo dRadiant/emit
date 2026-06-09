@@ -358,6 +358,19 @@ pub fn discardAllOverlays(ctx: anytype) void {
     }
 }
 
+/// Roll back overlay blocks at or above `fork` across every store, keeping
+/// canonical blocks below the fork. For a streamed REORG, where the engine
+/// re-streams only the canonical tail and finalized-but-uncommitted blocks
+/// below the fork must survive.
+pub fn discardOverlaysFrom(ctx: anytype, fork: u64) void {
+    const T = std.meta.Child(@TypeOf(ctx));
+    if (comptime !@hasField(T, "stores")) return;
+    const Stores = @FieldType(T, "stores");
+    inline for (std.meta.fields(Stores)) |f| {
+        @field(ctx.stores, f.name).discardFrom(fork);
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
