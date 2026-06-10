@@ -1,7 +1,6 @@
-/// Uniswap V2 manifest. The factory address is canonical; child events
-/// fire on every pair contract the factory spawned. The factory pre-pass
-/// (`scanCreations`) discovers pair addresses from `PairCreated` and
-/// feeds them into the main scan as the BLOCKS_CHILDREN address set.
+/// Uniswap V2 manifest. Child events fire on every pair the factory spawned.
+/// The factory pre-pass (`scanCreations`) discovers pair addresses from
+/// `PairCreated` and feeds them into the main scan as the BLOCKS_CHILDREN set.
 const sdk = @import("sdk");
 
 pub const PairCreated = struct {
@@ -24,9 +23,9 @@ pub const Sync = struct {
     pub const signature = "Sync(uint112 reserve0, uint112 reserve1)";
 };
 
-/// Comptime helper that expands `addrs` into ERC20-shaped `StaticCall`
-/// triples. Lives in user code rather than the SDK so adapting to other
-/// shapes (ERC721 `tokenURI`, ERC4626 `asset`) is a copy-paste edit.
+/// Expands `addrs` into ERC20-shaped `StaticCall` triples at comptime.
+/// Lives in user code so adapting to other shapes (ERC721 `tokenURI`,
+/// ERC4626 `asset`) is a copy-paste edit.
 fn erc20Metadata(comptime addrs: []const [20]u8) []const sdk.StaticCall {
     comptime {
         var out: []const sdk.StaticCall = &.{};
@@ -47,8 +46,8 @@ const USDC = sdk.address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
 pub const config: sdk.Manifest = .{
     .name = "uniswap-v2",
     .chain_id = 1,
-    // 10k-block window matching the open-indexer-benchmark fixture. Drop
-    // start_block to 0 and raise end_block for a full-chain backfill.
+    // 10k-block benchmark window. Drop start_block to 0 and raise end_block
+    // for a full-chain backfill.
     .start_block = 19_000_000,
     .end_block = 19_010_000,
     .factories = &.{.{
@@ -59,7 +58,7 @@ pub const config: sdk.Manifest = .{
         .child_events = &.{ Mint, Burn, Swap, Sync },
     }},
     // Per-pair token decimals fetched once at creation. `symbol()`/`name()`
-    // would also fit here but their dynamic-string returns are deferred
+    // would fit here too but their dynamic-string returns are deferred.
     .prefetch = &.{.{
         .on_event = PairCreated,
         .calls = &.{

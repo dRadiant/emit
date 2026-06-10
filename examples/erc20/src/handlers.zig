@@ -1,18 +1,18 @@
-/// ERC20 event handlers. The SDK's comptime topic0 dispatcher invokes
-/// `handle<EventName>(log, ctx)` per matching log; method names mirror the
+/// ERC20 event handlers. Comptime topic0 dispatcher invokes
+/// `handle<EventName>(log, ctx)` per matching log. Method names mirror the
 /// event types declared in `manifest.zig`.
 const sdk = @import("sdk");
 
 const m = @import("manifest.zig");
 
-/// `Ctx` is derived from the entities module — `sdk.Context` introspects
-/// its pub decls for any struct declaring `pub const storage`. Single
-/// source of truth: add or remove an entity in `entities.zig` and both
-/// `Ctx` here and the tuple in `main.zig` pick it up automatically.
+/// `Ctx` derived from the entities module. `sdk.Context` introspects
+/// its pub decls for any struct declaring `pub const storage`. Add or remove
+/// an entity in `entities.zig` and both `Ctx` here and the tuple in `main.zig`
+/// pick it up automatically.
 const Ctx = sdk.Context(@import("entities.zig"));
 
 /// Wrapping arithmetic on balances so a non-genesis start block doesn't
-/// trip integer-overflow safety checks; balances reconcile by head.
+/// trip integer-overflow safety checks. Balances reconcile by head.
 pub fn handleTransfer(log: sdk.Log(m.Transfer), ctx: *Ctx) !void {
     var sender = try ctx.stores.accounts.loadOrInit(log.params.from);
     var receiver = try ctx.stores.accounts.loadOrInit(log.params.to);

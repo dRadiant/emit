@@ -9,8 +9,8 @@
 ///     ./reader /path/to/erc20/data/state.snap
 ///
 /// The schema (mutable count, immutable count, per-slot record size, field
-/// layout) is comptime-known in the indexer. Readers consume that as
-/// external knowledge — there is no per-slot descriptor on disk.
+/// layout) is comptime-known in the indexer. Readers supply it as external
+/// knowledge. No per-slot descriptor exists on disk.
 const std = @import("std");
 
 const MAGIC: *const [8]u8 = "EMITSTAT";
@@ -63,8 +63,8 @@ pub fn main() !void {
         pos += 8;
     }
 
-    // Slot 0 = Account slab. Slot 1 = Allowance (we don't decode it here;
-    // exercise left as the same struct/parse pattern with a different layout).
+    // Slot 0 = Account slab. Slot 1 = Allowance, not decoded here (same
+    // struct/parse pattern with a different layout).
     const account_slab = buf[pos .. pos + mutable_bytes[0]];
     std.debug.assert(account_slab.len % Account.RECORD_SIZE == 0);
     const account_count = account_slab.len / Account.RECORD_SIZE;
@@ -83,8 +83,8 @@ pub fn main() !void {
 }
 
 fn parseAccount(record: *const [Account.RECORD_SIZE]u8) Account {
-    // First field is BE per the format spec (sorted-by-bytes order).
-    // u256 is little-endian for the data fields.
+    // First field is big-endian (sorted-by-bytes order). Data fields are
+    // little-endian.
     return .{
         .id = record[0..20].*,
         .balance = std.mem.readInt(u256, record[20..52], .little),

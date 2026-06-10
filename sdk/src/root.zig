@@ -1,15 +1,14 @@
 /// emit sdk. Library for user indexer projects.
 ///
-/// User code should reach for `sdk.run`, `sdk.init`, the manifest types
+/// Public surface: `sdk.run`, `sdk.init`, the manifest types
 /// (`Manifest`, `ContractDef`, `FactoryDef`), `DecodedLog`, `Context`,
-/// `Options`, `RunStats`, `StorageMode`, `address`, `concat`, and
+/// `Options`, `RunStats`, `StorageMode`, `address`, `concat`,
 /// `validateHandler`. Everything else is implementation detail.
 const std = @import("std");
 
 const eth = @import("eth");
 
-// Implementation modules. Kept private so the user-facing surface stays
-// small. Reach for the re-exports below instead.
+// Private implementation modules. Use the re-exports below instead.
 const abi_parse = @import("abi_parse.zig");
 const entity_serial = @import("entity_serial.zig");
 const entry = @import("entry.zig");
@@ -24,8 +23,9 @@ const event_log = @import("event_log.zig");
 const mutable_store = @import("mutable_store.zig");
 const scanner = @import("scanner.zig");
 const state_snap = @import("state_snap.zig");
+const tcp_client = @import("tcp_client.zig");
 
-// Public submodules: handler-helper utilities the user calls by name.
+// Public submodule: handler-helper utilities called by name.
 pub const manifest = @import("manifest.zig");
 
 // User-facing top-level surface.
@@ -44,6 +44,7 @@ pub const FactoryDef = manifest.FactoryDef;
 pub const init = entry.init;
 pub const Manifest = manifest.Manifest;
 pub const Options = entry.Options;
+pub const RemoteEngine = entry.RemoteEngine;
 pub const PrefetchCall = manifest.PrefetchCall;
 pub const PrefetchDef = manifest.PrefetchDef;
 pub const run = entry.run;
@@ -52,23 +53,21 @@ pub const RunStats = entry.RunStats;
 pub const StaticCall = manifest.StaticCall;
 
 /// Storage mode declared per-entity via `pub const storage: sdk.StorageMode`.
-/// `mutable` → MutableStore (HashMap-fronted, dirty-flag flush, supports
-/// `load` / `loadOrInit` / `save`). `immutable` → ImmutableStore
+/// `mutable` -> MutableStore (HashMap-fronted, dirty-flag flush, supports
+/// `load` / `loadOrInit` / `save`). `immutable` -> ImmutableStore
 /// (append-only events.dat, monotonic key invariant, `load` is a `@compileError`).
 ///
-/// Each entity must declare its mode explicitly — there is no default.
-/// The choice is a real design decision per entity (mutable counter vs.
-/// append-only event log) and silent defaulting would mask mistakes.
+/// No default. Each entity declares its mode explicitly so silent
+/// defaulting cannot mask a mutable-vs-append-only design mistake.
 pub const StorageMode = enum { mutable, immutable };
 
-/// Parse a 20-byte Ethereum address from its hex string at compile time.
-/// Accepts an optional `0x` prefix. If the input contains any uppercase
-/// hex digit, it is interpreted as an EIP-55 checksum and rejected at
-/// compile time when the checksum doesn't match. All-lowercase or
-/// all-uppercase inputs skip checksum validation (consistent with EIP-55,
-/// which makes mixed case the validation signal).
+/// Parse a 20-byte Ethereum address from hex at compile time.
+/// Optional `0x` prefix. Any uppercase hex digit makes the input an
+/// EIP-55 checksum, rejected at compile time on mismatch. All-lowercase
+/// or all-uppercase skips checksum validation (EIP-55 uses mixed case as
+/// the validation signal).
 ///
-/// Use at the manifest call site:
+/// Manifest call site:
 /// `.address = sdk.address("0xae78736Cd615f374D3085123A210448E74Fc6393")`.
 pub fn address(comptime hex: []const u8) [20]u8 {
     return comptime blk: {
@@ -76,8 +75,8 @@ pub fn address(comptime hex: []const u8) [20]u8 {
             "sdk.address: failed to parse '" ++ hex ++ "': " ++ @errorName(err),
         );
 
-        // Detect mixed case (the EIP-55 signal). All-lower or all-upper
-        // means the user opted out of the checksum check.
+        // Mixed case is the EIP-55 signal. All-lower or all-upper opts out
+        // of the checksum check.
         const body: []const u8 = if (hex.len >= 2 and hex[0] == '0' and (hex[1] == 'x' or hex[1] == 'X'))
             hex[2..]
         else
@@ -90,8 +89,8 @@ pub fn address(comptime hex: []const u8) [20]u8 {
         }
         if (has_upper and has_lower) {
             const checksum = eth.primitives.addressToChecksum(&parsed);
-            // checksum is always "0x" + 40 hex chars; compare against body
-            // so the comparison works whether the input had a "0x" prefix.
+            // checksum is "0x" + 40 hex chars. Compare against body so the
+            // match holds whether or not the input had a "0x" prefix.
             if (!std.mem.eql(u8, body, checksum[2..])) @compileError(
                 "sdk.address: '" ++ hex ++ "' fails EIP-55 checksum. Expected '" ++ checksum ++ "'.",
             );
@@ -100,15 +99,14 @@ pub fn address(comptime hex: []const u8) [20]u8 {
     };
 }
 
-/// Concatenate a tuple of fixed-size `[N]u8` arrays into a single
-/// `[total]u8`. Use to build composite primary keys without spelling out
-/// `@memcpy` calls — e.g.,
+/// Concatenate a tuple of fixed-size `[N]u8` arrays into one `[total]u8`.
+/// Builds composite primary keys without manual `@memcpy`:
 ///
 ///     const id = sdk.concat(.{ owner, spender }); // [40]u8
 ///     try ctx.stores.allowances.save(.{ .id = id, .value = value });
 ///
-/// All parts must be `[N]u8` arrays. Length is checked at comptime; the
-/// return type is the sum of the parts' lengths.
+/// All parts must be `[N]u8` arrays, checked at comptime. Return length is
+/// the sum of the parts' lengths.
 pub fn concat(parts: anytype) [concatLen(@TypeOf(parts))]u8 {
     const T = @TypeOf(parts);
     var out: [concatLen(T)]u8 = undefined;
@@ -137,10 +135,9 @@ fn concatLen(comptime T: type) comptime_int {
     return total;
 }
 
-/// Resolve the store type for entity `T`. The entity must declare
-/// `pub const storage: sdk.StorageMode = .mutable | .immutable;` —
-/// no default is provided. Used internally by `Context` and exposed for
-/// users writing their own context shapes.
+/// Resolve the store type for entity `T`. `T` must declare
+/// `pub const storage: sdk.StorageMode = .mutable | .immutable;`, no
+/// default. Used by `Context`, exposed for custom context shapes.
 pub fn storeFor(comptime T: type) type {
     validateEntity(T);
     if (!@hasDecl(T, "storage")) @compileError(
@@ -155,7 +152,7 @@ pub fn storeFor(comptime T: type) type {
 
 /// Comptime check that `T` is a non-empty struct. Per-field type checks
 /// (int or `[N]u8` array) are delegated to entity_serial, which fires its
-/// own `@compileError` for unsupported types when the store is instantiated.
+/// own `@compileError` for unsupported types at store instantiation.
 fn validateEntity(comptime T: type) void {
     const info = @typeInfo(T);
     if (info != .@"struct") @compileError(
@@ -166,11 +163,10 @@ fn validateEntity(comptime T: type) void {
     );
 }
 
-/// Comptime check that `Handler` exposes the required `handle<EventName>`
-/// methods for every event declared in `m`. `sdk.run` runs the same check
-/// internally; this helper lets users surface the error at the top of their
-/// build (e.g. in a `comptime { sdk.validateHandler(...) }` block) instead
-/// of waiting for the full dependency graph to compile.
+/// Comptime check that `Handler` exposes a `handle<EventName>` method for
+/// every event in `m`. `sdk.run` runs the same check internally. This
+/// helper surfaces the error early (e.g. `comptime { sdk.validateHandler(...) }`)
+/// instead of waiting for the full dependency graph to compile.
 pub fn validateHandler(comptime m: Manifest, comptime Handler: type) void {
     const D = handler.dispatcherFor(m);
     D.validateHandler(Handler);
@@ -190,9 +186,10 @@ test {
     _ = filtered_store;
     _ = scanner;
     _ = state_snap;
+    _ = tcp_client;
     _ = event_log;
     _ = entry;
-    // Test-only fixture
+    // Test-only fixture.
     _ = @import("testing/fake_engine.zig");
     _ = @import("live.zig");
 }
@@ -216,16 +213,16 @@ test "concat builds owner+spender allowance key" {
 }
 
 test "address parses lowercase, EIP-55, and rejects bad checksum" {
-    // EIP-55 checksum: vitalik.eth.
+    // EIP-55 checksum (vitalik.eth).
     const a = address("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045");
     try std.testing.expectEqual(@as(u8, 0xd8), a[0]);
     try std.testing.expectEqual(@as(u8, 0x45), a[19]);
 
-    // All-lowercase: skips the checksum check.
+    // All-lowercase skips the checksum check.
     const b = address("0xd8da6bf26964af9d7eed9e03e53415d37aa96045");
     try std.testing.expectEqualSlices(u8, &a, &b);
 
-    // No-prefix lowercase: also accepted.
+    // No-prefix lowercase also accepted.
     const c = address("d8da6bf26964af9d7eed9e03e53415d37aa96045");
     try std.testing.expectEqualSlices(u8, &a, &c);
 }

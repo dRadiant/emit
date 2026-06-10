@@ -1,6 +1,6 @@
-/// ERC20 manifest for rETH. Each event type declares its `signature`; the
-/// SDK derives `topic0` (keccak-256) and the dispatch method name
-/// (`handle<EventName>`) at comptime. Mirrors `examples/erc20`
+/// ERC20 manifest for rETH. Each event declares its `signature`. The SDK
+/// derives `topic0` (keccak-256) and the dispatch name (`handle<EventName>`)
+/// at comptime.
 const sdk = @import("sdk");
 
 pub const Transfer = struct {

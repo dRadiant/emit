@@ -1,18 +1,17 @@
 /// Bulk importer for Nethermind's receipts RocksDB into the flat log store.
-/// Reads the CompactReceiptStore column family directly — no JSON-RPC.
+/// Reads the CompactReceiptStore column family directly, no JSON-RPC.
 ///
-/// Architecture: single reader thread fills a 512-slot ring from the RocksDB
-/// iterator. N worker threads (one per slot modulo) decode RLP → build blooms
-/// → serialize → LZ4 compress. The reader thread also drains completed slots
-/// into the flat store writer in order. Lock-free via atomic slot states.
+/// Single reader thread fills a 512-slot ring from the RocksDB iterator.
+/// N worker threads (one per slot modulo) decode RLP, build blooms,
+/// serialize, LZ4 compress. The reader thread drains completed slots into
+/// the flat store writer in order. Lock-free via atomic slot states.
 ///
-/// Only finalized blocks land in the flat store: we stop at `head - 64`.
+/// Only finalized blocks land in the flat store, stopping at `head - 64`.
 /// Nethermind retains reorg-history receipt rows in the Blocks CF for
 /// not-yet-finalized blocks (multiple entries per block_number with a
-/// discriminator suffix), and our first-8-bytes-as-block_number key parsing
-/// would collapse those onto a single block_number and write whichever
-/// version came last. The pending ring in head_follower fills the trailing
-/// edge canonically.
+/// discriminator suffix). First-8-bytes-as-block_number key parsing would
+/// collapse those onto one block_number and write whichever version came
+/// last. The pending ring in head_follower fills the trailing edge canonically.
 ///
 /// Only compiled when the rocksdb lazy dependency is available (`zig build import`).
 /// Decode logic lives in receipt_decoder.zig (testable without rocksdb).
@@ -38,7 +37,7 @@ const Iterator = ?*c.rocksdb_iterator_t;
 // ── Parallel pipeline ────────────────────────────────────────────────────
 
 /// Ring buffer of decode slots shared between reader and workers.
-/// 512 slots keeps the pipeline full even when individual blocks vary in size.
+/// 512 slots keeps the pipeline full when block sizes vary.
 const SLOT_COUNT = 512;
 const MAX_RAW_VALUE = 2 * 1024 * 1024; // largest observed Nethermind receipt ~1.5 MB
 const MAX_ENTRY_SIZE = 4 + types.BLOCK_BUF_SIZE; // lz4_len(4) + compressed payload
@@ -71,10 +70,10 @@ const WorkerArgs = struct {
 };
 
 /// Fill `slot` with a canonical zero-log entry and empty blooms. Used for
-/// no-log blocks and (on the error path) for blocks we failed to decode —
-/// every block in range MUST land in the flat store so the reader's dense
+/// no-log blocks and, on the error path, for blocks that failed to decode.
+/// Every block in range MUST land in the flat store so the reader's dense
 /// index (`idx = block_number - first_block`) stays aligned. Skipping a block
-/// would shift every later block's logs onto the wrong block number.
+/// shifts every later block's logs onto the wrong block number.
 fn writeEmptyEntry(slot: *Slot, serialize_buf: []u8) void {
     const n = log_serial.serializeLogs(&[_]types.RawLog{}, serialize_buf);
     slot.entry_len = log_serial.compressEntry(serialize_buf[0..n], &slot.entry) catch 0;
@@ -83,8 +82,17 @@ fn writeEmptyEntry(slot: *Slot, serialize_buf: []u8) void {
     slot.log_count = 0;
 }
 
-/// Worker: decode RLP receipts → build blooms → serialize → LZ4 compress.
-/// Stack scratch is safe under the buffer rule in `core.parallel`: spawned
+/// Mark `slot` failed: write a canonical empty entry (so the dense index stays
+/// aligned), flag the error, and publish DONE. Both worker error paths (decode,
+/// compress) share this so the failure protocol has a single definition.
+fn failSlot(slot: *Slot, serialize_buf: []u8) void {
+    writeEmptyEntry(slot, serialize_buf);
+    slot.has_error = true;
+    slot.state.store(Slot.DONE, .release);
+}
+
+/// Worker: decode RLP receipts, build blooms, serialize, LZ4 compress.
+/// Stack scratch is safe under the `core.parallel` buffer rule, spawned
 /// with `WORKER_STACK_SIZE`.
 fn workerFn(args: *WorkerArgs) void {
     var log_buf: [types.MAX_LOGS_PER_BLOCK]types.RawLog = undefined;
@@ -98,29 +106,27 @@ fn workerFn(args: *WorkerArgs) void {
             if (slot.state.load(.acquire) != Slot.FILLED) continue;
 
             const log_count = receipt_decoder.decodeReceipts(
-                slot.block_number, slot.raw_value[0..slot.raw_len], &log_buf, &data_buf,
+                slot.block_number,
+                slot.raw_value[0..slot.raw_len],
+                &log_buf,
+                &data_buf,
             ) catch |e| {
                 std.debug.print("decode error block {d}: {}\n", .{ slot.block_number, e });
-                writeEmptyEntry(slot, &serialize_buf);
-                slot.has_error = true;
-                slot.state.store(Slot.DONE, .release);
+                failSlot(slot, &serialize_buf);
                 continue;
             };
 
-            // No-log blocks (empty post-merge blocks, or blocks whose txs emit
-            // nothing) still flow through here: serializeLogs writes a zero-count
-            // entry, the blooms come out empty, and the writer appends it so the
-            // dense block index stays contiguous. Skipping them corrupts every
-            // later block's number.
+            // No-log blocks still flow through here. serializeLogs writes a
+            // zero-count entry, blooms come out empty, the writer appends it so
+            // the dense block index stays contiguous. Skipping them corrupts
+            // every later block's number.
             const topic_bloom = log_serial.buildTopicBloom(log_buf[0..log_count]);
             const addr_bloom = log_serial.buildAddrBloom(log_buf[0..log_count]);
             const serialized_len = log_serial.serializeLogs(log_buf[0..log_count], &serialize_buf);
 
             slot.entry_len = log_serial.compressEntry(serialize_buf[0..serialized_len], &slot.entry) catch {
                 std.debug.print("compress error block {d}\n", .{slot.block_number});
-                writeEmptyEntry(slot, &serialize_buf);
-                slot.has_error = true;
-                slot.state.store(Slot.DONE, .release);
+                failSlot(slot, &serialize_buf);
                 continue;
             };
 
@@ -130,7 +136,7 @@ fn workerFn(args: *WorkerArgs) void {
             slot.state.store(Slot.DONE, .release);
         }
 
-        // Shutdown signal: reader sets slot 0's block_number to max after iterator exhausted
+        // Shutdown signal: reader sets slot 0's block_number to max once iterator exhausted.
         if (args.slots[0].block_number == std.math.maxInt(u64)) break;
         std.atomic.spinLoopHint();
     }
@@ -143,10 +149,10 @@ const FillStatus = enum { filled, skipped };
 /// block number (leaving it at the next block, or invalid).
 ///
 /// Nethermind keys receipts by block_number(8 BE) ++ block_hash(32) and retains
-/// reorg-orphan rows even for finalized blocks. When a block number carries more
-/// than one row we must keep the one whose hash matches the canonical chain;
-/// `provider` (eth_getBlockByNumber) supplies that hash. Single-row blocks — the
-/// overwhelming majority — take the provider-free fast path. A duplicate with no
+/// reorg-orphan rows even for finalized blocks. A block number with more than
+/// one row keeps the one whose hash matches the canonical chain. `provider`
+/// (eth_getBlockByNumber) supplies that hash. Single-row blocks, the
+/// overwhelming majority, take the provider-free fast path. A duplicate with no
 /// `provider` fails loud rather than guessing.
 fn fillSlotCanonical(slot: *Slot, iter: Iterator, provider: ?*eth.provider.Provider, dup_blocks: *u64) !FillStatus {
     var klen: usize = 0;
@@ -159,7 +165,7 @@ fn fillSlotCanonical(slot: *Slot, iter: Iterator, provider: ?*eth.provider.Provi
     }
     const bn = std.mem.readInt(u64, kp[0..8], .big);
 
-    // Provisionally take the first row; it wins outright unless a duplicate
+    // Provisionally take the first row. It wins outright unless a duplicate
     // group turns up and a sibling matches the canonical hash.
     const have_row = vlen <= MAX_RAW_VALUE;
     if (have_row) {
@@ -172,7 +178,7 @@ fn fillSlotCanonical(slot: *Slot, iter: Iterator, provider: ?*eth.provider.Provi
 
     c.rocksdb_iter_next(iter);
 
-    // Fast path: the next row is a different block (or EOF) — single-row block.
+    // Fast path: next row is a different block (or EOF), single-row block.
     if (!iterValid(iter) or (iterKeyBlock(iter) orelse (bn +% 1)) != bn) {
         if (!have_row) return .skipped;
         finalizeFilled(slot, bn);
@@ -233,8 +239,8 @@ fn iterValid(iter: Iterator) bool {
     return c.rocksdb_iter_valid(iter) != 0;
 }
 
-/// Peek the current iter key as a u64 BE block number. Returns null if
-/// the iter is invalid or the key is shorter than 8 bytes.
+/// Peek the current iter key as a u64 BE block number. Null if the iter
+/// is invalid or the key is shorter than 8 bytes.
 fn iterKeyBlock(iter: Iterator) ?u64 {
     var klen: usize = 0;
     const key_ptr: [*]const u8 = @ptrCast(c.rocksdb_iter_key(iter, &klen) orelse return null);
@@ -245,7 +251,7 @@ fn iterKeyBlock(iter: Iterator) ?u64 {
 // ── Timestamp pass (sibling headers DB) ──────────────────────────────────
 
 /// Thread entry: best-effort timestamp pass. Any failure (missing headers DB,
-/// FD pressure, decode error) is logged and swallowed — block timestamps then
+/// FD pressure, decode error) is logged and swallowed. Block timestamps then
 /// fall back to `humanize.blockTimestamp`, so the log import is never blocked.
 fn importHeaderTimestamps(
     headers_path: [*:0]const u8,
@@ -275,12 +281,19 @@ fn runHeaderTimestamps(
     const opts = c.rocksdb_options_create();
     defer c.rocksdb_options_destroy(opts);
 
-    // headers has a single "default" CF; open it read-only like the receipts DB.
+    // headers has a single "default" CF, open read-only like the receipts DB.
     const cf_names = [_][*c]const u8{@ptrCast("default")};
     const cf_opts = [1]?*const c.rocksdb_options_t{opts};
     var cf_handles: [1]?*c.rocksdb_column_family_handle_t = .{null};
     const db = c.rocksdb_open_for_read_only_column_families(
-        opts, headers_path, 1, &cf_names, &cf_opts, &cf_handles, 0, @ptrCast(&err),
+        opts,
+        headers_path,
+        1,
+        &cf_names,
+        &cf_opts,
+        &cf_handles,
+        0,
+        @ptrCast(&err),
     );
     try rocksErr(&err);
     if (db == null) return error.RocksDBError;
@@ -342,8 +355,8 @@ pub fn main() !void {
         std.process.exit(1);
     }
     // Flags after the two required positionals. --start/--end bound the import
-    // (debug/isolation); --rpc lets the importer resolve the canonical row for
-    // blocks that carry reorg-history receipt duplicates.
+    // (debug/isolation). --rpc resolves the canonical row for blocks carrying
+    // reorg-history receipt duplicates.
     var start_override: ?u64 = null;
     var end_override: ?u64 = null;
     var rpc_url: ?[:0]const u8 = null;
@@ -391,7 +404,7 @@ fn runInner(
     const allocator = std.heap.page_allocator;
 
     // Open Nethermind's receipts DB read-only with column families.
-    // "Blocks" CF contains receipts keyed by block number (u64 BE).
+    // "Blocks" CF holds receipts keyed by block number (u64 BE).
     var err: ?[*:0]u8 = null;
     const opts = c.rocksdb_options_create();
     defer c.rocksdb_options_destroy(opts);
@@ -401,7 +414,14 @@ fn runInner(
     var cf_handles: [3]?*c.rocksdb_column_family_handle_t = .{ null, null, null };
 
     const db = c.rocksdb_open_for_read_only_column_families(
-        opts, receipts_path, 3, &cf_names, &cf_opts, &cf_handles, 0, @ptrCast(&err),
+        opts,
+        receipts_path,
+        3,
+        &cf_names,
+        &cf_opts,
+        &cf_handles,
+        0,
+        @ptrCast(&err),
     );
     try rocksErr(&err);
     if (db == null) return error.RocksDBError;
@@ -425,9 +445,9 @@ fn runInner(
     if (iter == null) return error.RocksDBError;
     defer c.rocksdb_iter_destroy(iter);
 
-    // Query chain head; cap import at head - FINALITY_DEPTH so the flat store
-    // only contains finalized blocks. The pending ring (head_follower) fills
-    // the trailing edge canonically.
+    // Cap import at head - FINALITY_DEPTH so the flat store holds only
+    // finalized blocks. The pending ring (head_follower) fills the trailing
+    // edge canonically.
     c.rocksdb_iter_seek_to_last(iter);
     if (!iterValid(iter)) {
         std.debug.print("Receipts DB is empty; nothing to import.\n", .{});
@@ -441,10 +461,10 @@ fn runInner(
 
     // Backfill timestamps.bin from the sibling `headers` DB over the store's
     // full finalized range, concurrent with the receipts decode (different DB,
-    // different output file). Runs even when the log import is already caught
-    // up, so an existing store still gets its historical timestamps. The pass
-    // resumes from the first un-backfilled block. Best-effort: any failure
-    // leaves block timestamps on the formula fallback.
+    // different output file). Runs even when the log import is caught up, so an
+    // existing store still gets its historical timestamps. Resumes from the
+    // first un-backfilled block. Best-effort: any failure leaves block
+    // timestamps on the formula fallback.
     const ts_first_block: u64 = if (writer.meta.blocks_idx_count > 0)
         writer.first_block
     else
@@ -464,7 +484,7 @@ fn runInner(
 
     // Resume from where we left off, else start at the merge (or an explicit
     // override for bounded runs). Pre-merge events are rarely an indexing
-    // target; users who need them should pre-seed the data dir.
+    // target. Users who need them should pre-seed the data dir.
     const start_block: u64 = start_override orelse if (writer.meta.last_finalized_block > 0)
         writer.meta.last_finalized_block + 1
     else
@@ -510,8 +530,8 @@ fn runInner(
         workers[i] = try std.Thread.spawn(.{ .stack_size = parallel.WORKER_STACK_SIZE }, workerFn, .{&worker_args[i]});
     }
 
-    // Reader + writer loop. `read_done` flips once we've consumed past
-    // `finality_cutoff` or exhausted the iter; the drain phase then runs
+    // Reader + writer loop. `read_done` flips once consumed past
+    // `finality_cutoff` or the iter is exhausted. The drain phase then runs
     // until in-flight slots are flushed.
     var read_cursor: usize = 0;
     var write_cursor: usize = 0;
@@ -553,8 +573,8 @@ fn runInner(
             blocks_with_logs += 1;
             total_logs += slot.log_count;
         }
-        // Append every block — including no-log and (post-loop-fatal) errored
-        // ones — so the flat store's dense index never skips a block number.
+        // Append every block, including no-log and (post-loop-fatal) errored
+        // ones, so the flat store's dense index never skips a block number.
         try writer.appendBlock(slot.block_number, slot.entry[0..slot.entry_len], &slot.topic_bloom, &slot.addr_bloom);
 
         blocks_processed += 1;
@@ -564,14 +584,13 @@ fn runInner(
         if (blocks_processed % 100_000 == 0) {
             const elapsed_s = @as(f64, @floatFromInt(std.time.nanoTimestamp() - t_start)) / 1e9;
             std.debug.print("  {d:>10} blocks | {d:>12} logs | {d:.1}s | {d:.0} blk/s | {d:.0} logs/s\n", .{
-                blocks_processed, total_logs, elapsed_s,
-                @as(f64, @floatFromInt(blocks_processed)) / elapsed_s,
-                @as(f64, @floatFromInt(total_logs)) / elapsed_s,
+                blocks_processed,                                      total_logs,                                      elapsed_s,
+                @as(f64, @floatFromInt(blocks_processed)) / elapsed_s, @as(f64, @floatFromInt(total_logs)) / elapsed_s,
             });
         }
     }
 
-    // Signal workers to exit and wait
+    // Signal workers to exit (max block_number sentinel), then join.
     slots[0].block_number = std.math.maxInt(u64);
     for (&workers) |*w| w.join();
     if (ts_thread) |t| t.join();

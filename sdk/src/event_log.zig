@@ -1,9 +1,8 @@
 /// Owns one `<entity>.events.dat` file for a single ImmutableStore type.
 /// Append-only flat record file mirroring the engine's `blocks.dat` pattern.
-/// The authoritative record count lives in `state.snap`, not in this file's
-/// header. Any trailing bytes past `count * record_size` are orphan records
-/// from a crashed prior commit; readers ignore them and the next append
-/// overwrites them.
+/// Authoritative record count lives in `state.snap`, not in this file's
+/// header. Trailing bytes past `count * record_size` are orphan records
+/// from a crashed prior commit. Readers ignore them, next append overwrites.
 ///
 /// Layout:
 ///   magic            [8]u8       "EMITEVTS"
@@ -34,7 +33,7 @@ pub fn EventLog(comptime T: type) type {
         file: std.fs.File,
 
         /// Open `<dir>/<name>` for append + random read. Creates the file
-        /// with a fresh magic header on first use; a wrong magic surfaces
+        /// with a fresh magic header on first use. Wrong magic surfaces
         /// `error.InvalidMagic` so the caller can fail loud.
         pub fn open(allocator: std.mem.Allocator, dir: std.fs.Dir, name: []const u8) !Self {
             const file = try core.flat_format.openOrCreateWithMagic(dir, name, MAGIC);
@@ -47,7 +46,7 @@ pub fn EventLog(comptime T: type) type {
 
         /// Append records at byte offset `HEADER_SIZE + at_count * record_size`.
         /// Caller passes `at_count` from `state.snap.immutable_counts[slot]`
-        /// so any orphan trailing bytes from a crashed prior commit are
+        /// so orphan trailing bytes from a crashed prior commit get
         /// overwritten by the new records.
         pub fn append(self: *Self, records: []const T, at_count: u64) !void {
             if (records.len == 0) return;
@@ -69,8 +68,8 @@ pub fn EventLog(comptime T: type) type {
             try self.file.sync();
         }
 
-        /// Read the record at index `i`. Caller is responsible for ensuring
-        /// `i < state.snap.immutable_counts[slot]`; reading past the
+        /// Read the record at index `i`. Caller must ensure
+        /// `i < state.snap.immutable_counts[slot]`. Reading past the
         /// authoritative count may return orphan bytes from a crashed
         /// prior commit.
         pub fn read(self: *Self, i: u64) !T {
@@ -94,6 +93,7 @@ pub fn EventLog(comptime T: type) type {
         /// Binary search for the record whose key equals `target`. `count`
         /// is the authoritative record count (from `state.snap`). Returns
         /// the record index, or null if absent.
+        /// Keys are big-endian, so byte order matches numeric order.
         pub fn binarySearch(self: *Self, count: u64, target: KeyBytes) !?u64 {
             if (count == 0) return null;
             var lo: u64 = 0;
@@ -210,8 +210,7 @@ test "orphan trailing bytes past count are invisible and overwritten by next app
     };
     try log.append(&orphan, good.len);
 
-    // state.snap would still record count=2; the binary search bounded by the
-    // authoritative count must NOT see the orphan records.
+    // Binary search bounded by the authoritative count (2) must NOT see orphans.
     try testing.expect((try log.binarySearch(good.len, keyAt(200, 0))) == null);
 
     // Next legitimate append overwrites the orphans starting at offset 2.

@@ -1,6 +1,5 @@
-/// ERC20 example indexer (rETH on mainnet). All glue lives in
-/// `examples/utils/cli.zig`; this file just wires the manifest, handlers,
-/// and entities together.
+/// ERC20 example indexer (rETH on mainnet). Glue lives in
+/// `examples/utils/cli.zig`. Wires manifest, handlers, and entities.
 const sdk = @import("sdk");
 const cli = @import("cli");
 

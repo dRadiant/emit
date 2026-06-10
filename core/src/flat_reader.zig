@@ -1,10 +1,13 @@
 /// Read-only access to the flat log store (blocks.dat + blocks.idx + blooms.bin).
-/// Thread-safe — multiple readers can operate concurrently via pread + mmap.
-/// Writer lives in engine; this module is read-only infrastructure shared by
-/// engine (status/validation) and sdk (filtered index builds).
+/// Thread-safe. Multiple readers operate concurrently via pread + mmap.
+/// Writer lives in engine. Read-only infrastructure shared by engine
+/// (status/validation) and sdk (filtered index builds).
 const std = @import("std");
 
 const bloom = @import("bloom.zig");
+const types = @import("types.zig");
+const log_serial = @import("log_serial.zig");
+const timestamps = @import("timestamps.zig");
 
 // ── Flat store format constants ──────────────────────────────────────────
 
@@ -22,8 +25,8 @@ pub const META_SIZE = 40;
 // ── Meta ─────────────────────────────────────────────────────────────────
 
 /// Flat store checkpoint persisted to meta.bin via atomic write (tmp + rename).
-/// Enables crash recovery: on restart, resume from last_finalized_block + 1.
-/// Checksum is XOR of all fields with a magic constant — detects partial writes.
+/// Crash recovery resumes from last_finalized_block + 1.
+/// Checksum is XOR of all fields with a magic constant, detecting partial writes.
 pub const Meta = struct {
     last_finalized_block: u64,
     blocks_dat_size: u64,
@@ -65,7 +68,7 @@ const MmapSlice = []align(std.heap.page_size_min) const u8;
 pub const BlockLoc = struct { offset: u64, length: u32 };
 
 /// Read-only handle to the flat log store. blocks.idx and blooms.bin are
-/// mmap'd for O(1) lookups; blocks.dat is read via pread (or io_uring in
+/// mmap'd for O(1) lookups. blocks.dat is read via pread (or io_uring in
 /// block_filter). All fields are pub for in-memory test construction.
 pub const FlatStoreReader = struct {
     blocks_file: std.fs.File, // pread target for block data
@@ -88,8 +91,12 @@ pub const FlatStoreReader = struct {
         if (idx_size < INDEX_HEADER_SIZE) return error.InvalidIndex;
 
         const index_map = try std.posix.mmap(
-            null, idx_size, std.posix.PROT.READ,
-            .{ .TYPE = .SHARED }, idx_file.handle, 0,
+            null,
+            idx_size,
+            std.posix.PROT.READ,
+            .{ .TYPE = .SHARED },
+            idx_file.handle,
+            0,
         );
 
         const first_block = std.mem.readInt(u64, index_map[0..8], .little);
@@ -102,8 +109,12 @@ pub const FlatStoreReader = struct {
         if (blooms_size < BLOOM_HEADER_SIZE) return error.InvalidBlooms;
 
         const blooms_map = try std.posix.mmap(
-            null, blooms_size, std.posix.PROT.READ,
-            .{ .TYPE = .SHARED }, blooms_file.handle, 0,
+            null,
+            blooms_size,
+            std.posix.PROT.READ,
+            .{ .TYPE = .SHARED },
+            blooms_file.handle,
+            0,
         );
 
         const blooms_count = std.mem.readInt(u64, blooms_map[0..8], .little);
@@ -157,8 +168,7 @@ pub const FlatStoreReader = struct {
     }
 
     /// Binary search for the first bloom entry with block_number >= target.
-    /// Bloom entries are sorted ascending by block number (big-endian).
-    /// Skips ~33% of entries when start_block > 0. O(log N).
+    /// Bloom entries are sorted ascending by block number (big-endian). O(log N).
     pub fn findBloomStart(self: *const FlatStoreReader, target_block: u64) usize {
         const base = self.blooms_map[BLOOM_HEADER_SIZE..];
         var lo: usize = 0;
@@ -236,6 +246,98 @@ pub fn testReader(
         .index_count = std.mem.readInt(u64, index_buf[8..16], .little),
         .blooms_count = std.mem.readInt(u64, blooms_buf[0..8], .little),
     };
+}
+
+/// One log for `writeTestStore`. A single `topic0` (topic_count = 1) covers the
+/// bloom-and-filter cases. The few tests that need multi-topic blocks (indexed
+/// factory params) still hand-build their store.
+pub const TestLog = struct {
+    address: [20]u8,
+    topic0: [32]u8,
+    data: []const u8 = &.{},
+    tx_index: u16 = 0,
+    log_index: u16 = 0,
+};
+
+/// One block for `writeTestStore`. `timestamp` 0 means "omit": a timestamps.bin
+/// is written only when at least one block carries a non-zero timestamp.
+pub const TestBlock = struct {
+    block_number: u64,
+    logs: []const TestLog,
+    timestamp: u32 = 0,
+};
+
+/// Write a synthetic flat store (blocks.dat/.idx + blooms.bin, plus a
+/// timestamps.bin when any block sets `timestamp`) into `dir`, in the exact
+/// on-disk format `FlatStoreReader` reads. The shared fixture for the engine
+/// and sdk test suites (neither imports the other). `blocks` must be ascending
+/// and dense. The reader indexes by `block - first_block`.
+pub fn writeTestStore(dir: std.fs.Dir, blocks: []const TestBlock, allocator: std.mem.Allocator) !void {
+    var blocks_file = try dir.createFile("blocks.dat", .{});
+    defer blocks_file.close();
+    var idx_file = try dir.createFile("blocks.idx", .{});
+    defer idx_file.close();
+    var blooms_file = try dir.createFile("blooms.bin", .{});
+    defer blooms_file.close();
+
+    var idx_hdr: [INDEX_HEADER_SIZE]u8 = undefined;
+    std.mem.writeInt(u64, idx_hdr[0..8], blocks[0].block_number, .little);
+    std.mem.writeInt(u64, idx_hdr[8..16], blocks.len, .little);
+    try idx_file.writeAll(&idx_hdr);
+
+    var blooms_hdr: [BLOOM_HEADER_SIZE]u8 = undefined;
+    std.mem.writeInt(u64, &blooms_hdr, blocks.len, .little);
+    try blooms_file.writeAll(&blooms_hdr);
+
+    const serialize_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
+    defer allocator.free(serialize_buf);
+    const compress_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
+    defer allocator.free(compress_buf);
+
+    var any_ts = false;
+    for (blocks) |blk| {
+        if (blk.timestamp != 0) any_ts = true;
+    }
+    var ts_writer = if (any_ts) try timestamps.TimestampWriter.open(dir, blocks[0].block_number) else null;
+    defer if (ts_writer) |*w| w.deinit();
+
+    var offset: u64 = 0;
+    for (blocks) |blk| {
+        const raw_logs = try allocator.alloc(types.RawLog, blk.logs.len);
+        defer allocator.free(raw_logs);
+        for (blk.logs, 0..) |tl, i| {
+            raw_logs[i] = .{
+                .block_number = blk.block_number,
+                .tx_index = tl.tx_index,
+                .log_index = tl.log_index,
+                .address = tl.address,
+                .topic_count = 1,
+                .topics = .{ tl.topic0, [_]u8{0} ** 32, [_]u8{0} ** 32, [_]u8{0} ** 32 },
+                .data = tl.data,
+                .tx_hash = [_]u8{0xFE} ** 32,
+            };
+        }
+
+        const written = log_serial.serializeLogs(raw_logs, serialize_buf);
+        const entry_len = try log_serial.compressEntry(serialize_buf[0..written], compress_buf);
+        try blocks_file.writeAll(compress_buf[0..entry_len]);
+
+        var idx_entry: [INDEX_ENTRY_SIZE]u8 = undefined;
+        std.mem.writeInt(u64, idx_entry[0..8], offset, .little);
+        std.mem.writeInt(u32, idx_entry[8..12], @intCast(entry_len), .little);
+        try idx_file.writeAll(&idx_entry);
+
+        const tb = log_serial.buildTopicBloom(raw_logs);
+        const ab = log_serial.buildAddrBloom(raw_logs);
+        var bloom_entry: [BLOOM_ENTRY_SIZE]u8 = std.mem.zeroes([BLOOM_ENTRY_SIZE]u8);
+        std.mem.writeInt(u64, bloom_entry[0..8], blk.block_number, .big);
+        @memcpy(bloom_entry[TOPIC_BLOOM_OFFSET..][0..bloom.BLOOM_SIZE], &tb.bits);
+        @memcpy(bloom_entry[ADDR_BLOOM_OFFSET..][0..bloom.ADDR_BLOOM_SIZE], &ab.bits);
+        try blooms_file.writeAll(&bloom_entry);
+
+        if (blk.timestamp != 0) try ts_writer.?.set(blk.block_number, blk.timestamp);
+        offset += entry_len;
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────

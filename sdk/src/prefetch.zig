@@ -1,5 +1,5 @@
-/// Phase 4 gather → dedupe → filterUncached. All allocations come from a
-/// caller-owned arena so the entire phase frees in one `arena.deinit()`.
+/// gather → dedupe → filterUncached. All allocations come from a caller-owned
+/// arena so the entire phase frees in one `arena.deinit()`.
 const std = @import("std");
 
 const core = @import("core");
@@ -13,8 +13,8 @@ const RawLog = core.RawLog;
 const log_serial = core.log_serial;
 const types = core.types;
 
-/// One `Call` per `static_prefetch` entry. Selectors dupe into arena memory
-/// so every `Call.calldata` shares the same lifetime as the dynamic-channel.
+/// One `Call` per `static_prefetch` entry. Selectors dupe into arena memory so
+/// every `Call.calldata` shares the dynamic-channel lifetime.
 pub fn gatherStatic(
     arena: std.mem.Allocator,
     comptime m: sdk_manifest.Manifest,
@@ -29,10 +29,9 @@ pub fn gatherStatic(
     return out;
 }
 
-/// Live-mode counterpart to `gatherDynamic`: walks the logs of a single
-/// pending block and emits one `Call` per `(matching log, declared
-/// PrefetchCall)`. The live loop calls this before child-event dispatch
-/// so factory children's metadata lands in the cache in time.
+/// Live-mode counterpart to `gatherDynamic`. Walks one pending block's logs and
+/// emits one `Call` per `(matching log, declared PrefetchCall)`. Live loop calls
+/// it before child-event dispatch so factory children's metadata is cached in time.
 pub fn gatherOneBlock(
     arena: std.mem.Allocator,
     logs: []const RawLog,
@@ -45,10 +44,9 @@ pub fn gatherOneBlock(
     return out.toOwnedSlice(arena);
 }
 
-/// Walk `logs` and append one `Call` to `out` per `(matching log, declared
-/// PrefetchCall)`. The matching shape is identical between live (one
-/// block's logs) and backfill (every block's logs in the filtered index);
-/// keep this in one place so the two paths can't drift.
+/// Append one `Call` to `out` per `(matching log, declared PrefetchCall)`.
+/// Matching shape is identical between live (one block's logs) and backfill
+/// (every block in the filtered index). Single source so the paths can't drift.
 fn matchAndAppend(
     arena: std.mem.Allocator,
     out: *std.ArrayList(ethcall.Call),
@@ -77,8 +75,8 @@ fn matchAndAppend(
     }
 }
 
-/// Walk the filtered index (primary + children pairs when present) and
-/// emit one `Call` per `(matching log, declared PrefetchCall)`.
+/// Walk the filtered index (primary + children pairs when present), emitting one
+/// `Call` per `(matching log, declared PrefetchCall)`.
 pub fn gatherDynamic(
     arena: std.mem.Allocator,
     dir: std.fs.Dir,
@@ -130,8 +128,8 @@ pub fn dedupe(arena: std.mem.Allocator, calls: []const ethcall.Call) ![]ethcall.
     return out.toOwnedSlice(arena);
 }
 
-/// Drop entries already in the cache; order-preserving. Cache lookups
-/// are in-memory hash hits, so no transaction or batch helper is needed.
+/// Drop entries already in the cache, order-preserving. Lookups are in-memory
+/// hash hits, so no transaction or batch helper is needed.
 pub fn filterUncached(
     arena: std.mem.Allocator,
     cache: *const ethcall.Cache,
@@ -338,7 +336,7 @@ test "gatherOneBlock returns empty when no log matches a PrefetchDef" {
         }},
     };
 
-    // A Transfer log; topic0 doesn't match PairCreated.
+    // A Transfer log. topic0 doesn't match PairCreated.
     const transfer_topic = sdk_manifest.eventTopic0(Transfer);
     const log: RawLog = .{
         .block_number = 100,

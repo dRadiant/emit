@@ -3,21 +3,21 @@
 /// ## Determinism contract
 ///
 /// Handlers must be pure functions of `(log, prior state)`. The SDK
-/// re-dispatches blocks on reorg recovery and on restart against an
-/// existing entity store; both rely on a handler producing the same
-/// mutations for the same inputs.
+/// re-dispatches blocks on reorg recovery and on restart against an existing
+/// entity store. Both rely on a handler producing the same mutations for the
+/// same inputs.
 ///
 /// Forbidden inside a handler:
 /// - `std.time` / wall-clock reads
 /// - randomness (`std.crypto.random`, `std.rand`, anything entropic)
 /// - direct HTTP / RPC calls
 /// - reads from the engine's pending file or any external state outside
-///   `log`, `ctx.stores.*.load*`, and `ctx.ethCall` (which is itself a
-///   strict cache read against pre-fetched immutable metadata)
+///   `log`, `ctx.stores.*.load*`, and `ctx.ethCall` (a strict cache read
+///   against pre-fetched immutable metadata)
 ///
 /// Block time, if needed, comes from `ctx.timestamp` (derived from
-/// `block_number` via `humanize.blockTimestamp` — the 12 s consensus
-/// invariant, not the system clock). Anything else breaks replay.
+/// `block_number` via `humanize.blockTimestamp`, not the system clock).
+/// Anything else breaks replay.
 const std = @import("std");
 
 const core = @import("core");
@@ -26,17 +26,17 @@ const abi_parse = @import("abi_parse.zig");
 const manifest = @import("manifest.zig");
 
 /// View of a single log presented to a handler. `data` borrows from the
-/// scanner's per-block decompression buffer and is valid only for the
-/// duration of the handler invocation.
+/// scanner's per-block decompression buffer, valid only for the duration of the
+/// handler invocation.
 ///
 /// Two decoder layers:
 ///
 /// 1. **Slot-positional**: `indexedAddress(i)`, `dataU256(word)`, etc.
 ///    For one-off ad-hoc reads or signatures without parameter names.
-/// 2. **Name-resolved**: `param(E, "from")` — single helper whose return
-///    type is comptime-resolved from `E.signature`. `address` → `[20]u8`,
-///    `uintN` → `uN`, `intN` → `iN`, `boolean` → `bool`, `bytesN` → `[N]u8`.
-///    Wrong parameter name or unsupported type is a `@compileError`.
+/// 2. **Name-resolved**: `param(E, "from")`, return type comptime-resolved from
+///    `E.signature`. `address`→`[20]u8`, `uintN`→`uN`, `intN`→`iN`,
+///    `boolean`→`bool`, `bytesN`→`[N]u8`. Wrong parameter name or unsupported
+///    type is a `@compileError`.
 pub const DecodedLog = struct {
     block_number: u64,
     tx_index: u16,
@@ -60,38 +60,37 @@ pub const DecodedLog = struct {
         };
     }
 
-    /// Read the i-th indexed event parameter as an address. Indexed
-    /// parameters live in `topics[i + 1]` (topic0 is the event selector).
-    /// EVM addresses are right-padded inside their 32-byte word; the
-    /// trailing 20 bytes are the address.
+    /// Read the i-th indexed event parameter as an address. Indexed parameters
+    /// live in `topics[i + 1]` (topic0 is the event selector). EVM addresses are
+    /// right-padded inside their 32-byte word, so the trailing 20 bytes are the
+    /// address.
     pub fn indexedAddress(self: DecodedLog, i: u8) [20]u8 {
         return self.topics[i + 1][12..32].*;
     }
 
     /// Read the `word`-th 32-byte slot of `data` as a big-endian u256.
-    /// Most ERC20-class events pack each non-indexed parameter in one
-    /// word; `dataU256(0)` reads the value from a Transfer or Approval log.
+    /// Most ERC20-class events pack each non-indexed parameter in one word.
+    /// `dataU256(0)` reads the value from a Transfer or Approval log.
     pub fn dataU256(self: DecodedLog, word: u8) u256 {
         const start = @as(usize, word) * 32;
         return std.mem.readInt(u256, self.data[start..][0..32], .big);
     }
 
-    /// Read the `word`-th 32-byte slot of `data` as an address. EVM
-    /// addresses are right-padded inside their 32-byte word; the trailing
-    /// 20 bytes are the address. Symmetric with `indexedAddress` for the
-    /// non-indexed case (e.g., Uniswap V2 `PairCreated`'s `pair`).
+    /// Read the `word`-th 32-byte slot of `data` as an address. EVM addresses
+    /// are right-padded inside their 32-byte word, so the trailing 20 bytes are
+    /// the address. Symmetric with `indexedAddress` for the non-indexed case
+    /// (e.g. Uniswap V2 `PairCreated`'s `pair`).
     pub fn dataAddress(self: DecodedLog, word: u8) [20]u8 {
         const start = @as(usize, word) * 32;
         return self.data[start + 12 ..][0..20].*;
     }
 
-    /// Read a named parameter from `E.signature`. The return type is derived at
-    /// comptime — `address`→`[20]u8`, `uintN`→`uN`, `intN`→`iN`, `bool`→`bool`,
-    /// `bytesN`→`[N]u8`, `T[N]`→`[N]…`, `(t1,…)`→a Zig tuple, and `T[]`→a
-    /// zero-copy `Array(T)` view borrowing `log.data`. Wrong names list the
-    /// available params. An indexed array/tuple/`bytes`/`string` stores
-    /// `keccak(value)`, not the value — those error with a pointer at the raw
-    /// `log.topics[i]`.
+    /// Read a named parameter from `E.signature`. Return type derived at
+    /// comptime: `address`→`[20]u8`, `uintN`→`uN`, `intN`→`iN`, `bool`→`bool`,
+    /// `bytesN`→`[N]u8`, `T[N]`→`[N]…`, `(t1,…)`→a Zig tuple, `T[]`→a zero-copy
+    /// `Array(T)` view borrowing `log.data`. Wrong names list the available
+    /// params. An indexed array/tuple/`bytes`/`string` stores `keccak(value)`,
+    /// not the value, so those error with a pointer at the raw `log.topics[i]`.
     pub fn param(self: DecodedLog, comptime E: type, comptime param_name: []const u8) TypeFor(resolveParam(E, param_name).type_str) {
         const p = comptime resolveParam(E, param_name);
         if (comptime p.slot_kind == .topic) {
@@ -103,11 +102,11 @@ pub const DecodedLog = struct {
     }
 
     /// Decode every named parameter of `E.signature` into one struct.
-    /// `ParamsOf(E)` has one field per named parameter with the right Zig
-    /// type (see `param`). Unnamed parameters are skipped. Data slots beyond
-    /// `self.data.len` are zero-filled (the ABI's zero-padding convention;
-    /// keeps the dispatcher safe against malformed RPC responses or short test
-    /// fixtures). Errors if any named param is an indexed non-primitive.
+    /// `ParamsOf(E)` has one field per named parameter with the right Zig type
+    /// (see `param`). Unnamed parameters are skipped. Data slots beyond
+    /// `self.data.len` are zero-filled (ABI zero-padding, also guards against
+    /// malformed RPC responses or short test fixtures). Errors if any named
+    /// param is an indexed non-primitive.
     pub fn decode(self: DecodedLog, comptime E: type) ParamsOf(E) {
         var out: ParamsOf(E) = undefined;
         inline for (comptime manifest.parsedEvent(E).params) |p| {
@@ -123,9 +122,9 @@ pub const DecodedLog = struct {
         return out;
     }
 
-    /// Canonical 16-byte event id. Equivalent to `EventId.pack` over this
-    /// log's `(block_number, tx_index, log_index)`. See `EventId` for the byte
-    /// layout and the inverse `unpack`.
+    /// Canonical 16-byte event id. Equivalent to `EventId.pack` over this log's
+    /// `(block_number, tx_index, log_index)`. See `EventId` for the byte layout
+    /// and the inverse `unpack`.
     pub fn eventId(self: DecodedLog) [16]u8 {
         return (EventId{
             .block_number = self.block_number,
@@ -137,13 +136,11 @@ pub const DecodedLog = struct {
 
 /// Structured view of an event's 16-byte storage key. `pack` and `unpack` are
 /// inverses, so `EventId.unpack(log.eventId())` round-trips. The packed form is
-/// big-endian, so byte-order sort equals chronological `(block, tx, log)` order
-/// — that is what lets `ImmutableStore.save` append in monotonic-key order. It
-/// is the binary equivalent of envio's `${block.number}-${logIndex}` string id
-/// without the runtime concat.
+/// big-endian, so byte-order sort equals chronological `(block, tx, log)`
+/// order, which lets `ImmutableStore.save` append in monotonic-key order.
 ///
-/// `pack` also builds a key from components, which makes the immutable by-key
-/// read usable: `ctx.read(MyEvent, (EventId{ ... }).pack())`.
+/// `pack` also builds a key from components, making the immutable by-key read
+/// usable as `ctx.read(MyEvent, (EventId{ ... }).pack())`.
 ///
 /// Layout: `block_number(BE u64) ++ tx_index(BE u32) ++ log_index(BE u32)`.
 /// A log's `tx_index`/`log_index` are u16-ranged at the source and widen into
@@ -178,7 +175,7 @@ fn resolveParam(comptime E: type, comptime param_name: []const u8) abi_parse.Par
 
 /// Zig type the decoder returns for an ABI type string. Recurses over the
 /// `abi_parse.typeShape` structure: `T[N]`→`[N]TypeFor(T)`, `(t1,…)`→a Zig
-/// tuple, `T[]`→an `Array(T)` view; primitives map via `PrimType`.
+/// tuple, `T[]`→an `Array(T)` view. Primitives map via `PrimType`.
 fn TypeFor(comptime t: []const u8) type {
     const s = abi_parse.typeShape(t);
     return switch (s.tag) {
@@ -191,7 +188,7 @@ fn TypeFor(comptime t: []const u8) type {
 
 /// Primitive Solidity type → Zig type. `address`→`[20]u8`, `uintN`→`uN`,
 /// `intN`→`iN`, `bytesN`→`[N]u8`, `bool`→`bool`. Dynamic `bytes`/`string`
-/// values are rejected (their storage lands with v1.2 blobs).
+/// values are rejected.
 fn PrimType(comptime t: []const u8) type {
     if (comptime std.mem.eql(u8, t, "address")) return [20]u8;
     if (comptime std.mem.eql(u8, t, "bool")) return bool;
@@ -210,8 +207,8 @@ fn TupleType(comptime components: []const []const u8) type {
 }
 
 /// Zero-copy view over a dynamic array `elem[]` in `log.data`. Borrows the log
-/// data — valid only while the source `DecodedLog`/`Log(E)` is. Iterate with
-/// `arr.len` and `arr.at(i)`; element `i` is decoded on access.
+/// data, valid only while the source `DecodedLog`/`Log(E)` is. Iterate with
+/// `arr.len` and `arr.at(i)`. Element `i` is decoded on access.
 pub fn Array(comptime elem: []const u8) type {
     return struct {
         const Self = @This();
@@ -229,7 +226,7 @@ pub fn Array(comptime elem: []const u8) type {
     };
 }
 
-/// True if `t` is a static primitive — the only thing an indexed (topic) slot
+/// True if `t` is a static primitive, the only thing an indexed (topic) slot
 /// can hold as its actual value. Indexed arrays/tuples/`bytes`/`string` hold
 /// `keccak(value)` instead.
 fn isTopicPrimitive(comptime t: []const u8) bool {
@@ -238,8 +235,8 @@ fn isTopicPrimitive(comptime t: []const u8) bool {
 
 /// Recursively decode an ABI value of canonical type `t` from `data` whose head
 /// word starts at byte `head_off`. Supports any fully-static type (nested
-/// arrays/tuples/primitives) and a top-level dynamic array of a static element;
-/// deeper dynamic nesting and `bytes`/`string` values are `@compileError`.
+/// arrays/tuples/primitives) and a top-level dynamic array of a static element.
+/// Deeper dynamic nesting and `bytes`/`string` values are `@compileError`.
 fn decodeValue(comptime t: []const u8, data: []const u8, head_off: usize) TypeFor(t) {
     const s = comptime abi_parse.typeShape(t);
     switch (comptime s.tag) {
@@ -267,7 +264,7 @@ fn decodeValue(comptime t: []const u8, data: []const u8, head_off: usize) TypeFo
         },
         .dynamic_array => {
             if (comptime abi_parse.isDynamicType(s.elem)) @compileError("DecodedLog: dynamic array of dynamic elements (`" ++ t ++ "`) not yet supported");
-            // Head word holds the tail offset (relative to `data`); the word at
+            // Head word holds the tail offset (relative to `data`). The word at
             // that offset is the length, then the elements follow.
             const tail = readOffset(data, head_off);
             return TypeFor(t){ .data = data, .tail = tail, .len = readOffset(data, tail) };
@@ -288,15 +285,15 @@ fn readOffset(data: []const u8, off: usize) usize {
 }
 
 /// Comptime struct synthesized from `E.signature`: one field per named
-/// parameter with the right Zig type (see `TypeFor`). Unnamed parameters
-/// are skipped — for fully-positional reads, use `log.param` / `log.dataU256`.
+/// parameter with the right Zig type (see `TypeFor`). Unnamed parameters are
+/// skipped. For fully-positional reads, use `log.param` / `log.dataU256`.
 pub fn ParamsOf(comptime E: type) type {
     return comptime blk: {
         var fields: []const std.builtin.Type.StructField = &.{};
         for (manifest.parsedEvent(E).params) |p| {
             if (p.name.len == 0) continue;
             const T = TypeFor(p.type_str);
-            // StructField.name needs a sentinel; the parser's slice into the
+            // StructField.name needs a sentinel. The parser's slice into the
             // signature has none, so reformat at comptime.
             fields = fields ++ &[_]std.builtin.Type.StructField{.{
                 .name = std.fmt.comptimePrint("{s}", .{p.name}),
@@ -339,10 +336,10 @@ fn parseBits(comptime s: []const u8) comptime_int {
     return n;
 }
 
-/// Typed log handed to handlers by the dispatcher: same meta shape as
-/// `DecodedLog`, plus a comptime-decoded `params: ParamsOf(E)` so handlers
-/// read named fields directly (`log.params.from`) instead of routing every
-/// access through `log.param(E, "from")`.
+/// Typed log handed to handlers by the dispatcher. Same meta shape as
+/// `DecodedLog`, plus a comptime-decoded `params: ParamsOf(E)` so handlers read
+/// named fields directly (`log.params.from`) instead of routing every access
+/// through `log.param(E, "from")`.
 pub fn Log(comptime E: type) type {
     return struct {
         block_number: u64,
@@ -380,13 +377,12 @@ pub fn Log(comptime E: type) type {
 }
 
 /// Decode a `RawLog` and route it through the manifest's comptime dispatcher
-/// in one step. Backfill (`scanner.replay`) and live mode share this — keeping
-/// the per-log path in one place means a future change (e.g. metrics, tracing)
-/// lands once.
+/// in one step. Backfill (`scanner.replay`) and live mode share this single
+/// per-log path.
 ///
-/// This routes by topic0 only — it does NOT gate by emitter address. Callers
-/// feeding *untrusted* logs (the live path's raw pending blocks) MUST pre-filter
-/// by address first; backfill is safe because `filter_builder` already pruned
+/// Routes by topic0 only, does NOT gate by emitter address. Callers feeding
+/// *untrusted* logs (the live path's raw pending blocks) MUST pre-filter by
+/// address first. Backfill is safe because `filter_builder` already pruned
 /// non-matching addresses before the filtered store was written.
 pub fn dispatchLog(
     comptime m: manifest.Manifest,
@@ -397,14 +393,14 @@ pub fn dispatchLog(
     return dispatcherFor(m).dispatch(Handler, DecodedLog.fromRawLog(raw_log), ctx);
 }
 
-/// Build the comptime dispatch table for a manifest. Returns a function
-/// type that switches on `log.topics[0]` against each declared event's
-/// topic0 and invokes `Handler.handle ++ event.name`. Logs whose topic0
-/// matches no declared event are silently skipped.
+/// Build the comptime dispatch table for a manifest. Returns a type that
+/// switches on `log.topics[0]` against each declared event's topic0 and invokes
+/// `Handler.handle ++ event.name`. Logs whose topic0 matches no declared event
+/// are silently skipped.
 ///
-/// `validateHandler(Handler, m)` runs at comptime: any required handler
-/// method missing from `Handler` produces a `@compileError` listing the
-/// method name and the event signature.
+/// `validateHandler(Handler, m)` runs at comptime. Any required handler method
+/// missing from `Handler` produces a `@compileError` listing the method name
+/// and the event signature.
 pub fn dispatcherFor(comptime m: manifest.Manifest) type {
     return struct {
         pub fn dispatch(comptime Handler: type, log: DecodedLog, ctx: anytype) !void {
@@ -699,7 +695,7 @@ test "DecodedLog.fromRawLog preserves all fields" {
 
 test "EventId pack/unpack round-trips and lays out big-endian" {
     const id = (EventId{ .block_number = 0x0102030405060708, .tx_index = 7, .log_index = 3 }).pack();
-    // block_number is the high 8 bytes, big-endian; tx/log are the next two u32 fields.
+    // block_number is the high 8 bytes, big-endian. tx/log are the next two u32 fields.
     try std.testing.expectEqual(@as(u8, 0x01), id[0]);
     try std.testing.expectEqual(@as(u8, 0x08), id[7]);
     try std.testing.expectEqual(@as(u8, 7), id[11]);
@@ -778,7 +774,7 @@ test "decode a dynamic array uint256[] via the Array view" {
     const E = struct {
         pub const signature = "E(uint256[] amounts)";
     };
-    // head: offset 0x20 → tail; tail: len=3, then 3 elements.
+    // head: offset 0x20 → tail. tail: len=3, then 3 elements.
     var data: [160]u8 = std.mem.zeroes([160]u8);
     wU256(data[0..32], 0x20);
     wU256(data[32..64], 3);
@@ -815,7 +811,7 @@ test "mixed: primitive, dynamic array, primitive — slot offsets + tail" {
     const E = struct {
         pub const signature = "E(uint256 a, uint256[] arr, uint256 b)";
     };
-    // head: a (off 0), arr offset = 0x60 (off 32), b (off 64); tail at 0x60.
+    // head: a (off 0), arr offset = 0x60 (off 32), b (off 64). tail at 0x60.
     var data: [192]u8 = std.mem.zeroes([192]u8);
     wU256(data[0..32], 11);
     wU256(data[32..64], 0x60);

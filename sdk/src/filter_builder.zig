@@ -1,24 +1,21 @@
 /// Filtered-index builder. Reads the engine's flat log store via `core`,
-/// keeps logs that match the manifest, and writes them into a flat-file
-/// pair (`<base>.dat` + `<base>.idx`) via `sdk.filtered_store`. Per ADR-002.
+/// keeps logs matching the manifest, writes them into a flat-file pair
+/// (`<base>.dat` + `<base>.idx`) via `sdk.filtered_store`. Per ADR-002.
 ///
 /// Two entry points:
 ///   - `build`: phase 1, writes the `primary` pair for static + factory addresses.
 ///   - `appendChildren`: phase 3, writes the `children` pair for addresses
-///     discovered by the scanner's factory pre-pass. No-op when the
-///     discovered set is empty.
+///     discovered by the scanner's factory pre-pass. No-op for an empty set.
 ///
-/// Per-log keep rule (uniform across both phases via the `Filter` struct):
+/// Per-log keep rule (uniform across both phases via `Filter`):
 ///   keep = (address ∈ filter.match_addrs)
 ///       AND (topic0 ∈ filter.match_topics)
 ///       AND (address ∉ filter.exclude_addrs)
-/// Phase 1 sets exclude_addrs empty; phase 3 sets it to static∪factory so a
+/// Phase 1 leaves exclude_addrs empty. Phase 3 sets it to static∪factory so a
 /// static contract that's also a factory child does not appear in both pairs.
 const std = @import("std");
 
-const builtin = @import("builtin");
 const core = @import("core");
-const lz4 = @import("lz4");
 
 const filtered_store_mod = @import("filtered_store.zig");
 const sdk_manifest = @import("manifest.zig");
@@ -27,15 +24,7 @@ const FilteredStore = filtered_store_mod.FilteredStore;
 const RawLog = core.RawLog;
 const FlatStoreReader = core.FlatStoreReader;
 const log_serial = core.log_serial;
-const block_filter = core.block_filter;
-const parallel = core.parallel;
-const io_pipeline = core.io_pipeline;
 const types = core.types;
-
-pub const WORKER_QUEUE_DEPTH = 16;
-/// Min matching blocks before we spawn worker threads. Below this, the
-/// thread spin-up cost is larger than the parallel speedup.
-pub const PARALLEL_THRESHOLD = 1_000;
 
 pub const BASE_PRIMARY: []const u8 = "primary";
 pub const BASE_CHILDREN: []const u8 = "children";
@@ -44,24 +33,20 @@ pub const BuildResult = struct {
     blocks_scanned: u64 = 0,
     blocks_matched: u64 = 0,
     total_logs: u64 = 0,
-    /// Bloom-matched blocks the worker pipeline failed to materialize. Caller
-    /// must treat any non-zero value as a hard failure (incomplete index).
+    /// Bloom-matched blocks the worker pipeline failed to materialize. Any
+    /// non-zero value is a hard failure (incomplete index).
     dropped_blocks: u64 = 0,
     elapsed_ns: u64 = 0,
 };
 
-/// Per-log keep predicate. `match_addrs` and `match_topics` are positive
-/// match sets; `exclude_addrs` is a negative filter applied after positives
-/// pass. Used by both `build` (phase 1) and `appendChildren` (phase 3).
-const Filter = struct {
-    match_addrs: []const [20]u8,
-    match_topics: []const [32]u8,
-    exclude_addrs: []const [20]u8,
-};
+/// Per-log keep predicate, shared with the engine via `core.filter`. Phase 1
+/// (`build`) leaves `exclude_addrs` empty. Phase 3 (`appendChildren`) sets it
+/// to static∪factory.
+const Filter = core.filter.Filter;
 
 /// Phase 1: build the `primary` filtered-store pair under `dir` from the
 /// manifest's static and factory addresses. Caller owns `reader` and `dir`.
-/// Appending to a pre-existing pair extends it; block numbers must be
+/// Appending to a pre-existing pair extends it. Block numbers must be
 /// strictly greater than the last recorded block.
 pub fn build(
     reader: *const FlatStoreReader,
@@ -73,10 +58,10 @@ pub fn build(
 }
 
 /// Extend the primary filtered-store pair over `from_block..=to_block`.
-/// `build` is a special case with `from_block = manifest.start_block`.
-/// Used by the follow-mode gap fill in `entry.init`: when the engine
-/// advances during backfill, the SDK re-scans the new range and appends
-/// matching blocks to the existing pair without rebuilding from scratch.
+/// `build` is the special case `from_block = manifest.start_block`.
+/// Drives the follow-mode gap fill in `entry.init`: when the engine advances
+/// during backfill, the SDK re-scans the new range and appends matching blocks
+/// without rebuilding from scratch.
 pub fn appendBlocks(
     reader: *const FlatStoreReader,
     comptime m: sdk_manifest.Manifest,
@@ -103,10 +88,10 @@ pub fn appendBlocks(
     );
 }
 
-/// Phase 3: walk the engine's flat store filtered by the
-/// scanner-discovered child addresses, write matching child-event logs to
-/// the `children` pair under `dir`. Spans the manifest's whole range; the
-/// follow-mode gap fill uses `appendChildrenBlocks` for a sub-range instead.
+/// Phase 3: walk the engine's flat store filtered by scanner-discovered child
+/// addresses, write matching child-event logs to the `children` pair under
+/// `dir`. Spans the manifest's whole range. The follow-mode gap fill uses
+/// `appendChildrenBlocks` for a sub-range instead.
 pub fn appendChildren(
     reader: *const FlatStoreReader,
     comptime m: sdk_manifest.Manifest,
@@ -130,7 +115,7 @@ pub fn appendChildren(
 /// per-log filter excludes addresses already in `static∪factory` so a static
 /// contract that's also a factory child does not produce duplicate entries
 /// across pairs. Block numbers must exceed the children store's current tail
-/// (the caller fills strictly-increasing ranges).
+/// (caller fills strictly-increasing ranges).
 pub fn appendChildrenBlocks(
     reader: *const FlatStoreReader,
     comptime m: sdk_manifest.Manifest,
@@ -162,10 +147,10 @@ pub fn appendChildrenBlocks(
     );
 }
 
-/// Shared phase runner. `bloom_addresses` is what we feed the bloom scan
-/// (block-level prefilter); `filter` is the per-log keep predicate
-/// (post-decompression precision filter). `base` selects which flat-store
-/// pair under `dir` to append to (one of `BASE_PRIMARY` / `BASE_CHILDREN`).
+/// Shared phase runner. `bloom_addresses` feeds the bloom scan (block-level
+/// prefilter). `filter` is the per-log keep predicate (post-decompression
+/// precision filter). `base` selects the flat-store pair under `dir` to append
+/// to (`BASE_PRIMARY` or `BASE_CHILDREN`).
 fn runPhase(
     reader: *const FlatStoreReader,
     bloom_addresses: []const [20]u8,
@@ -176,87 +161,38 @@ fn runPhase(
     comptime base: []const u8,
     allocator: std.mem.Allocator,
 ) !BuildResult {
-    var result = BuildResult{};
-    var timer = try std.time.Timer.start();
-
-    var matching = std.ArrayListUnmanaged(u64){};
-    defer matching.deinit(allocator);
-
-    try block_filter.scanBloomsParallel(
-        reader,
-        bloom_addresses,
-        filter.match_topics,
-        start_block,
-        end_block,
-        &matching,
-        &result.blocks_scanned,
-        &result.dropped_blocks,
-        allocator,
-    );
-
-    if (matching.items.len == 0) {
-        result.elapsed_ns = timer.read();
-        return result;
-    }
-
-    // blooms.bin can hold duplicate entries for the same block_number when the
-    // importer's RocksDB key parsing collapses multi-byte discriminators (reorg
-    // entries) onto the same u64. The list is already sorted, so adjacent dedup
-    // suffices. Without this, FilteredStore.appendEntry raises OutOfOrder on
-    // the second write and the build fails.
-    var write_idx: usize = 1;
-    for (1..matching.items.len) |read_idx| {
-        if (matching.items[read_idx] == matching.items[read_idx - 1]) continue;
-        matching.items[write_idx] = matching.items[read_idx];
-        write_idx += 1;
-    }
-    matching.items.len = write_idx;
-
-    const num_workers = parallel.workerCount(matching.items.len, PARALLEL_THRESHOLD);
-    const ranges = parallel.chunkRanges(matching.items.len, num_workers);
-
-    var worker_results: [parallel.MAX_WORKERS]std.ArrayListUnmanaged(FilteredBlock) = undefined;
-    var worker_args: [parallel.MAX_WORKERS]FilterWorkerArgs = undefined;
-    var worker_arenas: [parallel.MAX_WORKERS]std.heap.ArenaAllocator = undefined;
-
-    for (0..num_workers) |i| {
-        worker_arenas[i] = std.heap.ArenaAllocator.init(allocator);
-        worker_results[i] = .{};
-        worker_args[i] = .{
-            .reader = reader,
-            .matching_blocks = matching.items[ranges[i][0]..ranges[i][1]],
-            .filter = filter,
-            .results = &worker_results[i],
-            .allocator = worker_arenas[i].allocator(),
-        };
-    }
-    defer for (0..num_workers) |i| worker_arenas[i].deinit();
-
-    try parallel.run(FilterWorkerArgs, worker_args[0..num_workers], num_workers, filterWorker);
-
-    // Surface fatal pipeline errors before opening the writer. Per-block drops accumulate below.
-    for (0..num_workers) |i| if (worker_args[i].err) |e| return e;
-
     var store = try FilteredStore.open(allocator, dir, base);
     defer store.deinit();
 
-    for (0..num_workers) |i| {
-        for (worker_results[i].items) |fb| {
-            try store.appendEntry(fb.block_number, fb.entry);
-            result.blocks_matched += 1;
-            result.total_logs += fb.log_count;
-        }
-    }
+    var sink = StoreSink{ .store = &store };
+    const r = try core.parallel_filter.run(reader, bloom_addresses, filter, start_block, end_block, StoreSink, &sink, allocator);
     try store.syncAll();
 
-    for (0..num_workers) |i| result.dropped_blocks += worker_args[i].dropped_blocks;
-    result.elapsed_ns = timer.read();
-    return result;
+    return .{
+        .blocks_scanned = r.blocks_scanned,
+        .blocks_matched = r.blocks_matched,
+        .total_logs = r.total_logs,
+        .dropped_blocks = r.dropped_blocks,
+        .elapsed_ns = r.elapsed_ns,
+    };
 }
 
-// ── Manifest projections ─────────────────────────────────────────────────
+/// Writes each filtered survivor to the FilteredStore pair. The chunked pipeline
+/// emits in ascending block order, satisfying `appendEntry`'s monotonic key.
+const StoreSink = struct {
+    store: *FilteredStore,
+    /// The local build leaves the timestamp 0. The scanner falls back to the
+    /// engine's timestamps.bin via `timestampOf`; only the remote client fills
+    /// it, from the PUSH frame.
+    pub fn emit(self: *StoreSink, block_number: u64, entry: []const u8, _: u32) !void {
+        try self.store.appendEntry(block_number, 0, entry);
+    }
+};
 
-fn collectKnownAddresses(comptime m: sdk_manifest.Manifest) []const [20]u8 {
+// ── Manifest projections ─────────────────────────────────────────────────
+// Public so the remote client builds its REGISTER filter from the manifest.
+
+pub fn collectKnownAddresses(comptime m: sdk_manifest.Manifest) []const [20]u8 {
     comptime {
         var out: []const [20]u8 = &.{};
         for (m.contracts) |c| out = out ++ &[_][20]u8{c.address};
@@ -265,244 +201,58 @@ fn collectKnownAddresses(comptime m: sdk_manifest.Manifest) []const [20]u8 {
     }
 }
 
-fn collectAllTopics(comptime m: sdk_manifest.Manifest) []const [32]u8 {
+pub fn collectAllTopics(comptime m: sdk_manifest.Manifest) []const [32]u8 {
     comptime {
         var out: []const [32]u8 = &.{};
         for (m.contracts) |c| {
             for (c.events) |E| {
                 const t = sdk_manifest.eventTopic0(E);
-                if (containsTopic(out, &t)) continue;
+                if (core.filter.containsTopic(out, &t)) continue;
                 out = out ++ &[_][32]u8{t};
             }
         }
         for (m.factories) |f| {
             const t = sdk_manifest.eventTopic0(f.create_event);
-            if (!containsTopic(out, &t)) out = out ++ &[_][32]u8{t};
+            if (!core.filter.containsTopic(out, &t)) out = out ++ &[_][32]u8{t};
         }
         return out;
     }
 }
 
-fn collectChildTopics(comptime m: sdk_manifest.Manifest) []const [32]u8 {
+/// Every topic a live follow must match: contract events, factory create
+/// events, and child events. `collectAllTopics` omits child topics (the
+/// backfill streams children in a separate pass), but a single follow
+/// connection carries both, so children registered via ADD_ADDRESS match.
+pub fn collectFollowTopics(comptime m: sdk_manifest.Manifest) []const [32]u8 {
+    comptime {
+        var out: []const [32]u8 = collectAllTopics(m);
+        for (collectChildTopics(m)) |t| {
+            if (!core.filter.containsTopic(out, &t)) out = out ++ &[_][32]u8{t};
+        }
+        return out;
+    }
+}
+
+pub fn collectChildTopics(comptime m: sdk_manifest.Manifest) []const [32]u8 {
     comptime {
         var out: []const [32]u8 = &.{};
         for (m.factories) |f| {
             for (f.child_events) |E| {
                 const t = sdk_manifest.eventTopic0(E);
-                if (!containsTopic(out, &t)) out = out ++ &[_][32]u8{t};
+                if (!core.filter.containsTopic(out, &t)) out = out ++ &[_][32]u8{t};
             }
         }
         return out;
     }
 }
 
-inline fn contains(comptime N: usize, haystack: []const [N]u8, needle: *const [N]u8) bool {
-    for (haystack) |h| if (std.mem.eql(u8, &h, needle)) return true;
-    return false;
-}
-
-inline fn containsTopic(haystack: []const [32]u8, needle: *const [32]u8) bool {
-    return contains(32, haystack, needle);
-}
-
-inline fn containsAddress(haystack: []const [20]u8, needle: *const [20]u8) bool {
-    return contains(20, haystack, needle);
-}
-
-// ── Worker ───────────────────────────────────────────────────────────────
-
-const FilteredBlock = struct {
-    block_number: u64,
-    entry: []u8, // lz4_len(4) + lz4_data
-    log_count: u32,
-};
-
-const FilterWorkerArgs = struct {
-    reader: *const FlatStoreReader,
-    matching_blocks: []const u64,
-    filter: Filter,
-    results: *std.ArrayListUnmanaged(FilteredBlock),
-    allocator: std.mem.Allocator,
-    /// Per-block recoverable failures (alloc, lz4, etc.) — surfaced via BuildResult.
-    dropped_blocks: u64 = 0,
-    /// First fatal pipeline-level error — init/wait/oversize. Aborts the build.
-    err: ?anyerror = null,
-};
-
-fn filterWorker(args: *FilterWorkerArgs) void {
-    // Stack scratch is safe under the buffer rule in `core.parallel`:
-    // `parallel.run` always spawns workers at `WORKER_STACK_SIZE`.
-    var decompress_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
-    var serialize_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
-    var compress_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
-
-    const reader = args.reader;
-
-    if (comptime io_pipeline.supported) {
-        const Pipeline = io_pipeline.ReadPipeline(WORKER_QUEUE_DEPTH);
-        const pipeline = Pipeline.init(args.allocator, reader.blocks_file.handle) catch |e| {
-            args.err = e;
-            return;
-        };
-        defer pipeline.deinit();
-
-        var submitted: usize = 0;
-        var completed: usize = 0;
-        const total = args.matching_blocks.len;
-
-        while (completed < total) {
-            while (submitted < total) {
-                const slot = pipeline.claimSlot() orelse break;
-                const loc = reader.getBlockLoc(args.matching_blocks[submitted]) catch {
-                    pipeline.releaseSlot(slot);
-                    submitted += 1;
-                    completed += 1;
-                    args.dropped_blocks += 1;
-                    continue;
-                };
-                pipeline.submit(slot, args.matching_blocks[submitted], loc.offset, loc.length) catch |e| {
-                    pipeline.releaseSlot(slot);
-                    // EntryExceedsBuffer = corrupt store (fatal); else SQE-full (drain + retry).
-                    if (e == error.EntryExceedsBuffer) {
-                        args.err = e;
-                        return;
-                    }
-                    break;
-                };
-                submitted += 1;
-            }
-            _ = pipeline.flush() catch |e| {
-                args.err = e;
-                return;
-            };
-
-            var done: [WORKER_QUEUE_DEPTH]*io_pipeline.Completion = undefined;
-            const n = pipeline.waitAtLeastOne(&done) catch |e| {
-                args.err = e;
-                return;
-            };
-            for (done[0..n]) |c| {
-                const entry_data = pipeline.getBuffer(c);
-                if (entry_data.len > 0) {
-                    processBlockEntry(entry_data, c.block_number, args, &decompress_buf, &serialize_buf, &compress_buf);
-                } else args.dropped_blocks += 1;
-                pipeline.releaseSlot(c.buf_slot);
-                completed += 1;
-            }
-        }
-        // io_uring completes in NVMe order, not submission order. Sort so
-        // the writer iterates worker outputs in ascending block order,
-        // satisfying FilteredStore.appendEntry's monotonic invariant.
-        std.mem.sort(FilteredBlock, args.results.items, {}, blockNumberLessThan);
-        return;
-    }
-
-    // pread fallback (non-Linux). Reads in matching_blocks order, no sort
-    // needed but we sort anyway for path-uniform output.
-    var read_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
-    for (args.matching_blocks) |bn| {
-        const entry_data = reader.readBlock(bn, &read_buf) catch {
-            args.dropped_blocks += 1;
-            continue;
-        };
-        processBlockEntry(entry_data, bn, args, &decompress_buf, &serialize_buf, &compress_buf);
-    }
-    std.mem.sort(FilteredBlock, args.results.items, {}, blockNumberLessThan);
-}
-
-fn blockNumberLessThan(_: void, a: FilteredBlock, b: FilteredBlock) bool {
-    return a.block_number < b.block_number;
-}
-
-fn processBlockEntry(
-    entry_data: []const u8,
-    block_number: u64,
-    args: *FilterWorkerArgs,
-    decompress_buf: []u8,
-    serialize_buf: []u8,
-    compress_buf: []u8,
-) void {
-    // Every error path counts the block as dropped → BuildResult.dropped_blocks
-    // → entry point refuses to ship the index. No silent failures here.
-    const decompressed = log_serial.decompressEntry(entry_data, decompress_buf) catch {
-        args.dropped_blocks += 1;
-        return;
-    };
-
-    // Zero-copy walk: iterate logs in place, check the filter against raw
-    // bytes at known offsets, memcpy whole-log byte ranges of keepers into
-    // serialize_buf. Skips both `deserializeLogs` and the
-    // per-log `RawLog` materialization for rejected logs
-    var pos: usize = 0;
-    const log_count: usize = std.mem.readInt(u32, decompressed[pos..][0..4], .little);
-    pos += 4;
-
-    var out_pos: usize = 4;
-    var kept: u32 = 0;
-
-    for (0..log_count) |_| {
-        const log_start = pos;
-        const address: *const [20]u8 = @ptrCast(decompressed[pos + 4 ..][0..20]);
-        const topic_count = decompressed[pos + 24];
-        const topics_end = pos + 25 + @as(usize, topic_count) * 32;
-        const data_len: usize = std.mem.readInt(u32, decompressed[topics_end..][0..4], .little);
-        const log_end = topics_end + 4 + data_len + 32;
-        pos = log_end;
-
-        if (topic_count == 0) continue;
-        if (!containsAddress(args.filter.match_addrs, address)) continue;
-        const topic0: *const [32]u8 = @ptrCast(decompressed[log_start + 25 ..][0..32]);
-        if (!containsTopic(args.filter.match_topics, topic0)) continue;
-        if (containsAddress(args.filter.exclude_addrs, address)) continue;
-
-        const len = log_end - log_start;
-        @memcpy(serialize_buf[out_pos..][0..len], decompressed[log_start..log_end]);
-        out_pos += len;
-        kept += 1;
-    }
-
-    if (kept == 0) return;
-
-    std.mem.writeInt(u32, serialize_buf[0..4], kept, .little);
-
-    const entry_len = log_serial.compressEntry(serialize_buf[0..out_pos], compress_buf) catch {
-        args.dropped_blocks += 1;
-        return;
-    };
-
-    const owned = args.allocator.alloc(u8, entry_len) catch {
-        args.dropped_blocks += 1;
-        return;
-    };
-    @memcpy(owned, compress_buf[0..entry_len]);
-
-    args.results.append(args.allocator, .{
-        .block_number = block_number,
-        .entry = owned,
-        .log_count = kept,
-    }) catch {
-        args.dropped_blocks += 1;
-    };
-}
-
 // ── Tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-const bloom = core.bloom;
 const flat_reader = core.flat_reader;
 
-const TestLog = struct {
-    tx_index: u16 = 0,
-    log_index: u16 = 0,
-    address: [20]u8,
-    topic0: [32]u8,
-    data: []const u8 = &.{},
-};
-
-const TestBlock = struct {
-    block_number: u64,
-    logs: []const TestLog,
-};
+const TestLog = flat_reader.TestLog;
+const TestBlock = flat_reader.TestBlock;
 
 const ContractA = struct {
     pub const signature = "EventA(uint256)";
@@ -520,67 +270,6 @@ const ADDR_C: [20]u8 = [_]u8{0xCC} ** 20;
 
 fn topicOf(comptime E: type) [32]u8 {
     return sdk_manifest.eventTopic0(E);
-}
-
-/// Write a synthetic flat store (blocks.dat + blocks.idx + blooms.bin) into
-/// `dir`. Returns nothing — caller opens via `FlatStoreReader.open(dir_path)`.
-fn writeFlatStore(dir: std.fs.Dir, blocks: []const TestBlock, allocator: std.mem.Allocator) !void {
-    var blocks_file = try dir.createFile("blocks.dat", .{});
-    defer blocks_file.close();
-    var idx_file = try dir.createFile("blocks.idx", .{});
-    defer idx_file.close();
-    var blooms_file = try dir.createFile("blooms.bin", .{});
-    defer blooms_file.close();
-
-    var idx_hdr: [flat_reader.INDEX_HEADER_SIZE]u8 = undefined;
-    std.mem.writeInt(u64, idx_hdr[0..8], blocks[0].block_number, .little);
-    std.mem.writeInt(u64, idx_hdr[8..16], blocks.len, .little);
-    try idx_file.writeAll(&idx_hdr);
-
-    var blooms_hdr: [flat_reader.BLOOM_HEADER_SIZE]u8 = undefined;
-    std.mem.writeInt(u64, &blooms_hdr, blocks.len, .little);
-    try blooms_file.writeAll(&blooms_hdr);
-
-    const serialize_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
-    defer allocator.free(serialize_buf);
-    const compress_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
-    defer allocator.free(compress_buf);
-
-    var offset: u64 = 0;
-    for (blocks) |blk| {
-        const raw_logs = try allocator.alloc(RawLog, blk.logs.len);
-        defer allocator.free(raw_logs);
-        for (blk.logs, 0..) |tl, i| {
-            raw_logs[i] = .{
-                .block_number = blk.block_number,
-                .tx_index = tl.tx_index,
-                .log_index = tl.log_index,
-                .address = tl.address,
-                .topic_count = 1,
-                .topics = .{ tl.topic0, [_]u8{0} ** 32, [_]u8{0} ** 32, [_]u8{0} ** 32 },
-                .data = tl.data,
-                .tx_hash = [_]u8{0xFE} ** 32,
-            };
-        }
-        const written = log_serial.serializeLogs(raw_logs, serialize_buf);
-        const entry_len = try log_serial.compressEntry(serialize_buf[0..written], compress_buf);
-        try blocks_file.writeAll(compress_buf[0..entry_len]);
-
-        var idx_entry: [flat_reader.INDEX_ENTRY_SIZE]u8 = undefined;
-        std.mem.writeInt(u64, idx_entry[0..8], offset, .little);
-        std.mem.writeInt(u32, idx_entry[8..12], @intCast(entry_len), .little);
-        try idx_file.writeAll(&idx_entry);
-
-        const tb = log_serial.buildTopicBloom(raw_logs);
-        const ab = log_serial.buildAddrBloom(raw_logs);
-        var bloom_entry: [flat_reader.BLOOM_ENTRY_SIZE]u8 = std.mem.zeroes([flat_reader.BLOOM_ENTRY_SIZE]u8);
-        std.mem.writeInt(u64, bloom_entry[0..8], blk.block_number, .big);
-        @memcpy(bloom_entry[flat_reader.TOPIC_BLOOM_OFFSET..][0..bloom.BLOOM_SIZE], &tb.bits);
-        @memcpy(bloom_entry[flat_reader.ADDR_BLOOM_OFFSET..][0..bloom.ADDR_BLOOM_SIZE], &ab.bits);
-        try blooms_file.writeAll(&bloom_entry);
-
-        offset += entry_len;
-    }
 }
 
 const SmallManifest: sdk_manifest.Manifest = .{
@@ -645,8 +334,8 @@ fn freeDecoded(decoded: *std.ArrayListUnmanaged(DecodedBlock), allocator: std.me
 test "build: filters multi-contract flat store, primary contains exactly the matches" {
     const allocator = testing.allocator;
 
-    // Plant 1000 blocks. Even-numbered → contract A and B logs (matching).
-    // Odd-numbered → contract C only (non-matching).
+    // Plant 1000 blocks. Even blocks: contract A+B logs (matching). Odd
+    // blocks: contract C only (non-matching).
     const N: u64 = 1000;
     const a_topic = topicOf(ContractA);
     const b_topic = topicOf(ContractB);
@@ -680,7 +369,7 @@ test "build: filters multi-contract flat store, primary contains exactly the mat
 
     var src_tmp = testing.tmpDir(.{});
     defer src_tmp.cleanup();
-    try writeFlatStore(src_tmp.dir, blocks_list.items, allocator);
+    try flat_reader.writeTestStore(src_tmp.dir, blocks_list.items, allocator);
 
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
@@ -728,7 +417,7 @@ test "build: rebuild produces decoded-identical output" {
 
     var src_tmp = testing.tmpDir(.{});
     defer src_tmp.cleanup();
-    try writeFlatStore(src_tmp.dir, blocks_list.items, allocator);
+    try flat_reader.writeTestStore(src_tmp.dir, blocks_list.items, allocator);
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
     var reader = try FlatStoreReader.open(src_path);
@@ -829,7 +518,7 @@ test "build + appendChildren: primary holds creations, children holds child even
     sync3_logs[0] = .{ .address = ChildAddr3, .topic0 = sync_topic };
     try blocks_list.append(allocator, .{ .block_number = 103, .logs = sync3_logs });
 
-    // Block 104: unrelated address with unrelated topic — must NOT appear in either DBI.
+    // Block 104: unrelated address with unrelated topic. Must NOT appear in either pair.
     const noise_topic = topicOf(Other);
     const noise_logs = try arena.alloc(TestLog, 1);
     noise_logs[0] = .{ .address = ADDR_C, .topic0 = noise_topic };
@@ -837,7 +526,7 @@ test "build + appendChildren: primary holds creations, children holds child even
 
     var src_tmp = testing.tmpDir(.{});
     defer src_tmp.cleanup();
-    try writeFlatStore(src_tmp.dir, blocks_list.items, allocator);
+    try flat_reader.writeTestStore(src_tmp.dir, blocks_list.items, allocator);
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
     var reader = try FlatStoreReader.open(src_path);
@@ -846,8 +535,8 @@ test "build + appendChildren: primary holds creations, children holds child even
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
 
-    // Phase 1: build primary. Only the factory creation event qualifies
-    // because child addresses are not yet known.
+    // Phase 1: build primary. Only the factory creation event qualifies, since
+    // child addresses are not yet known.
     const primary = try build(&reader, FactoryManifest, dst_tmp.dir, allocator);
     try testing.expectEqual(@as(u64, 1), primary.blocks_matched);
     try testing.expectEqual(@as(u64, 1), primary.total_logs);
@@ -905,7 +594,7 @@ test "appendChildren: returns zero-result for empty discovered set" {
     defer src_tmp.cleanup();
     var blocks: [1]TestBlock = .{.{ .block_number = 100, .logs = &.{} }};
     blocks[0].logs = &[_]TestLog{.{ .address = FactoryAddr, .topic0 = topicOf(Create) }};
-    try writeFlatStore(src_tmp.dir, &blocks, allocator);
+    try flat_reader.writeTestStore(src_tmp.dir, &blocks, allocator);
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
     var reader = try FlatStoreReader.open(src_path);
@@ -923,9 +612,9 @@ test "appendChildren: returns zero-result for empty discovered set" {
 test "build: end_block clamps the scan range to a fixed window" {
     const allocator = testing.allocator;
 
-    // Plant 50 contiguous blocks; every block has a matching ContractA log.
-    // With end_block = 119 (start_block 0, first block 100), the build
-    // should match exactly 20 blocks (100..=119) and ignore 120..=149.
+    // Plant 50 contiguous blocks, each with a matching ContractA log. With
+    // end_block = 119 (first block 100), the build matches exactly 20 blocks
+    // (100..=119) and ignores 120..=149.
     const a_topic = topicOf(ContractA);
     var blocks_list: std.ArrayListUnmanaged(TestBlock) = .{};
     defer blocks_list.deinit(allocator);
@@ -940,7 +629,7 @@ test "build: end_block clamps the scan range to a fixed window" {
 
     var src_tmp = testing.tmpDir(.{});
     defer src_tmp.cleanup();
-    try writeFlatStore(src_tmp.dir, blocks_list.items, allocator);
+    try flat_reader.writeTestStore(src_tmp.dir, blocks_list.items, allocator);
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
     var reader = try FlatStoreReader.open(src_path);
@@ -961,7 +650,7 @@ test "build: end_block clamps the scan range to a fixed window" {
     try testing.expectEqual(@as(u64, 20), result.blocks_matched);
     try testing.expectEqual(@as(u64, 20), result.total_logs);
 
-    // Verify the on-disk contents: exactly blocks 100..=119, none past 119.
+    // On-disk contents: exactly blocks 100..=119, none past 119.
     var decoded = try dumpDecodedBlocks(dst_tmp.dir, BASE_PRIMARY, allocator);
     defer freeDecoded(&decoded, allocator);
     try testing.expectEqual(@as(usize, 20), decoded.items.len);
@@ -987,7 +676,7 @@ test "appendBlocks extends a primary filter env over the new range" {
 
     var src_tmp = testing.tmpDir(.{});
     defer src_tmp.cleanup();
-    try writeFlatStore(src_tmp.dir, blocks_list.items, allocator);
+    try flat_reader.writeTestStore(src_tmp.dir, blocks_list.items, allocator);
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
     var reader = try FlatStoreReader.open(src_path);
@@ -1007,7 +696,7 @@ test "appendBlocks extends a primary filter env over the new range" {
     const first = try appendBlocks(&reader, M, 100, 104, dst_tmp.dir, allocator);
     try testing.expectEqual(@as(u64, 5), first.blocks_matched);
 
-    // Second pass extends the pair over 105..=109 — same files, appended.
+    // Second pass extends the pair over 105..=109, same files, appended.
     const second = try appendBlocks(&reader, M, 105, 109, dst_tmp.dir, allocator);
     try testing.expectEqual(@as(u64, 5), second.blocks_matched);
 
@@ -1057,7 +746,7 @@ test "appendChildrenBlocks extends the children pair over a sub-range" {
 
     var src_tmp = testing.tmpDir(.{});
     defer src_tmp.cleanup();
-    try writeFlatStore(src_tmp.dir, blocks_list.items, allocator);
+    try flat_reader.writeTestStore(src_tmp.dir, blocks_list.items, allocator);
     var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
     var reader = try FlatStoreReader.open(src_path);
@@ -1067,7 +756,7 @@ test "appendChildrenBlocks extends the children pair over a sub-range" {
     defer dst_tmp.cleanup();
 
     const children = [_][20]u8{ChildAddr};
-    // Backfill covers 100..=104; the follow gap then extends 105..=109.
+    // Backfill covers 100..=104, then the follow gap extends 105..=109.
     const first = try appendChildrenBlocks(&reader, M, &children, 100, 104, dst_tmp.dir, allocator);
     try testing.expectEqual(@as(u64, 5), first.blocks_matched);
     const second = try appendChildrenBlocks(&reader, M, &children, 105, 109, dst_tmp.dir, allocator);
@@ -1079,31 +768,3 @@ test "appendChildrenBlocks extends the children pair over a sub-range" {
     try testing.expectEqual(@as(u64, 100), decoded.items[0].block_number);
     try testing.expectEqual(@as(u64, 109), decoded.items[9].block_number);
 }
-
-test "processBlockEntry: corrupt entry counts as dropped_block (fail-loud safety net)" {
-    const allocator = testing.allocator;
-
-    var results: std.ArrayListUnmanaged(FilteredBlock) = .{};
-    defer results.deinit(allocator);
-
-    var args: FilterWorkerArgs = .{
-        .reader = undefined,
-        .matching_blocks = &.{},
-        .filter = .{ .match_addrs = &.{}, .match_topics = &.{}, .exclude_addrs = &.{} },
-        .results = &results,
-        .allocator = allocator,
-    };
-
-    // lz4_len prefix claims more bytes than the entry contains → decompressEntry
-    // returns error.InvalidEntry. A regression that re-introduced silent drop
-    // would leave dropped_blocks == 0 here.
-    const corrupt_entry = [_]u8{ 0xFF, 0xFF, 0xFF, 0x7F, 0x42 };
-    var decompress_buf: [256]u8 = undefined;
-    var serialize_buf: [256]u8 = undefined;
-    var compress_buf: [256]u8 = undefined;
-
-    processBlockEntry(&corrupt_entry, 100, &args, &decompress_buf, &serialize_buf, &compress_buf);
-    try testing.expectEqual(@as(u64, 1), args.dropped_blocks);
-    try testing.expectEqual(@as(usize, 0), results.items.len);
-}
-

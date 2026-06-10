@@ -7,30 +7,27 @@ const std = @import("std");
 /// Maximum event topics per EVM log entry (LOG0..LOG4).
 pub const MAX_TOPICS = 4;
 
-/// Pre-allocated log-buffer ceiling. 65,536 is the natural cap — `RawLog.log_index`
-/// is `u16`, so log_index 65,536 can't be addressed. Mainnet has 35 blocks with
-/// >16,384 logs (caught by the importer's fail-loud). Callers must fail loud,
-/// not truncate, on overflow.
+/// Pre-allocated log-buffer ceiling. 65,536 is the natural cap. `RawLog.log_index`
+/// is `u16`, so log_index 65,536 cannot be addressed. Mainnet has 35 blocks with
+/// >16,384 logs. Callers must fail loud, not truncate, on overflow.
 pub const MAX_LOGS_PER_BLOCK: usize = 65_536;
 
 /// Serialize/compress/decompress buffer size. Must fit the largest block's
-/// serialized log data (~1.5 MB typical, 3+ MB worst case). Also used as the
-/// io_uring per-slot read buffer — undersizing it silently truncates large
-/// compressed entries; LZ4 then errors and the whole block is dropped from
-/// the index.
+/// serialized log data (~1.5 MB typical, 3+ MB worst case). Also the io_uring
+/// per-slot read buffer. Undersizing silently truncates large compressed
+/// entries, LZ4 errors, and the whole block drops from the index.
 pub const BLOCK_BUF_SIZE: usize = 4 * 1024 * 1024;
 
 /// Blocks between meta commits during import. Each commit fsyncs (~1ms).
 /// 10K balances crash resilience (~3s of lost work) against fsync overhead (<1%).
 pub const COMMIT_INTERVAL: usize = 10_000;
 
-/// Chain-level finality cushion. The flat store contains only blocks that
-/// have at least this many confirmations; anything within FINALITY_DEPTH of
-/// head lives in the pending ring (engine/src/pending_ring.zig) and may
-/// still reorg. The importer stops at `head - FINALITY_DEPTH`, head_follower
-/// graduates blocks once they cross it, and reorg detection only ever walks
-/// back this far. Per-chain value: Ethereum L1 = 64 (≈ 12.8 min PoS). Becomes
-/// part of `ChainConfig` when multi-chain lands.
+/// Chain-level finality cushion. The flat store contains only blocks with at
+/// least this many confirmations. Anything within FINALITY_DEPTH of head lives
+/// in the pending ring (engine/src/pending_ring.zig) and may still reorg. The
+/// importer stops at `head - FINALITY_DEPTH`, head_follower graduates blocks
+/// once they cross it, and reorg detection only walks back this far. Ethereum
+/// L1 = 64 (~12.8 min PoS).
 pub const FINALITY_DEPTH: u64 = 64;
 
 /// Ethereum L1 merge block. Default import lower bound.
@@ -42,7 +39,7 @@ pub const MERGE_BLOCK: u64 = 15_537_394;
 // ── Raw log ──────────────────────────────────────────────────────────────
 
 /// A single EVM log entry. Core interchange type between import, serialization,
-/// filtering, and handler dispatch. `data` is a borrowed slice — valid only
+/// filtering, and handler dispatch. `data` is a borrowed slice, valid only
 /// within the current decompression buffer's lifetime.
 pub const RawLog = struct {
     block_number: u64,
@@ -58,6 +55,6 @@ pub const RawLog = struct {
 // ── Tests ────────────────────────────────────────────────────────────────
 
 test "RawLog size sanity" {
-    // Ensure RawLog doesn't accidentally grow (catches field additions)
+    // Guards against accidental growth from field additions.
     try std.testing.expect(@sizeOf(RawLog) < 256);
 }

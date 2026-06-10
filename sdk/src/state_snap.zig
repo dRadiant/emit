@@ -1,17 +1,17 @@
 /// Owns `state.snap`. One file is the atomic commit unit for cursor +
 /// every MutableStore slab + every ImmutableStore boundary. Its rename
-/// is the only primitive needed to commit all three consistently.
+/// commits all three consistently.
 ///
-/// Layout (per ADR-003):
+/// Layout (ADR-003):
 ///   magic              [8]u8       "EMITSTAT"
 ///   version            u32 LE
 ///   cursor             u64 LE      last fully-dispatched block
 ///   mutable_bytes      [mutable_count]u64 LE   slab byte length per MutableStore slot
-///   immutable_counts   [immutable_count]u64 LE   authoritative record count per ImmutableStore slot
+///   immutable_counts   [immutable_count]u64 LE   record count per ImmutableStore slot
 ///   [body: `mutable_count` MutableStore slabs concatenated in slot order]
 ///
-/// The schema is comptime-known via the type parameters; no per-slot
-/// descriptors live on disk. Cross-language readers consult the spec.
+/// Schema is comptime-known via the type parameters. No per-slot
+/// descriptors on disk.
 const std = @import("std");
 
 const core = @import("core");
@@ -26,9 +26,8 @@ pub const Error = error{
     SizeMismatch,
 } || std.mem.Allocator.Error || std.fs.File.OpenError || std.fs.File.WriteError || std.fs.File.ReadError || std.fs.Dir.DeleteFileError;
 
-/// `mutables` = number of MutableStore slots in the indexer's entities tuple.
-/// `immutables` = number of ImmutableStore slots. Both are zero-permitted;
-/// the no-store case yields a 20-byte header file.
+/// `mutables` = MutableStore slot count, `immutables` = ImmutableStore slot
+/// count. Both zero-permitted. No-store case yields a 20-byte header file.
 pub fn StateSnap(comptime mutables: usize, comptime immutables: usize) type {
     const HEADER_SIZE: usize = 8 + 4 + 8 + mutables * 8 + immutables * 8;
 
@@ -47,10 +46,9 @@ pub fn StateSnap(comptime mutables: usize, comptime immutables: usize) type {
         /// Concatenated MutableStore slabs in slot order. Owned by `allocator`.
         body: []u8,
 
-        /// Open `state.snap` from `dir`. Missing file is fine (returns an
-        /// empty StateSnap with cursor=0). A crashed prior commit leaves
-        /// `state.snap.tmp` behind; open unlinks it as part of startup so
-        /// the next commit isn't confused by stale tmp content.
+        /// Open `state.snap` from `dir`. Missing file returns an empty
+        /// StateSnap with cursor=0. Unlinks any `state.snap.tmp` left by a
+        /// crashed prior commit so the next commit isn't confused by it.
         pub fn open(allocator: std.mem.Allocator, dir: std.fs.Dir) !Self {
             dir.deleteFile("state.snap.tmp") catch |err| switch (err) {
                 error.FileNotFound => {},
@@ -117,9 +115,8 @@ pub fn StateSnap(comptime mutables: usize, comptime immutables: usize) type {
             if (self.body.len > 0) self.allocator.free(self.body);
         }
 
-        /// Borrow the slab bytes for MutableStore slot `i`. The returned
-        /// slice points into `self.body` and is valid until the next `commit`
-        /// or `deinit`.
+        /// Borrow the slab bytes for MutableStore slot `i`. Returned slice
+        /// points into `self.body`, valid until the next `commit` or `deinit`.
         pub fn mutableSlab(self: *const Self, i: usize) []const u8 {
             std.debug.assert(i < mutables);
             var offset: usize = 0;
@@ -133,11 +130,10 @@ pub fn StateSnap(comptime mutables: usize, comptime immutables: usize) type {
             return self.immutable_counts[i];
         }
 
-        /// Atomically commit a new cursor, new MutableStore slabs (in slot
-        /// order), and new ImmutableStore counts (in slot order). The
-        /// rename of `state.snap.tmp` is the single primitive that makes
-        /// all three visible together; see ADR-003 §"Cursor location
-        /// and atomicity".
+        /// Atomically commit a new cursor, new MutableStore slabs (slot
+        /// order), and new ImmutableStore counts (slot order). The rename
+        /// of `state.snap.tmp` makes all three visible together. See
+        /// ADR-003 §"Cursor location and atomicity".
         pub fn commit(
             self: *Self,
             new_cursor: u64,
@@ -168,8 +164,8 @@ pub fn StateSnap(comptime mutables: usize, comptime immutables: usize) type {
                 pos += slab.len;
             }
 
-            // Allocate the new body first so a post-rename OOM can't desync
-            // disk from in-memory state.
+            // Allocate the new body before the rename so a post-rename OOM
+            // can't desync disk from in-memory state.
             const new_body = try self.allocator.dupe(u8, buf[HEADER_SIZE..]);
             errdefer self.allocator.free(new_body);
 

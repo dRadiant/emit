@@ -1,17 +1,15 @@
-/// MutableStore(T): mutable entity store with an in-memory HashMap cache
-/// fronting a sorted slab inside `state.snap`. Cold loads fall through to
-/// a binary search on the slab; saves update the cache only.
+/// MutableStore(T): mutable entity store. In-memory HashMap cache fronts a
+/// sorted slab inside `state.snap`. Cold loads fall through to binary search
+/// on the slab. Saves update the cache only.
 ///
-/// `materialize` produces the sorted slab bytes for the next `state.snap`
-/// commit; `refreshSlab` rebinds the borrowed slab pointer after the
-/// commit succeeds and clears dirty flags. Disk I/O happens via
-/// `state_snap`, not this module.
+/// `materialize` produces sorted slab bytes for the next `state.snap` commit.
+/// `refreshSlab` rebinds the borrowed slab pointer post-commit and clears
+/// dirty flags. Disk I/O happens via `state_snap`, not this module.
 ///
-/// In live mode, saves route through per-block overlay submaps keyed by
-/// block number. `commitBlock(N)` drains submap N into the dirty cache;
-/// `discardAll` drops every submap on reorg recovery. Per-block isolation
-/// preserves each block's mutation even when later blocks touch the same
-/// key.
+/// Live mode routes saves through per-block overlay submaps keyed by block
+/// number. `commitBlock(N)` drains submap N into the dirty cache. `discardAll`
+/// drops every submap on reorg recovery. Per-block isolation preserves each
+/// block's mutation even when later blocks touch the same key.
 ///
 /// Not thread-safe.
 const std = @import("std");
@@ -48,9 +46,8 @@ pub fn MutableStore(comptime T: type) type {
         /// Per-block overlay submaps. Bounded by FINALITY_DEPTH (~64).
         pending: std.AutoHashMapUnmanaged(u64, BlockMap) = .{},
 
-        /// `slab` is borrowed from the owning `StateSnap`. Caller must
-        /// call `refreshSlab` after every `state_snap.commit` so this
-        /// pointer doesn't dangle.
+        /// `slab` is borrowed from the owning `StateSnap`. Caller must call
+        /// `refreshSlab` after every `state_snap.commit` to avoid dangling.
         pub fn open(allocator: std.mem.Allocator, slab: []const u8) Self {
             return .{
                 .allocator = allocator,
@@ -68,7 +65,7 @@ pub fn MutableStore(comptime T: type) type {
 
         pub fn load(self: *Self, key: KeyField) !?T {
             if (self.live) {
-                // Newest-block wins; walk all pending submaps. Bounded ~64.
+                // Newest-block wins. Walk all pending submaps. Bounded ~64.
                 var winner_block: ?u64 = null;
                 var winner_value: ?T = null;
                 var it = self.pending.iterator();
@@ -91,9 +88,9 @@ pub fn MutableStore(comptime T: type) type {
             return entity;
         }
 
-        /// Load `key`, or initialize a fresh entity with all fields zeroed
-        /// and the primary-key field set to `key`. The fresh entity is
-        /// inserted dirty so it persists at the next commit.
+        /// Load `key`, or initialize a fresh zeroed entity with the primary-key
+        /// field set to `key`. Fresh entity inserted dirty to persist at next
+        /// commit.
         pub fn loadOrInit(self: *Self, key: KeyField) !T {
             if (try self.load(key)) |existing| return existing;
             var entity = std.mem.zeroes(T);
@@ -122,12 +119,12 @@ pub fn MutableStore(comptime T: type) type {
             try gop.value_ptr.put(self.allocator, key, value);
         }
 
-        /// Drain block `N`'s overlay submap into the dirty cache. The disk
-        /// write happens later via `materialize` + `state_snap.commit`.
+        /// Drain block `N`'s overlay submap into the dirty cache. Disk write
+        /// happens later via `materialize` + `state_snap.commit`.
         pub fn commitBlock(self: *Self, block: u64) !void {
             const sub = self.pending.getPtr(block) orelse return;
-            // Reserve cache capacity before removing the submap so a partial OOM
-            // can't strand entries between pending (removed) and cache (incomplete).
+            // Reserve cache capacity before removing the submap. A partial OOM
+            // would otherwise strand entries between pending and cache.
             try self.cache.ensureUnusedCapacity(sub.count());
             var removed = self.pending.fetchRemove(block).?;
             defer removed.value.deinit(self.allocator);
@@ -137,12 +134,32 @@ pub fn MutableStore(comptime T: type) type {
             }
         }
 
-        /// Drop every overlay submap. Used on reorg; caller re-dispatches
-        /// the fresh canonical chain.
+        /// Drop every overlay submap. Used on reorg. Caller re-dispatches the
+        /// fresh canonical chain.
         pub fn discardAll(self: *Self) void {
             var it = self.pending.valueIterator();
             while (it.next()) |bm| bm.deinit(self.allocator);
             self.pending.clearRetainingCapacity();
+        }
+
+        /// Drop overlay submaps at or above `block`, keeping canonical blocks
+        /// below the fork. Partial reorg rollback for a streamed REORG, where
+        /// finalized-but-uncommitted blocks below the fork must survive. The
+        /// committed cache (finalized mutations) is untouched. Restart on each
+        /// removal since `fetchRemove` invalidates the live iterator. Overlay is
+        /// bounded by FINALITY_DEPTH, so convergence is quick.
+        pub fn discardFrom(self: *Self, block: u64) void {
+            outer: while (true) {
+                var it = self.pending.keyIterator();
+                while (it.next()) |k| {
+                    if (k.* >= block) {
+                        var removed = self.pending.fetchRemove(k.*).?;
+                        removed.value.deinit(self.allocator);
+                        continue :outer;
+                    }
+                }
+                break;
+            }
         }
 
         pub fn count(self: *const Self) u32 {
@@ -156,9 +173,9 @@ pub fn MutableStore(comptime T: type) type {
             return n;
         }
 
-        /// Produce the sorted slab bytes for the next `state.snap` commit.
-        /// Caller owns the returned buffer (frees via `allocator`). Slab is
-        /// the union of (current slab) and (cache), with cache overwriting.
+        /// Produce sorted slab bytes for the next `state.snap` commit. Caller
+        /// owns the returned buffer (frees via `allocator`). Slab is the union
+        /// of current slab and cache, cache overwriting on key match.
         pub fn materialize(self: *Self, allocator: std.mem.Allocator) ![]u8 {
             var union_map = std.AutoHashMapUnmanaged(KeyBytes, T){};
             defer union_map.deinit(allocator);
@@ -196,8 +213,8 @@ pub fn MutableStore(comptime T: type) type {
             return out;
         }
 
-        /// Rebind the borrowed slab pointer after `state_snap.commit`
-        /// succeeds. Clears dirty flags on cache entries.
+        /// Rebind the borrowed slab pointer after `state_snap.commit` succeeds.
+        /// Clears dirty flags on cache entries.
         pub fn refreshSlab(self: *Self, new_slab: []const u8) void {
             self.slab = new_slab;
             var it = self.cache.valueIterator();
@@ -283,7 +300,7 @@ test "materialize merges slab and cache, overwriting on key match" {
     var store = S.open(testing.allocator, &slab_buf);
     defer store.deinit();
 
-    // Overwrite alice's balance; add a new key.
+    // Overwrite alice's balance, add a new key.
     try store.save(.{ .id = alice, .balance = 999 });
     const carl = [_]u8{0xCC} ** 20;
     try store.save(.{ .id = carl, .balance = 50 });
@@ -382,6 +399,31 @@ test "discardAll drops the overlay" {
 
     store.discardAll();
     try testing.expectEqual(@as(u32, 0), store.pendingCount());
+}
+
+test "discardFrom drops overlay at or above the fork, keeps blocks below" {
+    const S = MutableStore(Account);
+    var store = S.open(testing.allocator, &.{});
+    defer store.deinit();
+    store.live = true;
+
+    const alice = [_]u8{0xAA} ** 20;
+    const bob = [_]u8{0xBB} ** 20;
+    const carol = [_]u8{0xCC} ** 20;
+    store.live_block = 100;
+    try store.save(.{ .id = alice, .balance = 100 });
+    store.live_block = 101;
+    try store.save(.{ .id = bob, .balance = 200 });
+    store.live_block = 102;
+    try store.save(.{ .id = carol, .balance = 300 });
+    try testing.expectEqual(@as(u32, 3), store.pendingCount());
+
+    // Fork at 101: blocks 101 and 102 roll back, block 100 survives.
+    store.discardFrom(101);
+    try testing.expectEqual(@as(u32, 1), store.pendingCount());
+    try testing.expectEqual(@as(u256, 100), (try store.load(alice)).?.balance);
+    try testing.expect((try store.load(bob)) == null);
+    try testing.expect((try store.load(carol)) == null);
 }
 
 test "loadOrInit returns existing or fresh zero-init entity" {

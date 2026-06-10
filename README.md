@@ -24,7 +24,7 @@ EMIT Indexers then read that store and produce whatever entities your applicatio
 - **Iterate quickly.** Build a filtered index over the Engine's flat store once (~10s for rETH), then iterate handlers against the filtered index (<1s per re-run). Most development cycles become instant and changes are visible in seconds, not hours.
 - **Node-agnostic.** Anything that serves `eth_subscribe(newHeads)` and `eth_getLogs` works. Nethermind is recommended for the RocksDB direct-import path; Geth, Reth, and Erigon work via RPC.
 - **Multi-chain by composition.** One engine per chain, one indexer binary per chain. Cross-chain joins are application-level.
-- **You own the API.** EMIT fills entity stores. Whether you serve them via REST, GraphQL, WebSocket, or raw memory map — is your choice.
+- **You own the API.** EMIT fills entity stores. Your choice is to serve them via REST, GraphQL, WebSocket, or raw memory map.
 
 Currently requires the Execution Client, Engine, and Indexer to be collocated on the same machine. This will change with the introduction of remote engine TCP streaming in v1.1.0, allowing indexers to be remote.
 
@@ -67,6 +67,28 @@ Expected output from step 4: a per-cycle line like `scan: 124,500 blocks / filte
 For a fully featured example with a REST API, see [examples/erc20-api/README.md](examples/erc20-api/README.md).
 
 If you prefer Docker, see [engine/README.md](engine/README.md#container-deployment) for the `compose.node.yml` + `compose.emit.yml` operator flow.
+
+### Remote indexing (v1.1)
+
+To run an indexer on a different machine from the Engine, serve the flat store over TCP instead of reading it from disk:
+
+```sh
+# On the Engine host: stream server-side-filtered blocks. Binds localhost by
+# design — tunnel in from elsewhere; --listen 0.0.0.0:9090 is opt-in.
+./zig-out/bin/emit-engine serve \
+  --listen 127.0.0.1:9090 \
+  --data-dir /var/lib/emit-engine
+
+# On the indexer host: forward the port over SSH, then point the indexer at it.
+ssh -N -L 9090:127.0.0.1:9090 engine-host &
+cd examples/erc20
+zig build run -Doptimize=ReleaseFast -- \
+  --remote-engine 127.0.0.1:9090 \
+  --data-dir ./data \
+  --follow
+```
+
+See [engine/README.md](engine/README.md) for `serve` options such as `--max-connections`.
 
 ## Benchmarks
 
@@ -117,7 +139,7 @@ $170/month Hetzner dedicated server (i9-13900, 128GB DDR5 ECC, 2x 2TB Gen4 U.2 N
 | Package | Role | Imports |
 |---|---|---|
 | [`core/`](core/README.md) | Shared primitives: types, bloom filter, flat-store reader, io_uring pipeline | (none) |
-| [`engine/`](engine/README.md) | Standalone binary: import historical receipts, follow chain head | `core` |
+| [`engine/`](engine/README.md) | Standalone binary: import historical receipts, follow chain head, serve filtered streams to remote indexers | `core` |
 | [`sdk/`](sdk/README.md) | Zig library: manifest validation, filtered index, handler dispatch, entity stores | `core` |
 | [`examples/`](examples/README.md) | A collection of example indexers (ERC20, Uniswap V2) | `sdk` |
 
@@ -133,6 +155,8 @@ Nethermind + Lighthouse (Execution + Consensus Clients)  →  emit-engine  →  
 ```
 
 The execution client owns receipts. The Engine owns the flat log store (immutable post-finality). Each Indexer owns its entity store. Any one can be stopped, replaced, or scaled without touching the others. Read-only API replicas spawn by opening the entity store at a path; concurrent readers are native.
+
+As of v1.1, Indexers need not be collocated with the Engine. `emit-engine serve` streams server-side-filtered blocks over TCP, so an Indexer can run on a different machine — reached through an SSH tunnel — and stay byte-for-byte identical to a collocated one (backfill, live follow, and reorg recovery all run over the wire).
 
 Full architectural detail in `docs/`. Decision records in [docs/adr/](docs/adr/).
 

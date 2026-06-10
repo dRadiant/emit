@@ -33,6 +33,26 @@ pub fn build(b: *std.Build) void {
         .{ .name = "eth", .module = eth },
     };
 
+    // Modules used only by the cross-package integration tests, which need to
+    // reach engine and sdk internals under one compilation.
+    const engine_mod = b.addModule("engine", .{
+        .root_source_file = b.path("engine/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = engine_imports,
+    });
+    const sdk_internal = b.addModule("sdk_internal", .{
+        .root_source_file = b.path("sdk/src/internal.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "core", .module = core },
+            .{ .name = "lz4", .module = lz4 },
+            .{ .name = "eth", .module = eth },
+        },
+    });
+
     // ── Engine binary ────────────────────────────────────────────────────
     const exe = b.addExecutable(.{
         .name = "emit-engine",
@@ -70,6 +90,24 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .name = "sdk-tests", .root_module = sdk })).step);
+
+    // Cross-package integration: engine and sdk never import each other, so
+    // end-to-end checks import the source files directly under one module.
+    const integration = b.addTest(.{
+        .name = "integration-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/integration/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "core", .module = core },
+                .{ .name = "engine", .module = engine_mod },
+                .{ .name = "sdk_internal", .module = sdk_internal },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(integration).step);
 
     // Compile-fail harness: each sample MUST fail with an error line whose
     // suffix matches `expected`. Zig's expect_errors `.contains` matcher is

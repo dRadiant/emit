@@ -1,12 +1,11 @@
 /// erc20-api: the rETH indexer of `examples/erc20`, served over HTTP from the
 /// same process. `sdk.spawn` backfills, then runs the live follow loop on a
-/// background thread and hands back a `*Context`; the HTTP handlers read that
-/// live, tip-inclusive, reorg-aware state through the SDK's in-process read
-/// surface (`ctx.read` / `ctx.count` / `ctx.range` / `ctx.cursor`), each of
-/// which takes the Context lock internally — the API code never touches a mutex.
+/// background thread and hands back a `*Context`. HTTP handlers read live,
+/// tip-inclusive, reorg-aware state through the SDK in-process read surface
+/// (`ctx.read` / `ctx.count` / `ctx.range` / `ctx.cursor`), each of which takes
+/// the Context lock internally. The API code never touches a mutex.
 ///
-/// This is the traditional indexer model: the indexing service answers its
-/// own queries, at the head. Endpoints:
+/// The indexing service answers its own queries at the head. Endpoints:
 ///
 ///   GET /health                       cursor (last indexed block) + liveness
 ///   GET /account/:addr                balance (mutable point read)
@@ -21,8 +20,8 @@ const e = @import("entities.zig");
 const m = @import("manifest.zig");
 const h = @import("handlers.zig");
 
-/// Module form so this Context type matches the one `sdk.spawn` returns and
-/// the one `handlers.zig` derives. All three resolve to `Context(entities-module)`.
+/// Module form matches the Context type `sdk.spawn` returns and the one
+/// `handlers.zig` derives. All three resolve to `Context(entities-module)`.
 const Ctx = sdk.Context(e);
 
 const App = struct { ctx: *Ctx };
@@ -32,15 +31,15 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Reuse the shared example flag parser for the standard dirs + node RPC,
-    // then pull the API-only `--port` (default 8080) from argv separately.
+    // Shared flag parser handles standard dirs + node RPC. The API-only
+    // `--port` (default 8080) is pulled from argv separately.
     const args = try cli.parseStandardArgs(allocator, "erc20-api");
     defer allocator.free(args.engine_data_dir);
     defer allocator.free(args.data_dir);
     defer if (args.node_rpc) |s| allocator.free(s);
     const port = try parsePort(allocator);
 
-    // Backfill, then follow on a background thread; `ctx` is the live handle.
+    // Backfill, then follow on a background thread. `ctx` is the live handle.
     const ctx = try sdk.spawn(m.config, h, e, .{
         .engine_data_dir = args.engine_data_dir,
         .data_dir = args.data_dir,
@@ -64,8 +63,8 @@ pub fn main() !void {
 
 // ── Endpoints ──────────────────────────────────────────────────────────────
 
-/// Indexing progress + liveness. `cursor()` is the last fully-dispatched
-/// block; `followError()` is null while the follow thread is healthy.
+/// Indexing progress + liveness. `cursor()` is the last fully-dispatched block.
+/// `followError()` is null while the follow thread is healthy.
 fn health(app: *App, _: *httpz.Request, res: *httpz.Response) !void {
     try res.json(.{
         .last_indexed_block = app.ctx.cursor(),
@@ -101,8 +100,8 @@ fn allowance(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
 /// Newest-first page of transfers. `?limit` (default 20, capped 100) and
 /// `?offset` page backwards from the tip. Transfers are an append-only log, so
-/// `count()` + `range()` are the natural reads; we read an ascending window and
-/// reverse it for newest-first presentation.
+/// `count()` + `range()` are the natural reads. Reads an ascending window and
+/// reverses it for newest-first presentation.
 fn transfers(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const q = try req.query();
     const limit = @min(parseU64(q.get("limit")) orelse 20, 100);
@@ -116,7 +115,6 @@ fn transfers(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const start = total - offset - n; // ascending index of the window's oldest
     const window = try app.ctx.range(e.Transfer, start, buf[0..n]);
 
-    // Reverse the ascending window into newest-first presentation views.
     // `EventId.unpack` decodes the packed key back into its coordinates.
     const views = try res.arena.alloc(TransferView, window.len);
     for (window, 0..) |t, i| {
@@ -160,8 +158,7 @@ fn parseU64(s: ?[]const u8) ?u64 {
     return std.fmt.parseInt(u64, str, 10) catch null;
 }
 
-/// `--port N` from argv, default 8080. Kept out of the shared parser since it
-/// is API-only.
+/// `--port N` from argv, default 8080. API-only, so kept out of the shared parser.
 fn parsePort(allocator: std.mem.Allocator) !u16 {
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);

@@ -1,19 +1,19 @@
 /// Comptime parser for Solidity-style event signatures.
 ///
-/// Accepts the full ABI form — names and `indexed` keywords are optional:
+/// Accepts the full ABI form. Names and `indexed` keywords are optional:
 ///
 ///     "Transfer(address,address,uint256)"
 ///     "Transfer(address indexed from, address indexed to, uint256 value)"
 ///
 /// Topic0 is `keccak(canonical)` where the canonical form strips arg names
-/// and the `indexed` keyword AND resolves aliases (`uint`→`uint256`,
+/// and the `indexed` keyword and resolves aliases (`uint`→`uint256`,
 /// `int`→`int256`, `byte`→`bytes1`). Both forms above produce the same
-/// canonical `Transfer(address,address,uint256)` and therefore the same
-/// topic0 — matching what `solc` emits.
+/// canonical `Transfer(address,address,uint256)` and the same topic0,
+/// matching what `solc` emits.
 ///
-/// Output also carries each param's slot assignment (which topic slot or
-/// data offset holds the value), so handler decoders can comptime-resolve
-/// arg names to byte ranges without re-walking the signature at runtime.
+/// Output carries each param's slot assignment (which topic slot or data
+/// offset holds the value), so handler decoders comptime-resolve arg names
+/// to byte ranges without re-walking the signature at runtime.
 const std = @import("std");
 
 pub const SlotKind = enum { topic, data };
@@ -25,7 +25,7 @@ pub const ParsedParam = struct {
     type_str: []const u8,
     indexed: bool,
     slot_kind: SlotKind,
-    /// `.topic`: 1-based topic index (1, 2, or 3 — topic[0] is the selector).
+    /// `.topic`: 1-based topic index (1, 2, or 3). topic[0] is the selector.
     /// `.data`: byte offset within `log.data`. For dynamic types this is
     /// the offset of the head word (the head holds the tail offset).
     slot_index: usize,
@@ -33,14 +33,13 @@ pub const ParsedParam = struct {
 
 pub const ParsedEvent = struct {
     name: []const u8,
-    /// `Name(t1,t2,...)` form — what gets keccak-hashed for topic0.
+    /// `Name(t1,t2,...)` form. Keccak-hashed for topic0.
     canonical: []const u8,
     params: []const ParsedParam,
 };
 
 /// Parse an event signature at comptime. Fires `@compileError` on any
-/// malformed input. `@setEvalBranchQuota` is bumped here so callers don't
-/// need to track quota for the parser.
+/// malformed input. Quota is bumped here so callers don't track it.
 pub fn parseEvent(comptime sig: []const u8) ParsedEvent {
     @setEvalBranchQuota(200_000);
     return comptime parseEventInner(sig);
@@ -52,7 +51,7 @@ pub fn paramByName(comptime parsed: ParsedEvent, comptime param_name: []const u8
     return comptime blk: {
         if (param_name.len == 0) @compileError("abi_parse: empty parameter name passed to paramByName");
         for (parsed.params) |p| {
-            // Skip unnamed params so a caller passing "" can't silently match.
+            // Skip unnamed params so a caller passing "" can't match.
             if (p.name.len > 0 and std.mem.eql(u8, p.name, param_name)) break :blk p;
         }
         var avail: []const u8 = "";
@@ -65,12 +64,12 @@ pub fn paramByName(comptime parsed: ParsedEvent, comptime param_name: []const u8
 }
 
 /// Extract a parameter's 32-byte ABI word from a log's `topics`/`data` per its
-/// assigned slot: indexed params read `topics[slot_index]`, non-indexed params
-/// read the data word at `slot_index`. Data slots beyond `data.len` zero-fill —
-/// the ABI's zero-padding convention, and the guard against short or malformed
+/// assigned slot. Indexed params read `topics[slot_index]`, non-indexed params
+/// read the data word at `slot_index`. Data slots beyond `data.len` zero-fill,
+/// the ABI's zero-padding convention and a guard against short or malformed
 /// payloads (truncated RPC responses, test fixtures). Single source of truth
-/// for the slot→word read shared by `handler` decode and `manifest`
-/// address extraction.
+/// for the slot→word read shared by `handler` decode and `manifest` address
+/// extraction.
 pub fn wordAt(comptime p: ParsedParam, topics: []const [32]u8, data: []const u8) [32]u8 {
     return switch (comptime p.slot_kind) {
         .topic => topics[comptime p.slot_index],
@@ -123,8 +122,8 @@ fn parseEventInner(comptime sig: []const u8) ParsedEvent {
         } else {
             p.slot_kind = .data;
             p.slot_index = data_word * 32;
-            // Static arrays/tuples occupy several head words; dynamic types one
-            // (the tail offset). `headWords` advances the cursor accordingly.
+            // Static arrays/tuples occupy several head words, dynamic types
+            // one (the tail offset). `headWords` advances the cursor.
             data_word += headWords(p.type_str);
         }
 
@@ -141,9 +140,9 @@ fn parseEventInner(comptime sig: []const u8) ParsedEvent {
 }
 
 fn parseParam(comptime sig: []const u8, comptime part: []const u8) ParsedParam {
-    // The type span comes first: a tuple `(...)` (balanced parens) or a bare
-    // base token, then any `[..]` array suffixes. Tuples carry internal commas
-    // and spaces, so a flat whitespace tokenizer can't be used for the type.
+    // Type span comes first, a tuple `(...)` (balanced parens) or a bare base
+    // token, then any `[..]` array suffixes. Tuples carry internal commas and
+    // spaces, so a flat whitespace tokenizer can't parse the type.
     var i: usize = 0;
     while (i < part.len and isWs(part[i])) i += 1;
     const type_start = i;
@@ -168,7 +167,7 @@ fn parseParam(comptime sig: []const u8, comptime part: []const u8) ParsedParam {
     const type_tok = part[type_start..i];
     if (type_tok.len == 0) err(sig, "empty param");
 
-    // Remainder: whitespace-separated optional `indexed` and arg name.
+    // Remainder is whitespace-separated optional `indexed` and arg name.
     var rest: []const []const u8 = &.{};
     while (i < part.len) {
         while (i < part.len and isWs(part[i])) i += 1;
@@ -211,14 +210,14 @@ pub const TypeShape = struct {
     components: []const []const u8 = &.{}, // tuple component types
 };
 
-/// One-level structural view of a type string; recurse by calling `typeShape`
+/// One-level structural view of a type string. Recurse by calling `typeShape`
 /// again on `elem`/`components`. A trailing `[..]` suffix takes precedence over
 /// a leading tuple paren, so `(a,b)[]` is an array of the tuple `(a,b)`. The
 /// handler decoder drives off this so type structure has a single source.
 pub fn typeShape(comptime t: []const u8) TypeShape {
     if (t.len == 0) return .{ .tag = .primitive };
     if (t[t.len - 1] == ']') {
-        // Match the '[' of the trailing suffix (brackets don't nest in types).
+        // Match the '[' of the trailing suffix. Brackets don't nest in types.
         var depth: usize = 0;
         var i: usize = t.len;
         while (i > 0) {
@@ -241,7 +240,7 @@ pub fn typeShape(comptime t: []const u8) TypeShape {
 }
 
 /// Split on top-level commas, ignoring those inside `()` / `[]`. Always returns
-/// at least one part; a trailing comma yields a trailing empty part (rejected
+/// at least one part. A trailing comma yields a trailing empty part (rejected
 /// upstream as an empty param / component).
 fn splitTopLevel(comptime s: []const u8) []const []const u8 {
     var parts: []const []const u8 = &.{};
@@ -260,8 +259,8 @@ fn splitTopLevel(comptime s: []const u8) []const []const u8 {
     return parts ++ &[_][]const u8{s[start..]};
 }
 
-/// True if the ABI type is dynamically sized (its head is a single tail
-/// offset): `bytes`, `string`, any `T[]`, a fixed array of a dynamic element,
+/// True if the ABI type is dynamically sized (head is a single tail offset).
+/// Covers `bytes`, `string`, any `T[]`, a fixed array of a dynamic element,
 /// or a tuple with any dynamic component.
 pub fn isDynamicType(comptime t: []const u8) bool {
     const s = typeShape(t);
@@ -277,13 +276,13 @@ pub fn isDynamicType(comptime t: []const u8) bool {
 }
 
 /// Number of 32-byte words the type occupies in the ABI head. Dynamic types
-/// take one (the tail offset); a static fixed array takes `len × elem`; a
-/// static tuple takes the sum over its components; a primitive takes one.
+/// take one (the tail offset), a static fixed array takes `len × elem`, a
+/// static tuple takes the sum over its components, a primitive takes one.
 pub fn headWords(comptime t: []const u8) usize {
     if (isDynamicType(t)) return 1;
     const s = typeShape(t);
     return switch (s.tag) {
-        .dynamic_array => 1, // unreachable (caught above); keeps the switch total
+        .dynamic_array => 1, // unreachable (caught above), keeps the switch total
         .fixed_array => s.len * headWords(s.elem),
         .tuple => blk: {
             var n: usize = 0;
@@ -380,8 +379,7 @@ test "wordAt reads topic and data slots and zero-fills short data" {
     try std.testing.expectEqual(@as(u8, 0xAB), wordAt(pa, &topics, &data)[31]);
     try std.testing.expectEqual(@as(u8, 0xCD), wordAt(pb, &topics, &data)[31]);
 
-    // Data shorter than slot_index+32 zero-fills instead of reading OOB —
-    // the guard `param` and `extractAddress` previously lacked.
+    // Data shorter than slot_index+32 zero-fills instead of reading OOB.
     const short = wordAt(pb, &topics, &.{});
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &short);
 }
@@ -466,8 +464,7 @@ test "uintN at every multiple-of-8 boundary" {
 }
 
 test "topic0 of canonical matches solc-style hash" {
-    // Hash of Transfer(address,address,uint256) is the well-known ERC20
-    // Transfer selector 0xddf252ad…
+    // Transfer(address,address,uint256) is the ERC20 selector 0xddf252ad…
     const p = comptime parseEvent("Transfer(address indexed from, address indexed to, uint256 value)");
     try std.testing.expectEqualStrings("Transfer(address,address,uint256)", p.canonical);
 }

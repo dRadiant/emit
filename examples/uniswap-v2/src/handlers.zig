@@ -1,15 +1,14 @@
 /// Uniswap V2 event handlers.
 ///
-/// The factory pre-pass (Phase 2) scans `PairCreated` logs and feeds the
-/// discovered pair addresses into Phase 3's filter. By the time the main
-/// replay invokes `handlePairCreated`, the pair address has already been
-/// wired into the SDK's child-address set; the handler's only job is to
-/// persist the `Pair` entity row.
+/// Factory pre-pass scans `PairCreated` logs and feeds discovered pair
+/// addresses into the main replay's filter. At `handlePairCreated` time
+/// the pair is already in the child-address set, so the handler only
+/// persists the `Pair` entity row.
 ///
-/// `handleMint` and `handleBurn` are no-ops — the example doesn't model
-/// LP-token issuance/burn, but the manifest declares them so the factory
-/// pre-pass admits all four child events through the BLOCKS_CHILDREN
-/// filter (verifying the dispatcher round-trips them all).
+/// `handleMint`/`handleBurn` are no-ops: the example doesn't model
+/// LP-token issuance/burn. The manifest declares them so the pre-pass
+/// admits all four child events through the BLOCKS_CHILDREN filter,
+/// exercising the dispatcher round-trip.
 const std = @import("std");
 
 const sdk = @import("sdk");
@@ -18,8 +17,8 @@ const m = @import("manifest.zig");
 
 const Ctx = sdk.Context(@import("entities.zig"));
 
-/// Pairs created before the indexer's start_block don't appear in the
-/// filter env, so their decimals weren't prefetched. ERC20 default is 18.
+/// Pairs created before start_block aren't in the filter env, so their
+/// decimals weren't prefetched. ERC20 default is 18.
 const DEFAULT_DECIMALS: u8 = 18;
 
 pub fn handlePairCreated(log: sdk.Log(m.PairCreated), ctx: *Ctx) !void {
@@ -34,7 +33,7 @@ pub fn handlePairCreated(log: sdk.Log(m.PairCreated), ctx: *Ctx) !void {
 
 pub fn handleSync(log: sdk.Log(m.Sync), ctx: *Ctx) !void {
     var pair = try ctx.stores.pairs.loadOrInit(log.address);
-    // Sync.reserve0/1 are uint112; widen to u256 for the entity store.
+    // Sync.reserve0/1 are uint112, widened to u256 for the entity store.
     pair.reserve0 = log.params.reserve0;
     pair.reserve1 = log.params.reserve1;
     try ctx.stores.pairs.save(pair);

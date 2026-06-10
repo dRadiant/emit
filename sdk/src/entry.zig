@@ -6,14 +6,14 @@
 /// Phase 4: prefetch.gather + ethcall.preload (only when prefetch declared)
 /// Phase 5: scanner.replay                (with commit batching via Context)
 ///
-/// Phases 1-3 are skipped when an existing filter env is present (the
-/// handler-only re-run path). Phase 4 is skipped when the manifest declares
-/// no prefetch. Three entry points share the pipeline:
-///   `init`  — backfill, return a caught-up `Context` (does not follow).
-///   `run`   — backfill, then (if `follow`) run the live loop inline, blocking.
-///   `spawn` — backfill, then run the live loop on a background thread and
-///             return the `Context`, so an in-process API can read the stores
-///             under `ctx.lock()` (tip-fresh, reorg-aware).
+/// Phases 1-3 skipped when an existing filter env is present (handler-only
+/// re-run path). Phase 4 skipped when the manifest declares no prefetch.
+/// Three entry points share the pipeline:
+///   `init`  backfill, return a caught-up `Context` (does not follow).
+///   `run`   backfill, then (if `follow`) run the live loop inline, blocking.
+///   `spawn` backfill, then run the live loop on a background thread and
+///           return the `Context`, so an in-process API reads the stores
+///           under `ctx.lock()` (tip-fresh, reorg-aware).
 const std = @import("std");
 
 const core = @import("core");
@@ -31,28 +31,41 @@ const root = @import("root.zig");
 const scanner = @import("scanner.zig");
 const sdk_manifest = @import("manifest.zig");
 const state_snap_mod = @import("state_snap.zig");
+const tcp_client = @import("tcp_client.zig");
 
 pub const Options = struct {
     /// Directory containing the engine's flat store
     /// (blocks.dat / blocks.idx / blooms.bin / meta.bin). Read-only.
     engine_data_dir: []const u8,
-    /// SDK-managed data root. The SDK creates `<data_dir>/entity/` for the
-    /// state.snap + per-entity events.dat files, `<data_dir>/filter/` for
-    /// the filtered-index pair, and `<data_dir>/ethcall/` for the eth_call
-    /// cache on first run; all three are mkdir'd if missing.
+    /// SDK-managed data root. Creates `<data_dir>/entity/` (state.snap +
+    /// per-entity events.dat), `<data_dir>/filter/` (filtered-index pair),
+    /// and `<data_dir>/ethcall/` (eth_call cache) on first run. All three
+    /// mkdir'd if missing.
     data_dir: []const u8,
     /// Flush + commit cadence during handler replay, in dispatched logs.
     commit_interval: u32 = 100_000,
     /// JSON-RPC HTTP URL for Phase 4. `null` skips the network fetch
-    /// (warm-cache re-runs and tests); uncached calls stay uncached.
+    /// (warm-cache re-runs and tests). Uncached calls stay uncached.
     node_rpc: ?[]const u8 = null,
-    /// Multicall3 address; canonical on every major chain. Override only
+    /// Multicall3 address, canonical on every major chain. Override only
     /// for chains without the canonical deployment.
     multicall_address: [20]u8 = CANONICAL_MULTICALL3,
     multicall_batch_size: usize = ethcall.DEFAULT_BATCH_SIZE,
     /// When true, `run` and `init` block after backfill and enter the
-    /// live head-following loop; `init` never returns.
+    /// live head-following loop. `init` never returns.
     follow: bool = false,
+    /// When set, stream the filtered backfill from a remote engine `serve`
+    /// listener instead of reading a local flat store at `engine_data_dir`.
+    /// Backfill only. Live following over the stream is a separate capability,
+    /// so remote with `follow` is rejected.
+    remote_engine: ?RemoteEngine = null,
+};
+
+/// Address of a remote engine `serve` listener. Reached over an SSH tunnel in
+/// production, so `host` is normally a localhost forward.
+pub const RemoteEngine = struct {
+    host: []const u8,
+    port: u16,
 };
 
 pub const CANONICAL_MULTICALL3: [20]u8 = .{
@@ -60,8 +73,7 @@ pub const CANONICAL_MULTICALL3: [20]u8 = .{
     0x02, 0x88, 0x62, 0xbe, 0x2a, 0x17, 0x39, 0x76, 0xca, 0x11,
 };
 
-
-/// Result of a backfill run; returned from `run` and embedded in `Context`.
+/// Result of a backfill run, returned from `run` and embedded in `Context`.
 /// `elapsed_ns - (filter_build_ns + scan_creations_ns + append_children_ns +
 /// replay_ns)` is overhead (entity-store open, final commit, env init).
 pub const RunStats = struct {
@@ -87,17 +99,17 @@ pub const RunStats = struct {
 };
 
 /// Comptime-generate the long-lived context type. `entities` is the user's
-/// tuple of entity types; each entity declares
+/// tuple of entity types, each declaring
 /// `pub const storage: sdk.StorageMode = .mutable | .immutable;`.
 ///
 /// Heap-allocated by `init` so each `MutableStore`'s borrowed slab and
 /// each `ImmutableStore`'s `*EventLog` stay valid across the Context's
 /// lifetime. `commitCycle` reassigns the slabs via `refreshSlab` after
-/// every `state_snap.commit` — pointer addresses don't move.
+/// every `state_snap.commit`. Pointer addresses don't move.
 ///
-/// Underscore-prefixed fields are SDK internals — handlers should not read
-/// or mutate them. Public surface for handlers is `block_number`,
-/// `timestamp`, `stores`, `stats`, and `ethCall`.
+/// Underscore-prefixed fields are SDK internals, not for handler read or
+/// mutation. Public surface for handlers is `block_number`, `timestamp`,
+/// `stores`, `stats`, and `ethCall`.
 pub fn Context(comptime entities: anytype) type {
     const Stores = StoresStruct(entities);
     const EventLogs = EventLogsStruct(entities);
@@ -115,12 +127,12 @@ pub fn Context(comptime entities: anytype) type {
         _state_snap: Snap,
         _event_logs: EventLogs,
         /// Heap-allocated ethcall cache, owned by Context. Null when init
-        /// runs without prefetch declared — every `ethCall` then returns
-        /// `error.NotPrefetched`, matching the strict-mode semantics.
+        /// runs without prefetch declared, where every `ethCall` then returns
+        /// `error.NotPrefetched` matching the strict-mode semantics.
         _cache: ?*ethcall.Cache = null,
         /// Engine's per-block timestamp index, or null when the store predates
-        /// the feature. `humanize.timestampOf` reads it for exact `timestamp`
-        /// and falls back to the derivation formula when absent.
+        /// the feature. `humanize.timestampOf` reads it for exact `timestamp`,
+        /// falling back to the derivation formula when absent.
         _timestamps: ?core.timestamps.TimestampReader = null,
         /// Highest fully-dispatched block. Updated at block boundaries.
         /// `commitCycle` writes it into `state.snap.cursor` inside the same
@@ -131,21 +143,21 @@ pub fn Context(comptime entities: anytype) type {
         /// cold build and warm reuse) and extended live by `discoverChildren`
         /// as new create-events arrive. `live.shouldDispatch` consults it so
         /// child logs pass the address gate alongside statically declared
-        /// contracts. Owned by the Context; freed in `deinit`.
+        /// contracts. Owned by the Context, freed in `deinit`.
         _child_addresses: ?*std.AutoHashMap([20]u8, void) = null,
-        /// Coarse lock: the follow thread holds it per tick, API readers per
+        /// Coarse lock. The follow thread holds it per tick, API readers per
         /// query. Serializing reads is what makes the caching `load` reusable.
         _lock: std.Thread.Mutex = .{},
-        /// Non-null only under `spawn` (live loop on a thread); `deinit` joins it.
+        /// Non-null only under `spawn` (live loop on a thread). `deinit` joins it.
         _follow_thread: ?std.Thread = null,
         _stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-        /// First error the follow thread hit before exiting; surfaced via `followError`.
+        /// First error the follow thread hit before exiting. Surfaced via `followError`.
         _follow_error: ?anyerror = null,
 
-        /// Locked point read for in-process API callers — a value copy of
+        /// Locked point read for in-process API callers. A value copy of
         /// entity `T` for `key`: the mutable store's tip-fresh state, or the
         /// immutable store's live log (finalized records plus the overlay). Not
-        /// for handlers: they already run under the loop's lock, so a read here
+        /// for handlers, which already run under the loop's lock so a read here
         /// would deadlock.
         pub fn read(self: *Self, comptime T: type, key: anytype) !?T {
             self.lock();
@@ -176,7 +188,7 @@ pub fn Context(comptime entities: anytype) type {
             return @field(self.stores, entityFieldName(T)).range(start, out);
         }
 
-        /// Manual guard for multi-key snapshots; prefer `read` for single keys.
+        /// Manual guard for multi-key snapshots. Prefer `read` for single keys.
         pub fn lock(self: *Self) void {
             self._lock.lock();
         }
@@ -190,7 +202,7 @@ pub fn Context(comptime entities: anytype) type {
             return self._follow_error;
         }
 
-        /// Last fully-dispatched block — the indexer's cursor, for an honest
+        /// Last fully-dispatched block, the indexer's cursor, for an honest
         /// health/progress readout. Locked. Not for handlers.
         pub fn cursor(self: *Self) u64 {
             self.lock();
@@ -228,10 +240,10 @@ pub fn Context(comptime entities: anytype) type {
 
         /// Flush every store, advance the cursor, and rename `state.snap`
         /// atomically. Cursor + every MutableStore slab + every ImmutableStore
-        /// count are all published together; a crash inside leaves the prior
+        /// count are published together. A crash inside leaves the prior
         /// `state.snap` intact.
         pub fn commitCycle(self: *Self) !void {
-            // Flush ImmutableStore appends to events.dat first; their new
+            // Flush ImmutableStore appends to events.dat first. Their new
             // record counts feed the next state.snap.
             inline for (comptime resolveEntities(entities)) |T| {
                 if (comptime T.storage == .immutable) {
@@ -301,7 +313,7 @@ pub fn Context(comptime entities: anytype) type {
             self.stats.commits_performed += 1;
         }
 
-        /// Strict cache read — never issues HTTP. Returns `error.NotPrefetched`
+        /// Strict cache read, never issues HTTP. Returns `error.NotPrefetched`
         /// for undeclared pairs, `error.CallReverted` for status=1 entries.
         pub fn ethCall(
             self: *Self,
@@ -363,7 +375,7 @@ fn EventLogsStruct(comptime entities: anytype) type {
 }
 
 /// Backfill to completion and tear down. The entity stores are committed
-/// via `state.snap`; every handle in the Context is closed. To keep the
+/// via `state.snap` and every handle in the Context is closed. To keep the
 /// stores readable after backfill, use `init` instead.
 pub fn run(
     comptime m: sdk_manifest.Manifest,
@@ -374,7 +386,7 @@ pub fn run(
 ) !RunStats {
     const ctx = try init(m, Handler, entities, options, allocator);
     defer ctx.deinit();
-    // Headless follow: run the live loop inline on this thread (blocks forever
+    // Headless follow runs the live loop inline on this thread (blocks forever
     // under normal operation). Backfill-only (`follow = false`) returns stats.
     if (options.follow) try followLoop(m, Handler, ctx, options);
     return ctx.stats;
@@ -404,8 +416,13 @@ pub fn init(
     try std.fs.cwd().makePath(filter_dir);
     try std.fs.cwd().makePath(ethcall_dir);
 
-    var reader = try core.FlatStoreReader.open(options.engine_data_dir);
-    defer reader.deinit();
+    // Local mode opens the engine flat store. Remote mode streams instead, so
+    // there is no local store to read.
+    var reader: ?core.FlatStoreReader = if (options.remote_engine == null)
+        try core.FlatStoreReader.open(options.engine_data_dir)
+    else
+        null;
+    defer if (reader) |*r| r.deinit();
 
     const C = Context(entities);
     const ctx = try allocator.create(C);
@@ -425,11 +442,12 @@ pub fn init(
     errdefer ctx._state_snap.deinit();
     ctx._last_dispatched_block = ctx._state_snap.cursor;
 
-    // Open the engine's per-block timestamp index if present. Absence (stores
-    // predating the feature) or a corrupt file leaves it null, and
-    // `humanize.timestampOf` falls back to the derivation formula. The mmap
-    // outlives the directory handle.
-    {
+    // Open the engine's per-block timestamp index if present. Absence (older
+    // stores) or a corrupt file leaves it null, and `humanize.timestampOf`
+    // falls back to the derivation formula. The mmap outlives the dir handle.
+    // Local mode reads the engine timestamps.bin for exact times. Remote mode
+    // carries each block's timestamp in its FilteredStore entry instead.
+    if (options.remote_engine == null) {
         var engine_dh = try std.fs.cwd().openDir(options.engine_data_dir, .{});
         defer engine_dh.close();
         ctx._timestamps = core.timestamps.TimestampReader.open(engine_dh) catch null;
@@ -457,12 +475,18 @@ pub fn init(
 
     const fp = comptime sdk_manifest.fingerprint(m);
 
-    if (shouldSkipFilterBuild(filter_dh, allocator, fp)) {
+    if (options.remote_engine) |re| {
+        // A manifest change invalidates the streamed store. Clear so the stream
+        // restarts from cursor 0 instead of appending past a stale tail.
+        if (!shouldSkipFilterBuild(filter_dh, allocator, fp)) try clearFilterFiles(filter_dh);
+        try remoteBackfill(m, C, re, ctx, filter_dh, allocator);
+        try writeFilterFingerprint(filter_dh, fp);
+    } else if (shouldSkipFilterBuild(filter_dh, allocator, fp)) {
         ctx.stats.phases_skipped = true;
         // Even with the filter reused, factory children must be rediscovered
         // so the live address gate admits them. The primary store always
         // holds the factory create-events, so scanCreations rebuilds the same
-        // set without re-running the (skipped) full build.
+        // set without re-running the skipped full build.
         if (comptime m.factories.len > 0) {
             const discovered = try scanner.scanCreations(filter_dh, m, allocator);
             ctx.stats.discovered_children = discovered.count();
@@ -473,7 +497,7 @@ pub fn init(
         // otherwise make build() try to append blocks <= the existing tail,
         // raising error.OutOfOrder. Clear first so the rebuild starts clean.
         try clearFilterFiles(filter_dh);
-        const primary_result = try filter_builder.build(&reader, m, filter_dh, allocator);
+        const primary_result = try filter_builder.build(&reader.?, m, filter_dh, allocator);
         try requireCompleteFilter("phase 1 (build)", primary_result);
         ctx.stats.filter_blocks_scanned = primary_result.blocks_scanned;
         ctx.stats.filter_blocks_matched = primary_result.blocks_matched;
@@ -496,7 +520,7 @@ pub fn init(
                 while (it.next()) |addr| : (i += 1) child_addrs[i] = addr.*;
 
                 const child_result = try filter_builder.appendChildren(
-                    &reader,
+                    &reader.?,
                     m,
                     child_addrs,
                     filter_dh,
@@ -516,7 +540,7 @@ pub fn init(
 
     // Cache + Phase 4 are prefetch-only. Opening the cache unconditionally
     // would let handlers read stale entries from a previous manifest after
-    // the prefetch declaration is removed.
+    // a prefetch declaration is removed.
     if (comptime (m.prefetch.len > 0 or m.static_prefetch.len > 0)) {
         var ethcall_dh = try std.fs.cwd().openDir(ethcall_dir, .{});
         defer ethcall_dh.close();
@@ -535,7 +559,7 @@ pub fn init(
         ctx.stats.prefetch_ns = phase4_timer.read();
     }
 
-    // Open every entity store. MutableStores borrow a slab from state_snap;
+    // Open every entity store. MutableStores borrow a slab from state_snap.
     // ImmutableStores wrap their owning EventLog with the authoritative count
     // from state_snap.immutable_counts. Slot indices are comptime-tracked in
     // entities-tuple order.
@@ -580,8 +604,10 @@ pub fn init(
     try ctx.commitCycle();
     ctx.stats.elapsed_ns = timer.read();
 
-    if (options.follow) {
-        // Gap fill: the engine may have advanced during backfill. Re-open
+    // Remote follow handles the gap differently: the live REGISTER re-streams
+    // from the committed cursor, so the engine fills any advance during backfill.
+    if (options.follow and options.remote_engine == null) {
+        // Gap fill. The engine may have advanced during backfill. Re-open
         // the reader so any flat-store entries added since the start of
         // init are visible (the original `reader` mmap was sized at open).
         const engine_last = try live.readMeta(options.engine_data_dir);
@@ -600,8 +626,8 @@ pub fn init(
             );
             try requireCompleteFilter("follow gap-fill", gap_result);
 
-            // Factories: the gap may hold create-events for children unknown to
-            // the backfill pass (and child events from already-known children).
+            // The gap may hold create-events for children unknown to the
+            // backfill pass (and child events from already-known children).
             // Rediscover over the now-extended primary, merge into the live set,
             // and extend children.dat across the gap so replay sees them. The
             // gap range is strictly above the children store's tail, so the
@@ -639,19 +665,31 @@ pub fn init(
             try ctx.commitCycle();
         }
     }
-    // init never enters the live loop; run/spawn drive followLoop below.
+    // init never enters the live loop. run/spawn drive followLoop below.
     return ctx;
 }
 
-/// Live loop body: set up the Multicall (when a node RPC is configured) and run
-/// `live.run` until stop/error. Inline under `run`, on a thread under `spawn`;
-/// the multicall stays on this frame for the loop's lifetime.
+/// Live loop body. Sets up the Multicall (when a node RPC is configured) and
+/// runs `live.run` until stop/error. Inline under `run`, on a thread under
+/// `spawn`. The multicall stays on this frame for the loop's lifetime.
 fn followLoop(
     comptime m: sdk_manifest.Manifest,
     comptime Handler: type,
     ctx: anytype,
     options: Options,
 ) !void {
+    if (options.remote_engine) |re| {
+        return tcp_client.follow(
+            m,
+            Handler,
+            ctx,
+            re.host,
+            re.port,
+            comptime filter_builder.collectKnownAddresses(m),
+            comptime filter_builder.collectFollowTopics(m),
+            ctx._allocator,
+        );
+    }
     if (options.node_rpc) |rpc_url| {
         var http = eth.http_transport.HttpTransport.init(ctx._allocator, rpc_url);
         var provider = eth.provider.Provider.init(ctx._allocator, &http);
@@ -699,7 +737,7 @@ pub fn spawn(
 }
 
 /// Gather → dedupe → filterUncached → preload. Runs once between Phases 3 and 5.
-/// All gather allocations live in a local arena that frees on return; the
+/// All gather allocations live in a local arena that frees on return. The
 /// only state that escapes is the cache writes from `preload`.
 fn runPhase4(
     comptime m: sdk_manifest.Manifest,
@@ -728,7 +766,7 @@ fn runPhase4(
     if (missing.len == 0) return;
 
     // No RPC configured: gather is informational, fetch is a no-op. Handlers
-    // that hit an uncached pair will see `error.NotPrefetched` at replay.
+    // that hit an uncached pair see `error.NotPrefetched` at replay.
     const rpc_url = options.node_rpc orelse return;
 
     var http = eth.http_transport.HttpTransport.init(allocator, rpc_url);
@@ -761,8 +799,88 @@ fn writeFilterFingerprint(filter_dh: std.fs.Dir, fp: [32]u8) !void {
     try core.atomic_file.write(filter_dh, "manifest.fingerprint.tmp", "manifest.fingerprint", &fp);
 }
 
+/// Stream one filtered store from the remote engine. The REGISTER cursor is the
+/// store's current tail, so a re-run extends it rather than restreaming. Returns
+/// the number of blocks written.
+fn streamInto(
+    re: RemoteEngine,
+    filter_dh: std.fs.Dir,
+    comptime base: []const u8,
+    addresses: []const [20]u8,
+    topics: []const [32]u8,
+    exclude: []const [20]u8,
+    allocator: std.mem.Allocator,
+) !u64 {
+    var store = try filtered_store_mod.FilteredStore.open(allocator, filter_dh, base);
+    defer store.deinit();
+    const cursor = if (store.count() > 0)
+        (try store.readEntry(store.count() - 1)).block_number
+    else
+        0;
+    const result = try tcp_client.backfill(re.host, re.port, .{
+        .cursor = cursor,
+        .addresses = addresses,
+        .topics = topics,
+        .exclude_addresses = exclude,
+    }, &store, allocator);
+    return result.blocks_received;
+}
+
+/// Remote analogue of the local build + scanCreations + appendChildren. Streams
+/// the primary, and for a factory manifest discovers children from the streamed
+/// creations and streams their events into the children store (excluding
+/// static∪factory, matching the local children filter). Populates `ctx.stats`
+/// and hands the discovered child set to `ctx` so the live follow admits them.
+fn remoteBackfill(
+    comptime m: sdk_manifest.Manifest,
+    comptime C: type,
+    re: RemoteEngine,
+    ctx: *C,
+    filter_dh: std.fs.Dir,
+    allocator: std.mem.Allocator,
+) !void {
+    ctx.stats.filter_blocks_matched = try streamInto(
+        re,
+        filter_dh,
+        filter_builder.BASE_PRIMARY,
+        comptime filter_builder.collectKnownAddresses(m),
+        comptime filter_builder.collectAllTopics(m),
+        &.{},
+        allocator,
+    );
+
+    if (comptime m.factories.len > 0) {
+        const child_topics = comptime filter_builder.collectChildTopics(m);
+        var discovered = try scanner.scanCreations(filter_dh, m, allocator);
+        errdefer discovered.deinit();
+        ctx.stats.discovered_children = discovered.count();
+
+        if (discovered.count() > 0 and child_topics.len > 0) {
+            const child_addrs = try allocator.alloc([20]u8, discovered.count());
+            defer allocator.free(child_addrs);
+            var i: usize = 0;
+            var it = discovered.keyIterator();
+            while (it.next()) |a| : (i += 1) child_addrs[i] = a.*;
+
+            ctx.stats.children_blocks_matched = try streamInto(
+                re,
+                filter_dh,
+                filter_builder.BASE_CHILDREN,
+                child_addrs,
+                child_topics,
+                comptime filter_builder.collectKnownAddresses(m),
+                allocator,
+            );
+        }
+
+        // The follow REGISTER and the live address gate read this set. Ownership
+        // moves to ctx, freed by Context.deinit.
+        try setChildAddresses(C, ctx, allocator, discovered);
+    }
+}
+
 /// Move `discovered` onto the heap and hand ownership to `ctx`. The set has
-/// the lifetime of the Context (same allocator); `Context.deinit` frees it.
+/// the lifetime of the Context (same allocator). `Context.deinit` frees it.
 /// The live address gate and child-discovery pre-pass both read/extend it.
 fn setChildAddresses(
     comptime C: type,
@@ -777,8 +895,8 @@ fn setChildAddresses(
 
 fn clearFilterFiles(filter_dh: std.fs.Dir) !void {
     const names = [_][]const u8{
-        "primary.dat",     "primary.idx",
-        "children.dat",    "children.idx",
+        "primary.dat",          "primary.idx",
+        "children.dat",         "children.idx",
         "manifest.fingerprint",
     };
     for (names) |n| filter_dh.deleteFile(n) catch |err| switch (err) {
@@ -806,9 +924,9 @@ fn requireCompleteFilter(phase: []const u8, r: filter_builder.BuildResult) !void
 
 /// Comptime-build the inner struct that holds one entity store per tuple
 /// element, used as the type of `Context.stores`. Field names derive from
-/// the entity type's basename: lowercase the first byte and append `s`
+/// the entity type's basename, lowercasing the first byte and appending `s`
 /// (e.g. `Account` → `accounts`). An entity type may override this with
-/// `pub const store_name = "balances";` — useful when the auto-derived
+/// `pub const store_name = "balances";`, useful when the auto-derived
 /// name is ugly (`LBTCBalance` → `lBTCBalances`) or collides with another
 /// entity. Two entities whose effective store names collide raise
 /// `@compileError`.
@@ -857,7 +975,7 @@ fn StoresStruct(comptime entities: anytype) type {
 fn resolveEntities(comptime entities: anytype) []const type {
     const T = @TypeOf(entities);
 
-    // Module form: `entities` is a type whose pub decls include the
+    // Module form. `entities` is a type whose pub decls include the
     // entity structs (those declaring `pub const storage`).
     if (T == type) {
         var out: []const type = &.{};
@@ -873,7 +991,7 @@ fn resolveEntities(comptime entities: anytype) []const type {
         return out;
     }
 
-    // Tuple form: `entities` is a tuple value of entity types.
+    // Tuple form. `entities` is a tuple value of entity types.
     const info = @typeInfo(T);
     if (info == .@"struct" and info.@"struct".is_tuple) {
         var out: []const type = &.{};
@@ -894,7 +1012,7 @@ fn resolveEntities(comptime entities: anytype) []const type {
 }
 
 /// Compile-time guard for the immutable-only Context reads (`count`, `range`).
-/// Mutable entities are point-read by key via `read`; iterating them would
+/// Mutable entities are point-read by key via `read`. Iterating them would
 /// mean a union+dedup over the slab, cache, and overlays, a different and
 /// unbuilt read shape.
 fn assertImmutable(comptime T: type, comptime who: []const u8) void {
@@ -952,10 +1070,9 @@ const LBTCBalance = struct {
 const ADDR_TOKEN: [20]u8 = [_]u8{0xAE} ** 20;
 
 test "commit boundary lands at block end, not mid-block" {
-    // commit_interval = 1 with a 3-log single-block fixture: the old
-    // mid-block commit would have produced 3 in-replay commits + 1 final.
-    // The new block-boundary discipline produces 1 in-replay commit + 1
-    // final = 2. This is the invariant the cursor scheme depends on:
+    // commit_interval = 1 with a 3-log single-block fixture. Block-boundary
+    // commit discipline produces 1 in-replay commit + 1 final = 2 (a mid-block
+    // commit would yield 3 + 1). The invariant the cursor scheme depends on:
     // every commit reflects a fully-dispatched block, never a partial.
     const allocator = testing.allocator;
     const ALICE: [20]u8 = [_]u8{0xA1} ** 20;
@@ -1020,7 +1137,7 @@ test "store_name override beats the default basename derivation" {
 }
 
 test "Context accepts a module type and produces the same Context as the tuple form" {
-    // Inline module fixture: a struct with two pub entity decls plus a
+    // Inline module fixture. A struct with two pub entity decls plus a
     // non-entity helper that the resolver must skip.
     const FixtureModule = struct {
         pub const A = struct {
@@ -1033,14 +1150,14 @@ test "Context accepts a module type and produces the same Context as the tuple f
             id: [16]u8,
             value: u64,
         };
-        // Non-entity decl — must be ignored by the resolver.
+        // Non-entity decl, must be ignored by the resolver.
         pub const helper_constant: u32 = 42;
     };
 
     const FromModule = Context(FixtureModule);
     const FromTuple = Context(.{ FixtureModule.A, FixtureModule.B });
 
-    // Both forms yield identical Stores layouts (the user-observable contract).
+    // Both forms yield identical Stores layouts, the user-observable contract.
     const stores_from_module = std.meta.fieldInfo(FromModule, .stores).type;
     const stores_from_tuple = std.meta.fieldInfo(FromTuple, .stores).type;
     try testing.expectEqual(stores_from_module, stores_from_tuple);
@@ -1050,8 +1167,8 @@ test "Context accepts a module type and produces the same Context as the tuple f
 
 const TransferHandler = struct {
     pub fn handleTransfer(log: @import("handler.zig").Log(Transfer), ctx: anytype) !void {
-        // Transfer's signature is unnamed, so we still read positionally
-        // here; named-parameter access (`log.params.value`) is exercised by the
+        // Transfer's signature is unnamed, so read positionally here.
+        // Named-parameter access (`log.params.value`) is exercised by the
         // example indexers and the parser tests.
         const from = log.topics[1][12..32].*;
         const to = log.topics[2][12..32].*;
@@ -1069,8 +1186,8 @@ const TransferHandler = struct {
 };
 
 /// Caller owns `data_buf` and must keep it alive as long as the returned
-/// RawLog is used; we used to stash data in a threadlocal static, which
-/// silently aliased across calls and corrupted the test fixtures.
+/// RawLog is used. A per-call buffer avoids aliasing across calls, which
+/// would corrupt the test fixtures.
 fn makeTransferLog(block: u64, log_index: u16, from: [20]u8, to: [20]u8, value: u64, data_buf: *[32]u8) core.RawLog {
     var from_topic: [32]u8 = std.mem.zeroes([32]u8);
     @memcpy(from_topic[12..32], &from);
@@ -1263,7 +1380,7 @@ test "Context read/count/range/cursor over an immutable store after backfill" {
     );
     defer ctx.deinit();
 
-    // count spans the finalized log; cursor is the last dispatched block.
+    // count spans the finalized log. cursor is the last dispatched block.
     try testing.expectEqual(@as(u64, 3), ctx.count(XferEvent));
     try testing.expectEqual(@as(u64, 102), ctx.cursor());
 
@@ -1276,7 +1393,7 @@ test "Context read/count/range/cursor over an immutable store after backfill" {
     try testing.expectEqual(@as(u64, 300), all[2].value);
     try testing.expectEqualSlices(u8, &CARL, &all[2].to);
 
-    // Newest-first page of size 2 (start = count - 2); the caller reverses.
+    // Newest-first page of size 2 (start = count - 2). The caller reverses.
     // Its own buffer so the `all` slice above (aliasing `buf`) stays valid.
     var page_buf: [2]XferEvent = undefined;
     const page = try ctx.range(XferEvent, ctx.count(XferEvent) - 2, &page_buf);
@@ -1294,9 +1411,9 @@ test "spawn: follows on a background thread, reads under lock, deinit joins" {
     const ALICE: [20]u8 = [_]u8{0xA1} ** 20;
 
     // Two finalized mints to alice (100 + 50). No pending.bin, so the follow
-    // thread ticks on an empty ring and idles — we're exercising spawn's
-    // thread lifecycle + locked reads + deinit join, not live dispatch (which
-    // the live.zig tick tests already cover).
+    // thread ticks on an empty ring and idles. Exercises spawn's thread
+    // lifecycle + locked reads + deinit join, not live dispatch (covered by
+    // the live.zig tick tests).
     var data_bufs: [2][32]u8 = undefined;
     const log_b100 = makeTransferLog(100, 0, [_]u8{0} ** 20, ALICE, 100, &data_bufs[0]);
     const log_b101 = makeTransferLog(101, 0, [_]u8{0} ** 20, ALICE, 50, &data_bufs[1]);
@@ -1327,7 +1444,7 @@ test "spawn: follows on a background thread, reads under lock, deinit joins" {
         .{ .engine_data_dir = src_path, .data_dir = data_path, .commit_interval = 100_000 },
         allocator,
     );
-    defer ctx.deinit(); // sets _stop + joins the follow thread; hangs the test if join fails
+    defer ctx.deinit(); // sets _stop + joins the follow thread, hangs the test if join fails
 
     try testing.expect(ctx._follow_thread != null);
     {
@@ -1389,13 +1506,13 @@ test "spawn: follow thread dispatches a live pending block + reorg; reader sees 
     fake.last_finalized = 101; // keep meta consistent with the backfilled flat store
     defer fake.deinit();
 
-    // Pending block 102 mints +25 to alice; the follow thread must dispatch it
+    // Pending block 102 mints +25 to alice. The follow thread must dispatch it
     // into the overlay so a reader sees the tip value 175.
     var pbuf: [32]u8 = undefined;
     try fake.ingest(102, [_]u8{0xAA} ** 32, &.{makeTransferLog(102, 0, [_]u8{0} ** 20, ALICE, 25, &pbuf)});
     try pollBalance(ctx, ALICE, 175, 5000);
 
-    // Reorg 102 to a version minting +99; the reader must converge to 249.
+    // Reorg 102 to a version minting +99. The reader must converge to 249.
     try fake.reorg(102);
     var pbuf2: [32]u8 = undefined;
     try fake.ingest(102, [_]u8{0xBB} ** 32, &.{makeTransferLog(102, 0, [_]u8{0} ** 20, ALICE, 99, &pbuf2)});
@@ -1505,8 +1622,8 @@ test "init + replay commit batching: ctx.commitCycle fires per commit_interval" 
 
 /// Build a minimal Context whose only used field is `_cache`.
 /// `_entity_dir` and `_state_snap` are left `undefined` because `ethCall`
-/// never touches them; the caller must NOT invoke `deinit` (which would
-/// dereference them).
+/// never touches them. The caller must NOT invoke `deinit`, which would
+/// dereference them.
 fn ethCallTestContext(cache: *ethcall.Cache) Context(.{}) {
     return .{
         .stores = .{},
@@ -1698,8 +1815,8 @@ test "phase 4 runs zero work for a manifest with no prefetch" {
 }
 
 test "handler-only re-run skips phases 1-3 and the cursor blocks re-dispatch" {
-    // cursor: the first init writes `state.snap.cursor` reflecting the
-    // last dispatched block. The second init reads it, seeds `start_block`,
+    // The first init writes `state.snap.cursor` reflecting the last
+    // dispatched block. The second init reads it, seeds `start_block`,
     // and `scanner.replay` seeks past the already-covered range. The
     // single planted block (number 100) is therefore *not* re-dispatched
     const allocator = testing.allocator;

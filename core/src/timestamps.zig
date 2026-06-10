@@ -1,10 +1,9 @@
-/// Per-block Unix timestamps: a dense `u32 LE` array indexed by
+/// Per-block Unix timestamps. Dense `u32 LE` array indexed by
 /// `block - first_block`, in `timestamps.bin`.
 ///
-/// `u32` epoch-seconds is exact until 2106 and halves the file versus `u64`
-/// (~39 MB at the current tip). A zero entry means "unknown" (a gap not yet
-/// backfilled), so callers fall back to the formula for those — a partial or
-/// absent file is always safe.
+/// `u32` epoch-seconds exact until 2106, halves the file versus `u64`
+/// (~39 MB at the tip). Zero entry means unknown (gap not yet backfilled).
+/// Callers fall back to the formula. Partial or absent file is always safe.
 ///
 /// Layout:
 ///   0   8         magic "EMITTIME"
@@ -22,18 +21,18 @@ pub const FILE_NAME = "timestamps.bin";
 
 const MmapSlice = []align(std.heap.page_size_min) const u8;
 
-/// Read-only, mmap-backed, O(1) lookup by block number. Thread-safe (the map
-/// is immutable for a reader's lifetime). Returns null for any block outside
-/// the covered range or whose entry is unknown, so the caller keeps the
-/// formula as a fallback and old stores without the file just work.
+/// Read-only, mmap-backed, O(1) lookup by block number. Thread-safe: the map
+/// is immutable for a reader's lifetime. Returns null for any block outside
+/// the covered range or whose entry is unknown. Caller keeps the formula
+/// fallback, and old stores without the file just work.
 pub const TimestampReader = struct {
     map: MmapSlice,
     first_block: u64,
     count: u64,
 
     /// Open `dir/timestamps.bin`. Returns null when the file is absent or too
-    /// short to hold a header (pre-feature stores). `error.InvalidMagic` /
-    /// `error.Truncated` surface a corrupt file loudly.
+    /// short to hold a header. `error.InvalidMagic` and `error.Truncated`
+    /// surface a corrupt file loudly.
     pub fn open(dir: std.fs.Dir) !?TimestampReader {
         const file = dir.openFile(FILE_NAME, .{}) catch |err| switch (err) {
             error.FileNotFound => return null,
@@ -60,7 +59,7 @@ pub const TimestampReader = struct {
     }
 
     /// Exact Unix timestamp for `block`, or null when out of range or unknown
-    /// (a zero entry). Caller falls back to the derivation formula.
+    /// (zero entry). Caller falls back to the derivation formula.
     pub fn get(self: *const TimestampReader, block: u64) ?u64 {
         if (block < self.first_block) return null;
         const idx = block - self.first_block;
@@ -72,22 +71,22 @@ pub const TimestampReader = struct {
     }
 };
 
-/// Writer for timestamps.bin, decoupled from `FlatStoreWriter` so it can run as
+/// Writer for timestamps.bin. Decoupled from `FlatStoreWriter` so it can run as
 /// a standalone pass without touching `appendBlock` or the receipts pipeline.
 /// Fed by the importer's concurrent pass over Nethermind's `headers` DB
-/// (historical) and by the follower (live); both read the header `timestamp`
+/// (historical) and by the follower (live). Both read the header `timestamp`
 /// field, so no extra RPC is involved.
 ///
-/// Advisory data: a torn or partial file degrades to the formula via the
+/// Advisory data. A torn or partial file degrades to the formula via the
 /// reader's zero-is-unknown rule, so writes are plain positional `pwrite`
-/// (no atomic rename) and the header count is flushed on `sync`/`deinit`.
+/// (no atomic rename). Header count is flushed on `sync`/`deinit`.
 pub const TimestampWriter = struct {
     file: std.fs.File,
     first_block: u64,
     count: u64,
 
     /// Open `dir/timestamps.bin` for a store whose first block is
-    /// `first_block`, resuming an existing matching file or creating a fresh
+    /// `first_block`. Resumes an existing matching file or creates a fresh
     /// one (header only). A file with a different first_block (store rebuilt)
     /// is recreated so dense indexing stays aligned.
     pub fn open(dir: std.fs.Dir, first_block: u64) !TimestampWriter {
@@ -116,8 +115,8 @@ pub const TimestampWriter = struct {
     }
 
     /// Record `ts` for `block`. Blocks below first_block are ignored. The u32
-    /// lands at its dense slot; any skipped slot stays zero (unknown). Call
-    /// `sync` (or `deinit`) to publish the new count to readers.
+    /// lands at its dense slot. Any skipped slot stays zero (unknown). Call
+    /// `sync` or `deinit` to publish the new count to readers.
     pub fn set(self: *TimestampWriter, block: u64, ts: u32) !void {
         if (block < self.first_block) return;
         const idx = block - self.first_block;
@@ -144,7 +143,7 @@ pub const TimestampWriter = struct {
 
 const testing = std.testing;
 
-/// Write a timestamps.bin with the given first_block and entries (test helper).
+/// Write a timestamps.bin with the given first_block and entries.
 fn writeFixture(dir: std.fs.Dir, first_block: u64, entries: []const u32) !void {
     var file = try dir.createFile(FILE_NAME, .{});
     defer file.close();
@@ -163,7 +162,7 @@ fn writeFixture(dir: std.fs.Dir, first_block: u64, entries: []const u32) !void {
 test "reader returns exact timestamps and null outside the covered range" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    // blocks 100..103 with real (slot-aligned) timestamps; block 102 unknown (0).
+    // blocks 100..103 with slot-aligned timestamps, block 102 unknown (0)
     try writeFixture(tmp.dir, 100, &.{ 1_700_000_000, 1_700_000_012, 0, 1_700_000_036 });
 
     var r = (try TimestampReader.open(tmp.dir)).?;

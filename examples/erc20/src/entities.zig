@@ -20,7 +20,7 @@ pub const Allowance = struct {
 };
 
 /// Immutable. Keyed by `block_number(BE u64) ++ tx_index(BE u32) ++ log_index(BE u32)`.
-/// Monotonic in (block, tx, log) — required by `ImmutableStore`'s append-only contract.
+/// Monotonic in (block, tx, log). Required by `ImmutableStore`'s append-only contract.
 pub const Transfer = struct {
     pub const storage: sdk.StorageMode = .immutable;
     id: [16]u8,

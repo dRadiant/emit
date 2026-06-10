@@ -1,6 +1,6 @@
 /// io_uring-based read pipeline for batch block reads from blocks.dat.
 /// Comptime-generic on queue depth so each worker thread gets its own ring.
-/// Linux-only — non-Linux platforms use the pread fallback in filter workers.
+/// Linux-only. Non-Linux platforms use the pread fallback in filter workers.
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -56,7 +56,7 @@ pub fn ReadPipeline(comptime QUEUE_DEPTH: u32) type {
 
         pub fn submit(self: *Self, slot: u16, block_number: u64, offset: u64, length: u32) !void {
             // Reject rather than truncate. Silent clipping defeats the bounds
-            // check and surfaces as an opaque LZ4 decompression failure downstream.
+            // check and surfaces as an opaque downstream LZ4 decompression failure.
             if (length > self.bufs[slot].len) return error.EntryExceedsBuffer;
             const sqe = try self.ring.get_sqe();
             sqe.prep_read(self.fd, self.bufs[slot][0..length], offset);

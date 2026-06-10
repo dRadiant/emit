@@ -9,7 +9,7 @@ pub fn build(b: *std.Build) void {
 
     const httpz = b.dependency("httpz", .{ .target = target, .optimize = optimize }).module("httpz");
 
-    // Shared CLI shell lives one level up so every example reuses it.
+    // Shared CLI shell, one level up, reused by every example.
     const cli = b.createModule(.{
         .root_source_file = b.path("../utils/cli.zig"),
         .target = target,

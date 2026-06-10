@@ -1,12 +1,10 @@
 /// CLI shell shared by every example indexer in `examples/`.
+/// `cli.run(manifest, handlers, entities)` collapses the per-example
+/// boilerplate: allocator setup, arg parse, run, print stats.
 ///
-/// Each example's `main.zig` is essentially boilerplate around `sdk.run`:
-/// allocator setup, parse standard args, run the indexer, print stats.
-/// `cli.run(manifest, handlers, entities)` collapses all of that.
-///
-/// Examples that need custom CLI behavior (config files, env vars,
-/// structured logging) should skip `cli.run` and call `sdk.run` directly,
-/// composing `parseStandardArgs` and `printStats` if they want.
+/// Examples needing custom CLI behavior (config files, env vars,
+/// structured logging) skip `cli.run` and call `sdk.run` directly,
+/// composing `parseStandardArgs` and `printStats`.
 const std = @import("std");
 const sdk = @import("sdk");
 
@@ -14,18 +12,21 @@ pub const StandardArgs = struct {
     engine_data_dir: []const u8,
     data_dir: []const u8,
     commit_interval: u32 = 100_000,
-    /// Optional JSON-RPC URL for Phase 4 prefetch. When absent, prefetch
-    /// gathers but skips Multicall3 — handlers see `error.NotPrefetched`
-    /// for any uncached pair.
+    /// Optional JSON-RPC URL for prefetch. When absent, prefetch gathers
+    /// but skips Multicall3. Handlers see `error.NotPrefetched` for any
+    /// uncached pair.
     node_rpc: ?[]const u8 = null,
-    /// When true, enter the live head-following loop after backfill +
-    /// gap-fill. The process never returns under normal operation.
+    /// Enter the live head-following loop after backfill + gap-fill.
+    /// The process never returns under normal operation.
     follow: bool = false,
+    /// Stream the filtered backfill from a remote engine `serve` listener
+    /// (`host:port`) instead of reading a local flat store. Backfill only.
+    remote_engine: ?sdk.RemoteEngine = null,
 };
 
-/// Parse the standard arg set: `--engine-data-dir`, `--data-dir`,
-/// `--commit-interval`, `--node-rpc`. Missing required args print usage and
-/// return `error.MissingArgs`. Caller frees the duped string fields.
+/// Parse `--engine-data-dir`, `--data-dir`, `--commit-interval`,
+/// `--node-rpc`, `--follow`. Missing required args print usage and return
+/// `error.MissingArgs`. Caller frees the duped string fields.
 pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8) !StandardArgs {
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
@@ -35,6 +36,7 @@ pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8) !S
     var commit_interval: u32 = 100_000;
     var node_rpc: ?[]const u8 = null;
     var follow: bool = false;
+    var remote_engine: ?sdk.RemoteEngine = null;
 
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -51,19 +53,34 @@ pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8) !S
         } else if (std.mem.eql(u8, a, "--node-rpc") and i + 1 < argv.len) {
             node_rpc = try allocator.dupe(u8, argv[i + 1]);
             i += 1;
+        } else if (std.mem.eql(u8, a, "--remote-engine") and i + 1 < argv.len) {
+            const hp = argv[i + 1];
+            const colon = std.mem.lastIndexOfScalar(u8, hp, ':') orelse return error.BadRemoteEngine;
+            remote_engine = .{
+                .host = try allocator.dupe(u8, hp[0..colon]),
+                .port = try std.fmt.parseInt(u16, hp[colon + 1 ..], 10),
+            };
+            i += 1;
         } else if (std.mem.eql(u8, a, "--follow")) {
             follow = true;
         }
     }
 
+    // Remote mode reads no local store, so engine_data_dir is unused. Default
+    // it to data_dir to keep `Options.engine_data_dir` populated.
+    if (remote_engine != null and engine_data_dir == null) {
+        if (data_dir) |d| engine_data_dir = try allocator.dupe(u8, d);
+    }
+
     if (engine_data_dir == null or data_dir == null) {
         std.debug.print(
-            "usage: {s} --engine-data-dir <path> --data-dir <path> [--commit-interval N] [--node-rpc URL] [--follow]\n",
+            "usage: {s} --engine-data-dir <path> --data-dir <path> [--commit-interval N] [--node-rpc URL] [--remote-engine host:port] [--follow]\n",
             .{prog_name},
         );
         if (engine_data_dir) |s| allocator.free(s);
         if (data_dir) |s| allocator.free(s);
         if (node_rpc) |s| allocator.free(s);
+        if (remote_engine) |re| allocator.free(re.host);
         return error.MissingArgs;
     }
 
@@ -73,19 +90,19 @@ pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8) !S
         .commit_interval = commit_interval,
         .node_rpc = node_rpc,
         .follow = follow,
+        .remote_engine = remote_engine,
     };
 }
 
-/// One canonical RunStats printout that covers both factory and
-/// non-factory manifests. Factory fields read zero for non-factory
-/// indexers — kept visible so users can sanity-check that their
-/// non-factory indexer didn't unexpectedly discover children.
+/// Canonical RunStats printout covering both factory and non-factory
+/// manifests. Factory fields read zero for non-factory indexers, kept
+/// visible so users can confirm no children were unexpectedly discovered.
 pub fn printStats(prog_name: []const u8, stats: sdk.RunStats) void {
     const ms = std.time.ns_per_ms;
     const phases = stats.filter_build_ns + stats.scan_creations_ns + stats.append_children_ns + stats.prefetch_ns + stats.replay_ns;
     const overhead_ns = if (stats.elapsed_ns > phases) stats.elapsed_ns - phases else 0;
-    // Derive batch count from executed pairs and the default Multicall3 chunk;
-    // an exact match would require routing the per-run override through stats.
+    // Batch count derived from executed pairs and the default Multicall3
+    // chunk. Exact count would need the per-run override routed through stats.
     const batches = (stats.prefetch_calls_executed + sdk.DEFAULT_BATCH_SIZE - 1) / sdk.DEFAULT_BATCH_SIZE;
     std.debug.print(
         \\{s} indexer complete
@@ -151,6 +168,7 @@ pub fn run(
     defer allocator.free(args.engine_data_dir);
     defer allocator.free(args.data_dir);
     defer if (args.node_rpc) |s| allocator.free(s);
+    defer if (args.remote_engine) |re| allocator.free(re.host);
 
     const stats = try sdk.run(manifest, handlers, entities, .{
         .engine_data_dir = args.engine_data_dir,
@@ -158,9 +176,10 @@ pub fn run(
         .commit_interval = args.commit_interval,
         .node_rpc = args.node_rpc,
         .follow = args.follow,
+        .remote_engine = args.remote_engine,
     }, allocator);
 
-    // Unreachable under `--follow`: sdk.run enters the live loop and
-    // never returns. Falling through here means backfill-only completed.
+    // Unreachable under `--follow`. sdk.run enters the live loop and never
+    // returns. Reaching here means backfill-only completed.
     printStats(manifest.name, stats);
 }
