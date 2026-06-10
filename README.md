@@ -130,9 +130,7 @@ $170/month Hetzner dedicated server (i9-13900, 128GB DDR5 ECC, 2x 2TB Gen4 U.2 N
 
 ## Status
 
-**v1.0.0, pre-release.** EMIT is not yet fully production ready, and is still under active development. Use at your own risk, and expect breaking changes.
-
-**v1.1.0 ships remote engine TCP streaming** (remote indexers, no collocation), a production RPC import path (direct import for L2s and L1 operators without a local node), array/tuple ABI types, and a full indexer example with a REST API. Transaction traces and variable-length entity fields follow in v1.2; seamless multi-chain handling is on the longer-term roadmap.
+**v1.1.0** EMIT is not yet fully production ready, and is still under active development. Use at your own risk, and expect breaking changes.
 
 ## Packages
 
@@ -164,7 +162,7 @@ Full architectural detail in `docs/`. Decision records in [docs/adr/](docs/adr/)
 
 If you have a subgraph manifest or a TypeScript indexer config, the mapping to EMIT is direct: your manifest becomes `manifest.zig`, your event handlers become methods on a Zig struct in `handlers.zig`, your schema becomes Zig struct definitions in `entities.zig`. The two-stage backfill replaces the streaming model — you write the same handler logic, but you can re-run it in under a second against the local filtered index instead of replaying from a remote source.
 
-A dedicated migration guide is planned for v1.2.0. Until then, the example indexers ([erc20](examples/erc20/), [uniswap-v2](examples/uniswap-v2/)) are the canonical reference for what an EMIT indexer looks like.
+A dedicated migration guide is planned for the future. Until then, the example indexers ([erc20](examples/erc20/), [uniswap-v2](examples/uniswap-v2/)) are the canonical reference for what an EMIT indexer looks like.
 
 ## Documentation
 
