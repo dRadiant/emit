@@ -131,6 +131,7 @@ pub fn serveConnection(
     allocator: std.mem.Allocator,
 ) !void {
     setNoDelay(stream);
+    clearRecvTimeout(stream);
 
     const reg_payload = try readFrame(stream, .register, allocator);
     defer allocator.free(reg_payload);
@@ -381,6 +382,14 @@ fn writeFrame(stream: std.net.Stream, t: tcp_frame.FrameType, payload: []const u
 fn setNoDelay(stream: std.net.Stream) void {
     const one: c_int = 1;
     std.posix.setsockopt(stream.handle, std.posix.IPPROTO.TCP, std.os.linux.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
+}
+
+/// Clear the recv timeout an accepted socket inherits from the listener (set by
+/// `setAcceptTimeout` for the accept poll). Connection reads must block, not
+/// time out at 250 ms, which would spuriously fail REGISTER over a latent link.
+fn clearRecvTimeout(stream: std.net.Stream) void {
+    const tv = std.posix.timeval{ .sec = 0, .usec = 0 };
+    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
 }
 
 /// Read one frame whose type must be `expect`. Returns the owned payload.
@@ -829,4 +838,47 @@ test "the worker pool serves concurrent follow connections" {
     // Both follows are live at once, so both receive their backfill PUSH(100).
     try expectLivePush(c0, allocator, 100, 1);
     try expectLivePush(c1, allocator, 100, 1);
+}
+
+test "an accepted connection does not inherit the listener's recv timeout" {
+    // Regression: setAcceptTimeout sets SO_RCVTIMEO on the listener, which Linux
+    // copies onto accepted sockets. Without clearing it, a REGISTER that arrives
+    // after the timeout fails with WouldBlock. Loopback hides this (reads are
+    // instant); a latent link, or this deliberate stall, exposes it.
+    const allocator = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const blocks = [_]TestBlock{.{ .block_number = 100, .timestamp = 1, .logs = &.{.{ .address = ADDR_A, .topic0 = TOPIC_T }} }};
+    try flat_reader.writeTestStore(tmp.dir, &blocks, allocator);
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpath(".", &path_buf);
+    var reader = try FlatStoreReader.open(path);
+    defer reader.deinit();
+
+    var server = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+    try setAcceptTimeout(server, 50);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const wctx = WorkerCtx{ .server = &server, .reader = &reader, .ts = null, .cfg = .{ .data_dir = path }, .alloc = allocator, .stop = &stop };
+    var w = try std.Thread.spawn(.{}, acceptLoop, .{wctx});
+    defer w.join();
+    defer stop.store(true, .release);
+
+    const client = try std.net.tcpConnectToAddress(try std.net.Address.parseIp("127.0.0.1", port));
+    defer client.close();
+
+    // Stall past the 50 ms accept timeout before sending REGISTER.
+    std.Thread.sleep(150 * std.time.ns_per_ms);
+
+    const reg = tcp_frame.Register{ .cursor = 0, .addresses = &.{ADDR_A}, .topics = &.{TOPIC_T} };
+    const reg_payload = try reg.encode(allocator);
+    defer allocator.free(reg_payload);
+    try writeFrame(client, .register, reg_payload);
+
+    // The backfill PUSH(100) still arrives: the inherited timeout was cleared.
+    try expectLivePush(client, allocator, 100, 1);
 }
