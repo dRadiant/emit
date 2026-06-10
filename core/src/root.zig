@@ -14,6 +14,7 @@ pub const log_serial = @import("log_serial.zig");
 pub const io_pipeline = @import("io_pipeline.zig");
 pub const parallel = @import("parallel.zig");
 pub const parallel_filter = @import("parallel_filter.zig");
+pub const log = @import("log.zig");
 pub const pending_format = @import("pending_format.zig");
 pub const atomic_file = @import("atomic_file.zig");
 pub const flat_format = @import("flat_format.zig");
@@ -39,6 +40,7 @@ test {
     _ = io_pipeline;
     _ = parallel;
     _ = parallel_filter;
+    _ = log;
     _ = pending_format;
     _ = atomic_file;
     _ = flat_format;

@@ -908,7 +908,7 @@ fn clearFilterFiles(filter_dh: std.fs.Dir) !void {
 /// Hard-fail when a filter phase dropped blocks. Better than shipping a partial index.
 fn requireCompleteFilter(phase: []const u8, r: filter_builder.BuildResult) !void {
     if (r.dropped_blocks == 0) return;
-    std.debug.print(
+    core.log.err(
         \\
         \\ERROR: filter {s} dropped {d} of {d} matching blocks.
         \\Index is incomplete; aborting. Likely cause: a block's serialized log

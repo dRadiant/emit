@@ -9,6 +9,7 @@
 const std = @import("std");
 
 const core = @import("core");
+const log = core.log;
 
 const head_follower = @import("head_follower.zig");
 const rpc_import = @import("rpc_import.zig");
@@ -21,6 +22,7 @@ pub fn main() !void {
     if (args.len < 2) return usage();
 
     const command = args[1];
+    log.setLevel(log.levelFromFlags(hasFlag(args, "--silent"), hasFlag(args, "--verbose")));
 
     if (std.mem.eql(u8, command, "status")) {
         const data_dir = getFlag(args, "--data-dir") orelse return usage();
@@ -66,10 +68,10 @@ pub fn main() !void {
                 .argv = argv,
             });
             if (result) |r| {
-                if (r.stdout.len > 0) std.debug.print("{s}", .{r.stdout});
-                if (r.stderr.len > 0) std.debug.print("{s}", .{r.stderr});
+                if (r.stdout.len > 0) log.info("{s}", .{r.stdout});
+                if (r.stderr.len > 0) log.info("{s}", .{r.stderr});
             } else |_| {
-                std.debug.print("Failed to exec rocksdb-import. Build it with: zig build import\n", .{});
+                log.err("Failed to exec rocksdb-import. Build it with: zig build import\n", .{});
             }
             return;
         }
@@ -93,7 +95,7 @@ pub fn main() !void {
 fn status(data_dir: []const u8) void {
     const meta = core.flat_reader.FlatStoreReader.readMeta(data_dir);
     if (meta) |m| {
-        std.debug.print(
+        log.info(
             \\=== Flat Store Status ===
             \\Data dir:            {s}
             \\Last finalized block: {d}
@@ -110,7 +112,7 @@ fn status(data_dir: []const u8) void {
             m.blooms_count,
         });
     } else {
-        std.debug.print("No flat store found at {s}\n", .{data_dir});
+        log.err("No flat store found at {s}\n", .{data_dir});
     }
 }
 
@@ -127,7 +129,7 @@ fn hasFlag(args: []const [:0]u8, flag: []const u8) bool {
 }
 
 fn usage() void {
-    std.debug.print(
+    log.err(
         \\Usage: emit-engine <command> [options]
         \\
         \\Commands:
@@ -139,6 +141,8 @@ fn usage() void {
         \\  serve [--listen <host:port>] [--max-connections <n>] --data-dir <path>
         \\                                              Stream filtered blocks to remote indexers (default 127.0.0.1:9090, 16 workers)
         \\  status --data-dir <path>                    Print store status
+        \\
+        \\Global: [--silent] errors only · [--verbose] add per-step detail
         \\
     , .{});
 }

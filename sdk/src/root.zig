@@ -51,6 +51,9 @@ pub const run = entry.run;
 pub const spawn = entry.spawn;
 pub const RunStats = entry.RunStats;
 pub const StaticCall = manifest.StaticCall;
+/// Leveled CLI output, shared with the engine. Set via `log.setLevel` from the
+/// indexer's `--silent` / `--verbose` flags.
+pub const log = @import("core").log;
 
 /// Storage mode declared per-entity via `pub const storage: sdk.StorageMode`.
 /// `mutable` -> MutableStore (HashMap-fronted, dirty-flag flush, supports

@@ -76,7 +76,7 @@ pub fn run(opts: Options) !void {
     var server = try address.listen(.{ .reuse_address = true });
     defer server.deinit();
     try setAcceptTimeout(server, ACCEPT_POLL_MS);
-    std.debug.print(
+    core.log.info(
         "emit-engine serve: listening on {s}:{d} ({d} workers, data-dir {s}, tip {d})\n",
         .{ opts.host, server.listen_address.getPort(), opts.max_connections, opts.data_dir, tipOf(&reader) },
     );
@@ -103,12 +103,12 @@ fn acceptLoop(ctx: WorkerCtx) void {
     while (!ctx.stop.load(.acquire)) {
         const conn = ctx.server.accept() catch |e| {
             if (e == error.WouldBlock) continue;
-            std.debug.print("serve: accept failed: {s}\n", .{@errorName(e)});
+            core.log.info("serve: accept failed: {s}\n", .{@errorName(e)});
             continue;
         };
         defer conn.stream.close();
         serveConnection(conn.stream, ctx.reader, ctx.ts, ctx.cfg, ctx.alloc) catch |e| {
-            std.debug.print("serve: connection ended: {s}\n", .{@errorName(e)});
+            core.log.debug("serve: connection ended: {s}\n", .{@errorName(e)});
         };
     }
 }

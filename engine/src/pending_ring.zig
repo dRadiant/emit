@@ -59,7 +59,7 @@ pub const PendingRing = struct {
             // follower re-baselines from meta and rewrites it in the current
             // format. Genuine corruption of a current-format file still fails
             // loud (Truncated / NonDense).
-            error.InvalidMagic => std.debug.print("pending.bin: unrecognized magic, discarding and re-baselining from meta\n", .{}),
+            error.InvalidMagic => core.log.info("pending.bin: unrecognized magic, discarding and re-baselining from meta\n", .{}),
             else => return err,
         };
         return ring;

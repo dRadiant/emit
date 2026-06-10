@@ -66,7 +66,7 @@ pub fn run(config: FollowConfig) !void {
         const tip = try provider.getBlockNumber();
         const gap: u64 = if (tip > baseline) tip - baseline else 0;
         if (gap > GAP_REFUSE_THRESHOLD) {
-            std.debug.print(
+            core.log.err(
                 \\
                 \\Refusing follow: flat store ends at block {d}, chain is at {d}
                 \\(gap of {d} blocks, ~{d}h via RPC). The fast path is:
@@ -83,21 +83,21 @@ pub fn run(config: FollowConfig) !void {
     }
 
     if (config.ws_url) |ws_url| ws: {
-        std.debug.print("Connecting to {s}...\n", .{ws_url});
+        core.log.info("Connecting to {s}...\n", .{ws_url});
         var ws = eth.ws_transport.WsTransport.connect(alloc, ws_url) catch |err| {
-            std.debug.print("WS failed ({s}), falling back to HTTP\n", .{@errorName(err)});
+            core.log.info("WS failed ({s}), falling back to HTTP\n", .{@errorName(err)});
             break :ws;
         };
         defer ws.close();
         followWs(&ws, &provider, &writer, &ring, alloc, if (ts_writer) |*w| w else null) catch |err| {
-            std.debug.print("WS error ({s}), falling back to HTTP\n", .{@errorName(err)});
+            core.log.info("WS error ({s}), falling back to HTTP\n", .{@errorName(err)});
         };
     }
 
-    std.debug.print("Polling {s} every {d}ms\n", .{ config.rpc_url, config.poll_interval_ms });
+    core.log.info("Polling {s} every {d}ms\n", .{ config.rpc_url, config.poll_interval_ms });
     while (true) {
         followPoll(&provider, &writer, &ring, alloc, if (ts_writer) |*w| w else null) catch |err| {
-            std.debug.print("Poll error: {s}\n", .{@errorName(err)});
+            core.log.debug("Poll error: {s}\n", .{@errorName(err)});
         };
         std.Thread.sleep(config.poll_interval_ms * std.time.ns_per_ms);
     }
@@ -115,7 +115,7 @@ fn followWs(
 ) !void {
     var sub = try eth.subscription.Subscription.subscribe(alloc, ws, .{ .new_heads = {} });
     defer sub.deinit();
-    std.debug.print("Subscribed to newHeads\n", .{});
+    core.log.info("Subscribed to newHeads\n", .{});
 
     while (true) {
         const msg = try sub.next();
@@ -138,7 +138,7 @@ fn followWs(
         var gap_ok = true;
         while (bn < block_number) : (bn += 1) {
             ingestBlock(bn, provider, ring, alloc) catch |err| {
-                std.debug.print("Gap-fill block {d}: {s}\n", .{ bn, @errorName(err) });
+                core.log.info("Gap-fill block {d}: {s}\n", .{ bn, @errorName(err) });
                 gap_ok = false;
                 break;
             };
@@ -146,7 +146,7 @@ fn followWs(
         if (!gap_ok) continue;
 
         ingestBlock(block_number, provider, ring, alloc) catch |err| {
-            std.debug.print("Block {d}: {s}\n", .{ block_number, @errorName(err) });
+            core.log.info("Block {d}: {s}\n", .{ block_number, @errorName(err) });
             continue;
         };
         finalizeReady(ring, writer, block_number, alloc, ts_writer);
@@ -169,7 +169,7 @@ fn followPoll(
 
     for (tip + 1..latest + 1) |bn| {
         ingestBlock(@intCast(bn), provider, ring, alloc) catch |err| {
-            std.debug.print("Block {d}: {s}\n", .{ bn, @errorName(err) });
+            core.log.info("Block {d}: {s}\n", .{ bn, @errorName(err) });
             break;
         };
     }
@@ -197,7 +197,7 @@ fn ingestBlock(
     // Reorg check: this block's parent hash vs the stored hash.
     if (ring.getHash(block_number - 1)) |stored_hash| {
         if (!std.mem.eql(u8, &stored_hash, &header.parent_hash)) {
-            std.debug.print("Reorg detected at block {d}\n", .{block_number});
+            core.log.info("Reorg detected at block {d}\n", .{block_number});
             const fork = try resolveReorg(ring, block_number, provider);
             var bn = fork;
             while (bn <= block_number) : (bn += 1) {
@@ -241,7 +241,7 @@ fn ingestBlockCore(
     // Fail loud per the contract in core/src/types.zig. A silent truncate
     // would land an incomplete block in pending + flat store.
     if (eth_logs.len > types.MAX_LOGS_PER_BLOCK) {
-        std.debug.print(
+        core.log.err(
             "Block {d}: {d} logs exceeds MAX_LOGS_PER_BLOCK ({d}). Bump the constant in core/src/types.zig.\n",
             .{ block_number, eth_logs.len, types.MAX_LOGS_PER_BLOCK },
         );
@@ -263,7 +263,7 @@ fn ingestBlockCore(
 
     const ts: u32 = std.math.cast(u32, header.timestamp) orelse 0; // exact block time, valid until 2106
     try ring.insert(block_number, ts, header.hash, &topic_bloom.bits, &addr_bloom.bits, compress_buf[0..entry_len]);
-    std.debug.print("Block {d}: {d} logs\n", .{ block_number, raw_logs.len });
+    core.log.debug("Block {d}: {d} logs\n", .{ block_number, raw_logs.len });
 }
 
 /// Truncate divergent pending entries down to the fork point and return it,
@@ -284,7 +284,7 @@ fn resolveReorg(ring: *PendingRing, from: u64, provider: *eth.provider.Provider)
     const fork = ring.findForkPoint(from, canonical[0..filled]);
     const removed = try ring.truncateFrom(fork);
     try ring.flush();
-    std.debug.print("Reorg: fork at {d}, removed {d} blocks\n", .{ fork, removed });
+    core.log.info("Reorg: fork at {d}, removed {d} blocks\n", .{ fork, removed });
     return fork;
 }
 
@@ -305,7 +305,7 @@ fn finalizeReady(
         const oldest = ring.peekOldest() orelse break;
         const pre = writer.meta.last_finalized_block;
         writer.appendBlock(oldest.block_number, oldest.lz4_entry, &oldest.topic_bloom, &oldest.addr_bloom) catch |err| {
-            std.debug.print("Finalize block {d}: {s}\n", .{ oldest.block_number, @errorName(err) });
+            core.log.info("Finalize block {d}: {s}\n", .{ oldest.block_number, @errorName(err) });
             break;
         };
         // Mirror the flat-store append into timestamps.bin so cold re-backfills
@@ -327,7 +327,7 @@ fn finalizeReady(
     // Flush ring on any pop, including idempotent skips, so crash recovery
     // doesn't keep re-presenting the same finalized blocks.
     if (popped_count > 0) ring.flush() catch {};
-    if (finalized > 0) std.debug.print("Finalized {d} blocks\n", .{finalized});
+    if (finalized > 0) core.log.debug("Finalized {d} blocks\n", .{finalized});
 }
 
 fn toRawLog(log: eth.receipt.Log, block_number: u64, alloc: std.mem.Allocator) !types.RawLog {

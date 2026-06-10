@@ -37,6 +37,8 @@ pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8) !S
     var node_rpc: ?[]const u8 = null;
     var follow: bool = false;
     var remote_engine: ?sdk.RemoteEngine = null;
+    var silent = false;
+    var verbose = false;
 
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -63,8 +65,14 @@ pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8) !S
             i += 1;
         } else if (std.mem.eql(u8, a, "--follow")) {
             follow = true;
+        } else if (std.mem.eql(u8, a, "--silent")) {
+            silent = true;
+        } else if (std.mem.eql(u8, a, "--verbose")) {
+            verbose = true;
         }
     }
+
+    sdk.log.setLevel(sdk.log.levelFromFlags(silent, verbose));
 
     // Remote mode reads no local store, so engine_data_dir is unused. Default
     // it to data_dir to keep `Options.engine_data_dir` populated.
@@ -73,8 +81,8 @@ pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8) !S
     }
 
     if (engine_data_dir == null or data_dir == null) {
-        std.debug.print(
-            "usage: {s} --engine-data-dir <path> --data-dir <path> [--commit-interval N] [--node-rpc URL] [--remote-engine host:port] [--follow]\n",
+        sdk.log.err(
+            "usage: {s} --engine-data-dir <path> --data-dir <path> [--commit-interval N] [--node-rpc URL] [--remote-engine host:port] [--follow] [--silent] [--verbose]\n",
             .{prog_name},
         );
         if (engine_data_dir) |s| allocator.free(s);
@@ -104,7 +112,7 @@ pub fn printStats(prog_name: []const u8, stats: sdk.RunStats) void {
     // Batch count derived from executed pairs and the default Multicall3
     // chunk. Exact count would need the per-run override routed through stats.
     const batches = (stats.prefetch_calls_executed + sdk.DEFAULT_BATCH_SIZE - 1) / sdk.DEFAULT_BATCH_SIZE;
-    std.debug.print(
+    sdk.log.info(
         \\{s} indexer complete
         \\  blocks scanned:    {d}
         \\  blocks matched:    {d}

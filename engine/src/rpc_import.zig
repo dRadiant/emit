@@ -92,7 +92,7 @@ pub fn run(config: Config) !void {
         defer ts_writer.deinit();
         try importTimestamps(&ts_writer, config.rpc_url, end, page);
     } else if (!config.timestamps) {
-        std.debug.print("Timestamps skipped (--no-timestamps); blocks use the formula fallback.\n", .{});
+        core.log.info("Timestamps skipped (--no-timestamps); blocks use the formula fallback.\n", .{});
     }
 }
 
@@ -101,10 +101,10 @@ pub fn run(config: Config) !void {
 /// store stays consistent and a re-run resumes from the next block.
 fn importLogs(writer: *FlatStoreWriter, rpc_url: []const u8, start: u64, end: u64, page: std.mem.Allocator) !void {
     if (start > end) {
-        std.debug.print("Logs: flat store already covers through block {d}.\n", .{end});
+        core.log.info("Logs: flat store already covers through block {d}.\n", .{end});
         return;
     }
-    std.debug.print("Importing logs [{d}, {d}] via eth_getLogs ({s}).\n", .{ start, end, rpc_url });
+    core.log.info("Importing logs [{d}, {d}] via eth_getLogs ({s}).\n", .{ start, end, rpc_url });
 
     const scratch = Scratch{
         .raw_logs = try page.alloc(types.RawLog, types.MAX_LOGS_PER_BLOCK),
@@ -131,7 +131,7 @@ fn importLogs(writer: *FlatStoreWriter, rpc_url: []const u8, start: u64, end: u6
             retries = 0;
             batch = @min(batch * 2, MAX_BATCH);
             if (hi >= next_log) {
-                std.debug.print("  ... logs block {d}/{d} ({d} so far)\n", .{ hi, end, total_logs });
+                core.log.debug("  ... logs block {d}/{d} ({d} so far)\n", .{ hi, end, total_logs });
                 next_log = hi + LOG_EVERY;
             }
         } else |err| {
@@ -143,16 +143,16 @@ fn importLogs(writer: *FlatStoreWriter, rpc_url: []const u8, start: u64, end: u6
             }
             retries += 1;
             if (retries > MAX_RETRIES) {
-                std.debug.print("Logs block {d}: {s} after {d} retries — aborting.\n", .{ lo, @errorName(err), MAX_RETRIES });
+                core.log.err("Logs block {d}: {s} after {d} retries — aborting.\n", .{ lo, @errorName(err), MAX_RETRIES });
                 return err;
             }
-            std.debug.print("Logs block {d}: {s}, retry {d}/{d}\n", .{ lo, @errorName(err), retries, MAX_RETRIES });
+            core.log.debug("Logs block {d}: {s}, retry {d}/{d}\n", .{ lo, @errorName(err), retries, MAX_RETRIES });
             std.Thread.sleep(std.time.ns_per_s * retries);
         }
     }
 
     try writer.commitMeta();
-    std.debug.print("Logs done: [{d}, {d}] — {d} blocks, {d} logs.\n", .{ start, end, end - start + 1, total_logs });
+    core.log.info("Logs done: [{d}, {d}] — {d} blocks, {d} logs.\n", .{ start, end, end - start + 1, total_logs });
 }
 
 /// Fill `timestamps.bin` over [resume, end] via batched `eth_getBlockByNumber`.
@@ -163,10 +163,10 @@ fn importLogs(writer: *FlatStoreWriter, rpc_url: []const u8, start: u64, end: u6
 fn importTimestamps(ts_writer: *core.timestamps.TimestampWriter, rpc_url: []const u8, end: u64, page: std.mem.Allocator) !void {
     const start = ts_writer.first_block + ts_writer.count;
     if (start > end) {
-        std.debug.print("Timestamps: already cover through block {d}.\n", .{end});
+        core.log.info("Timestamps: already cover through block {d}.\n", .{end});
         return;
     }
-    std.debug.print("Fetching timestamps [{d}, {d}] via eth_getBlockByNumber.\n", .{ start, end });
+    core.log.info("Fetching timestamps [{d}, {d}] via eth_getBlockByNumber.\n", .{ start, end });
 
     var lo: u64 = start;
     var chunk: u64 = TS_CHUNK;
@@ -181,7 +181,7 @@ fn importTimestamps(ts_writer: *core.timestamps.TimestampWriter, rpc_url: []cons
             retries = 0;
             chunk = @min(chunk * 2, TS_CHUNK_MAX);
             if (hi >= next_log) {
-                std.debug.print("  ... timestamps block {d}/{d}\n", .{ hi, end });
+                core.log.debug("  ... timestamps block {d}/{d}\n", .{ hi, end });
                 next_log = hi + LOG_EVERY;
             }
         } else |err| {
@@ -191,16 +191,16 @@ fn importTimestamps(ts_writer: *core.timestamps.TimestampWriter, rpc_url: []cons
             }
             retries += 1;
             if (retries > MAX_RETRIES) {
-                std.debug.print("Timestamps block {d}: {s} after {d} retries — aborting. Re-run to resume.\n", .{ lo, @errorName(err), MAX_RETRIES });
+                core.log.err("Timestamps block {d}: {s} after {d} retries — aborting. Re-run to resume.\n", .{ lo, @errorName(err), MAX_RETRIES });
                 return err;
             }
-            std.debug.print("Timestamps block {d}: {s}, retry {d}/{d}\n", .{ lo, @errorName(err), retries, MAX_RETRIES });
+            core.log.debug("Timestamps block {d}: {s}, retry {d}/{d}\n", .{ lo, @errorName(err), retries, MAX_RETRIES });
             std.Thread.sleep(std.time.ns_per_s * retries);
         }
     }
 
     try ts_writer.sync();
-    std.debug.print("Timestamps done: [{d}, {d}].\n", .{ start, end });
+    core.log.info("Timestamps done: [{d}, {d}].\n", .{ start, end });
 }
 
 /// Fetch [lo, hi] in one `eth_getLogs` and write its blocks. Owns a per-batch
@@ -345,7 +345,7 @@ fn writeBatch(
         const block_logs = logs[block_start..cursor];
 
         if (block_logs.len > types.MAX_LOGS_PER_BLOCK) {
-            std.debug.print(
+            core.log.err(
                 "Block {d}: {d} logs exceeds MAX_LOGS_PER_BLOCK ({d}). Bump the constant in core/src/types.zig.\n",
                 .{ bn, block_logs.len, types.MAX_LOGS_PER_BLOCK },
             );
