@@ -51,6 +51,8 @@ pub fn main() !void {
 
 Four arguments: manifest (concrete types), handler (a struct exposing `handleTransfer`, `handleApproval`, etc.), entities tuple (each declares `pub const storage: sdk.StorageMode = .mutable | .immutable`), runtime options. Comptime validation rejects missing handler methods, malformed manifests, and entity types without a declared storage mode.
 
+To run an indexer off-host, set `.remote_engine = .{ .host = "127.0.0.1", .port = 9090 }` (in place of `.engine_data_dir`) and the SDK streams the filtered backfill and live blocks from an `emit-engine serve` over TCP instead of reading the local flat store. Functionality is identical to a locally running indexer.
+
 ## Public surface
 
 Re-exported from `root.zig`:

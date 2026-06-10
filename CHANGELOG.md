@@ -4,7 +4,18 @@ All notable changes to EMIT are documented here.
 
 EMIT follows semantic versioning. Major bumps (1.x → 2.x) signal breaking changes. Minor bumps (1.0 → 1.1) add features in a backward-compatible way, but may contain breaking changes. Patch bumps (1.0.0 → 1.0.1) are bug fixes only.
 
-## EMIT 1.1.0 (unreleased)
+## EMIT 1.1.0
+
+### Remote Engine TCP Streaming
+
+The flagship v1.1 capability: indexers no longer need to be collocated with the Engine. A new `emit-engine serve` listener streams server-side-filtered blocks to off-host indexers over TCP, and the SDK gains a remote data source — `sdk.run`/`init`/`spawn` accept a `remote_engine` option (the examples expose it as `--remote-engine host:port`). A streamed indexer is byte-for-byte identical to a collocated one: backfill, live follow, reorg recovery, and factory-child discovery all work over the wire.
+
+- `emit-engine serve --listen <host:port> [--max-connections <n>]` opens a TCP listener (default `127.0.0.1:9090`, 16 workers). It binds localhost by design — remote clients reach it through an SSH tunnel; `0.0.0.0` is opt-in. A bounded worker pool serves multiple indexers concurrently: each follow connection holds a worker until the client disconnects, so `--max-connections` caps concurrent indexers and further clients wait in the listen backlog. The Engine is stateless across connections — all subscription state rides in the client's REGISTER, so a dropped connection reconnects from the committed cursor and re-streams.
+- Server-side filtering shares the SDK builder's primitive. The same `core.filter.filterBlockEntry` the local filtered-index build uses produces the streamed entries, so a streamed `FilteredStore` is byte-for-byte identical to a locally-built one (the PUSH payload is the on-disk entry layout — the server streams disk bytes, the client writes disk bytes, no transformation). Backfill reads matching blocks through a new shared `core/parallel_filter.zig` pipeline (7-worker io_uring, ~112 concurrent NVMe reads), chunked so each chunk's survivors stream before the next reads, with `TCP_NODELAY` and one `writev` per frame. This replaced the first server's sequential `pread`, which measured ~2× the collocated build.
+- Live following over the stream. After backfill the connection stays open: the Engine watches `pending.bin` and pushes new blocks, finalization heartbeats, and reorg notices. The client dispatches into the same per-block overlay the local live loop uses and commits each block on its heartbeat-finalization. A reorg rolls back only the overlay at or above the fork point — finalized-but-uncommitted blocks below it survive — and re-applies the re-streamed canonical tail. A fork at or below the committed cursor (a finality violation) is fatal rather than silently mis-applied.
+- Factory children discovered live. When a streamed block spawns a new factory child, the client registers it mid-stream via `ADD_ADDRESS`; the Engine extends the connection's filter and mini-backfills `[creation_block, tip]` for that address, catching the child's same-block-as-creation events.
+- Wire protocol (`core/tcp_frame.zig`): `[type][length][payload]` framing with `REGISTER` (client → engine: filter, cursor, follow flag), `PUSH`, `HEARTBEAT`, `REORG`, `ADD_ADDRESS`, and `GOAWAY`. Versioned; a protocol-version mismatch closes with `GOAWAY`.
+- Measured on the reference Hetzner box (rETH): a remote backfill over an SSH tunnel runs ~2.3× faster than the first sequential-read server, and at full-chain scale (521k matching blocks, a 106 MB filtered index) the remote backfill tracks the collocated build's read+filter time — the transfer fully overlaps the server-side parallel filter, so the network adds negligible wall-time. The collocation requirement of v1.0 is removed; the filtered-index-over-rsync workaround is no longer needed.
 
 ### SDK
 

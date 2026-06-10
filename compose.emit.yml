@@ -1,20 +1,25 @@
-# EMIT engine — import + follow.
+# EMIT engine — import + follow + serve.
 #
 # Companion to `compose.node.yml`. Assumes Nethermind is already running
 # on the host at localhost:8545 and is fully synced (eth_syncing == false).
 # If it isn't synced, `import` won't have receipts to read and `follow`
 # will reject newHeads notifications.
 #
-# Two services with different lifecycles:
+# Three services with different lifecycles:
 #   emit-engine-import   one-shot. Reads Nethermind's RocksDB receipts
 #                        directly, materializes the flat log store, exits.
 #                        Gated by the `import` profile so `up` doesn't run it.
 #   emit-engine          long-running. Follows the chain head via JSON-RPC +
 #                        WebSocket, atomically updates the pending ring.
+#   emit-engine-serve    long-running. Streams server-side-filtered blocks to
+#                        off-host indexers over TCP (v1.1). Binds localhost —
+#                        reach it through an SSH tunnel. Gated by the `serve`
+#                        profile (opt-in).
 #
 # Operator flow (after compose.node.yml is up and synced):
 #   docker compose -f compose.emit.yml --profile import up emit-engine-import
 #   docker compose -f compose.emit.yml up -d emit-engine
+#   docker compose -f compose.emit.yml --profile serve up -d emit-engine-serve   # optional: remote indexers
 #
 # To re-import from scratch (e.g. after a corrupted flat store):
 #   docker compose -f compose.emit.yml down
@@ -59,4 +64,24 @@ services:
       follow
       --rpc http://127.0.0.1:8545
       --ws ws://127.0.0.1:8546
+      --data-dir /var/lib/emit-engine
+
+  # TCP server for off-host indexers (v1.1). Reads the same flat store the
+  # follower writes and streams server-side-filtered blocks to SDK indexers
+  # over TCP. Binds the host's localhost by design — remote clients reach it
+  # through an SSH tunnel (`ssh -N -L 9090:127.0.0.1:9090 <host>`). Opt-in via
+  # the `serve` profile; runs alongside `emit-engine`.
+  emit-engine-serve:
+    container_name: emit-engine-serve
+    image: emit-engine:latest
+    build: .
+    profiles: [serve]
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ${EMIT_DATA_DIR:-./data/emit-engine}:/var/lib/emit-engine
+    command: >
+      serve
+      --listen 127.0.0.1:9090
+      --max-connections 16
       --data-dir /var/lib/emit-engine
