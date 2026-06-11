@@ -30,6 +30,18 @@ pub const FollowConfig = struct {
 /// `rocksdb-import` is the right tool (~30 s at this scale).
 const GAP_REFUSE_THRESHOLD: u64 = 1000;
 
+/// WebSocket read timeout. newHeads arrive about every 12s, so 60s of silence
+/// (roughly five missed blocks) means the stream is dead. Bounds `sub.next()`
+/// so a half-open connection reconnects instead of hanging forever.
+const WS_READ_TIMEOUT_S: u32 = 60;
+
+/// Best-effort SO_RCVTIMEO so a blocking read returns instead of hanging on a
+/// silent socket. A failure leaves the prior blocking behavior.
+fn setReadTimeout(handle: std.posix.socket_t, seconds: u32) void {
+    const tv = std.posix.timeval{ .sec = @intCast(seconds), .usec = 0 };
+    std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+}
+
 pub fn run(config: FollowConfig) !void {
     const alloc = std.heap.page_allocator;
 
@@ -82,20 +94,29 @@ pub fn run(config: FollowConfig) !void {
         }
     }
 
-    if (config.ws_url) |ws_url| ws: {
-        core.log.info("Connecting to {s}...\n", .{ws_url});
-        var ws = eth.ws_transport.WsTransport.connect(alloc, ws_url) catch |err| {
-            core.log.info("WS failed ({s}), falling back to HTTP\n", .{@errorName(err)});
-            break :ws;
-        };
-        defer ws.close();
-        followWs(&ws, &provider, &writer, &ring, alloc, if (ts_writer) |*w| w else null) catch |err| {
-            core.log.info("WS error ({s}), falling back to HTTP\n", .{@errorName(err)});
-        };
-    }
+    if (config.ws_url == null)
+        core.log.info("Polling {s} every {d}ms\n", .{ config.rpc_url, config.poll_interval_ms });
 
-    core.log.info("Polling {s} every {d}ms\n", .{ config.rpc_url, config.poll_interval_ms });
+    // Prefer WebSocket. On connect failure or a dropped stream, fall back to one
+    // poll cycle and reconnect, rather than degrading to HTTP polling forever.
     while (true) {
+        if (config.ws_url) |ws_url| ws: {
+            core.log.info("Connecting to {s}...\n", .{ws_url});
+            var ws = eth.ws_transport.WsTransport.connect(alloc, ws_url) catch |err| {
+                core.log.info("WS connect failed ({s}), polling then reconnecting\n", .{@errorName(err)});
+                break :ws;
+            };
+            defer ws.close();
+            // Bound sub.next() so a half-open stream (TCP up, no frames) surfaces
+            // a read error and reconnects, instead of blocking forever.
+            setReadTimeout(ws.stream.handle, WS_READ_TIMEOUT_S);
+            followWs(&ws, &provider, &writer, &ring, alloc, if (ts_writer) |*w| w else null) catch |err| {
+                core.log.info("WS error ({s}), polling then reconnecting\n", .{@errorName(err)});
+            };
+        }
+
+        // One poll cycle. The only mode when --ws is absent, a stopgap between
+        // WS reconnects otherwise. A healthy WS never returns, so this is skipped.
         followPoll(&provider, &writer, &ring, alloc, if (ts_writer) |*w| w else null) catch |err| {
             core.log.debug("Poll error: {s}\n", .{@errorName(err)});
         };
