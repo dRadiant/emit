@@ -47,7 +47,10 @@ pub fn readPending(allocator: std.mem.Allocator, engine_data_dir: []const u8) !P
     errdefer allocator.free(buf);
     _ = try file.readAll(buf);
 
-    const entries = pending_format.parse(allocator, buf) catch |err| switch (err) {
+    // Validated parse: `classifyChanges` indexes the ring as a sorted dense
+    // array, so a non-dense or oversized ring would silently misclassify
+    // finalized vs reorged blocks. Structural corruption fails loud.
+    const entries = pending_format.parseValidated(allocator, buf) catch |err| switch (err) {
         // An old (pre-magic) or unrecognized pending.bin reads as empty. The
         // engine rewrites it in the current format on its next ingest. Genuine
         // truncation of a current-format file still surfaces.

@@ -85,6 +85,10 @@ pub fn parse(allocator: std.mem.Allocator, buf: []const u8) ParseError![]Entry {
     if (!std.mem.eql(u8, buf[0..MAGIC.len], &MAGIC)) return error.InvalidMagic;
     const entry_count: usize = std.mem.readInt(u32, buf[MAGIC.len..][0..4], .little);
     if (entry_count == 0) return try allocator.alloc(Entry, 0);
+    // Bound the allocation by what the buffer could possibly hold (fixed
+    // portions alone). A corrupt count fails as Truncated, not as a
+    // multi-terabyte allocation attempt.
+    if (entry_count > (buf.len - HEADER_SIZE) / FIXED_ENTRY_SIZE) return error.Truncated;
 
     const entries = try allocator.alloc(Entry, entry_count);
     errdefer allocator.free(entries);
