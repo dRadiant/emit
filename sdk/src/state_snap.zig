@@ -43,8 +43,12 @@ pub fn StateSnap(comptime mutables: usize, comptime immutables: usize) type {
         cursor: u64,
         mutable_bytes: [mutables]u64,
         immutable_counts: [immutables]u64,
-        /// Concatenated MutableStore slabs in slot order. Owned by `allocator`.
+        /// Concatenated MutableStore slabs in slot order. A view into `backing`.
         body: []u8,
+        /// Allocation `body` points into, owned by `allocator`. `open` reads
+        /// the body alone, `commit` retains the full header + body file image,
+        /// so the two differ only in a header-sized prefix.
+        backing: []u8,
 
         /// Open `state.snap` from `dir`. Missing file returns an empty
         /// StateSnap with cursor=0. Unlinks any `state.snap.tmp` left by a
@@ -63,6 +67,7 @@ pub fn StateSnap(comptime mutables: usize, comptime immutables: usize) type {
                     .mutable_bytes = [_]u64{0} ** mutables,
                     .immutable_counts = [_]u64{0} ** immutables,
                     .body = &.{},
+                    .backing = &.{},
                 },
                 else => return err,
             };
@@ -86,6 +91,7 @@ pub fn StateSnap(comptime mutables: usize, comptime immutables: usize) type {
                 .mutable_bytes = undefined,
                 .immutable_counts = undefined,
                 .body = &.{},
+                .backing = &.{},
             };
 
             var pos: usize = 20;
@@ -106,13 +112,14 @@ pub fn StateSnap(comptime mutables: usize, comptime immutables: usize) type {
                 self.body = try allocator.alloc(u8, @intCast(total));
                 errdefer allocator.free(self.body);
                 if ((try file.readAll(self.body)) != total) return error.Truncated;
+                self.backing = self.body;
             }
 
             return self;
         }
 
         pub fn deinit(self: *Self) void {
-            if (self.body.len > 0) self.allocator.free(self.body);
+            if (self.backing.len > 0) self.allocator.free(self.backing);
         }
 
         /// Borrow the slab bytes for MutableStore slot `i`. Returned slice
@@ -143,8 +150,12 @@ pub fn StateSnap(comptime mutables: usize, comptime immutables: usize) type {
             var total: usize = 0;
             for (new_slabs) |slab| total += slab.len;
 
+            // One buffer is both the file image and the next in-memory
+            // backing, so the slabs are copied once, not assembled and then
+            // duplicated. Nothing allocates after the rename, disk and memory
+            // cannot desync.
             const buf = try self.allocator.alloc(u8, HEADER_SIZE + total);
-            defer self.allocator.free(buf);
+            errdefer self.allocator.free(buf);
 
             core.flat_format.writeMagic(buf, MAGIC);
             std.mem.writeInt(u32, buf[8..12], VERSION, .little);
@@ -164,15 +175,11 @@ pub fn StateSnap(comptime mutables: usize, comptime immutables: usize) type {
                 pos += slab.len;
             }
 
-            // Allocate the new body before the rename so a post-rename OOM
-            // can't desync disk from in-memory state.
-            const new_body = try self.allocator.dupe(u8, buf[HEADER_SIZE..]);
-            errdefer self.allocator.free(new_body);
-
             try core.atomic_file.write(self.dir, "state.snap.tmp", "state.snap", buf);
 
-            if (self.body.len > 0) self.allocator.free(self.body);
-            self.body = new_body;
+            if (self.backing.len > 0) self.allocator.free(self.backing);
+            self.backing = buf;
+            self.body = buf[HEADER_SIZE..];
             self.cursor = new_cursor;
             for (&self.mutable_bytes, new_slabs) |*b, slab| b.* = slab.len;
             for (&self.immutable_counts, new_counts) |*c, n| c.* = n;
