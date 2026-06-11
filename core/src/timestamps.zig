@@ -1,15 +1,15 @@
-/// Per-block Unix timestamps. Dense `u32 LE` array indexed by
-/// `block - first_block`, in `timestamps.bin`.
-///
-/// `u32` epoch-seconds exact until 2106, halves the file versus `u64`
-/// (~39 MB at the tip). Zero entry means unknown (gap not yet backfilled).
-/// Callers fall back to the formula. Partial or absent file is always safe.
-///
-/// Layout:
-///   0   8         magic "EMITTIME"
-///   8   8         first_block (u64 LE)
-///   16  8         count (u64 LE)
-///   24  count*4   timestamps (u32 LE)
+//! Per-block Unix timestamps. Dense `u32 LE` array indexed by
+//! `block - first_block`, in `timestamps.bin`.
+//!
+//! `u32` epoch-seconds exact until 2106, halves the file versus `u64`
+//! (~39 MB at the tip). Zero entry means unknown (gap not yet backfilled).
+//! Callers fall back to the formula. Partial or absent file is always safe.
+//!
+//! Layout:
+//!   0   8         magic "EMITTIME"
+//!   8   8         first_block (u64 LE)
+//!   16  8         count (u64 LE)
+//!   24  count*4   timestamps (u32 LE)
 const std = @import("std");
 
 const flat_format = @import("flat_format.zig");

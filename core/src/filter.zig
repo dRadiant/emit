@@ -1,16 +1,16 @@
-/// Per-block log filtering after bloom scan rejects non-matching blocks.
-/// Keeps the logs in one block's decompressed packed logs that match a
-/// `Filter`, re-emits them as a fresh LZ4 entry in the same packed wire format.
-///
-/// Shared by two callers that must produce byte-identical output:
-///   sdk `filter_builder` worker (backfill filtered-index build)
-///   engine `tcp_server` (streams filtered blocks to remote indexers)
-/// Engine cannot import sdk, so the shared primitive lives in core.
-///
-/// `decompressed` comes from the importer-produced flat store (LZ4-validated
-/// upstream), so the in-place walk trusts the packed layout.
-///
-/// Safe builds bounds-check the slice accesses. ReleaseFast does not.
+//! Per-block log filtering after bloom scan rejects non-matching blocks.
+//! Keeps the logs in one block's decompressed packed logs that match a
+//! `Filter`, re-emits them as a fresh LZ4 entry in the same packed wire format.
+//!
+//! Shared by two callers that must produce byte-identical output:
+//!   sdk `filter_builder` worker (backfill filtered-index build)
+//!   engine `tcp_server` (streams filtered blocks to remote indexers)
+//! Engine cannot import sdk, so the shared primitive lives in core.
+//!
+//! `decompressed` comes from the importer-produced flat store (LZ4-validated
+//! upstream), so the in-place walk trusts the packed layout.
+//!
+//! Safe builds bounds-check the slice accesses. ReleaseFast does not.
 const std = @import("std");
 const builtin = @import("builtin");
 

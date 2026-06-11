@@ -1,7 +1,7 @@
-/// Read-only access to the flat log store (blocks.dat + blocks.idx + blooms.bin).
-/// Thread-safe. Multiple readers operate concurrently via pread + mmap.
-/// Writer lives in engine. Read-only infrastructure shared by engine
-/// (status/validation) and sdk (filtered index builds).
+//! Read-only access to the flat log store (blocks.dat + blocks.idx + blooms.bin).
+//! Thread-safe. Multiple readers operate concurrently via pread + mmap.
+//! Writer lives in engine. Read-only infrastructure shared by engine
+//! (status/validation) and sdk (filtered index builds).
 const std = @import("std");
 
 const bloom = @import("bloom.zig");

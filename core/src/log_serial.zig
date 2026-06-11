@@ -1,7 +1,7 @@
-/// Packed binary log serialization and LZ4 entry helpers.
-/// Format: log_count(u32 LE) || [log_count × LogEntry]
-/// LogEntry: tx_index(u16) || log_index(u16) || address(20) || topic_count(u8)
-///           || topics(count×32) || data_len(u32) || data(var) || tx_hash(32)
+//! Packed binary log serialization and LZ4 entry helpers.
+//! Format: log_count(u32 LE) || [log_count × LogEntry]
+//! LogEntry: tx_index(u16) || log_index(u16) || address(20) || topic_count(u8)
+//!           || topics(count×32) || data_len(u32) || data(var) || tx_hash(32)
 const std = @import("std");
 
 const lz4 = @import("lz4");

@@ -1,23 +1,23 @@
-/// Wire format for `pending.bin`, the engine's pre-finality block buffer.
-///
-/// Engine owns the write path (insert, persist, truncate). SDK owns the read
-/// path. Single source of truth on the byte layout so the two never drift.
-///
-/// Layout:
-///   magic "EMITPEND" (8 bytes)
-///   count(u32 LE)
-///   [count × Entry]:
-///     block_number(u64 BE)
-///     timestamp(u32 LE)      exact block time, 0 when unknown
-///     hash(32)
-///     topic_bloom(BLOOM_SIZE = 256)
-///     addr_bloom(ADDR_BLOOM_SIZE = 1024)
-///     lz4_len(u32 LE)
-///     lz4_data(lz4_len)
-///
-/// Magic distinguishes a pre-magic/foreign file from a corrupt one. Mismatch
-/// surfaces `error.InvalidMagic`, treated as "no usable ring" (follower
-/// re-baselines from meta). Matching magic with a short body is `error.Truncated`.
+//! Wire format for `pending.bin`, the engine's pre-finality block buffer.
+//!
+//! Engine owns the write path (insert, persist, truncate). SDK owns the read
+//! path. Single source of truth on the byte layout so the two never drift.
+//!
+//! Layout:
+//!   magic "EMITPEND" (8 bytes)
+//!   count(u32 LE)
+//!   [count × Entry]:
+//!     block_number(u64 BE)
+//!     timestamp(u32 LE)      exact block time, 0 when unknown
+//!     hash(32)
+//!     topic_bloom(BLOOM_SIZE = 256)
+//!     addr_bloom(ADDR_BLOOM_SIZE = 1024)
+//!     lz4_len(u32 LE)
+//!     lz4_data(lz4_len)
+//!
+//! Magic distinguishes a pre-magic/foreign file from a corrupt one. Mismatch
+//! surfaces `error.InvalidMagic`, treated as "no usable ring" (follower
+//! re-baselines from meta). Matching magic with a short body is `error.Truncated`.
 const std = @import("std");
 
 const bloom = @import("bloom.zig");

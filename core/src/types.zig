@@ -1,5 +1,5 @@
-/// Shared types and constants for the flat log store format.
-/// Used by engine (writing) and sdk (reading + filtering).
+//! Shared types and constants for the flat log store format.
+//! Used by engine (writing) and sdk (reading + filtering).
 const std = @import("std");
 
 // ── Tuning constants ─────────────────────────────────────────────────────

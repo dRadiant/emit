@@ -1,14 +1,14 @@
-/// Parallel block read + precision filter, shared by the sdk filtered-index
-/// builder and the engine's TCP backfill server. Bloom-scans a range, then
-/// reads and filters matching blocks across a thread pool, each thread driving
-/// its own io_uring ring. Survivors are emitted to a caller-supplied sink in
-/// ascending block order.
-///
-/// Work is processed in chunks: each chunk's blocks are filtered in parallel,
-/// emitted, then freed before the next chunk. This bounds memory to one chunk's
-/// filtered output and lets the sink stream (a socket flushes per chunk instead
-/// of after the whole range). Linux uses io_uring; other platforms fall back to
-/// sequential pread per worker.
+//! Parallel block read + precision filter, shared by the sdk filtered-index
+//! builder and the engine's TCP backfill server. Bloom-scans a range, then
+//! reads and filters matching blocks across a thread pool, each thread driving
+//! its own io_uring ring. Survivors are emitted to a caller-supplied sink in
+//! ascending block order.
+//!
+//! Work is processed in chunks: each chunk's blocks are filtered in parallel,
+//! emitted, then freed before the next chunk. This bounds memory to one chunk's
+//! filtered output and lets the sink stream (a socket flushes per chunk instead
+//! of after the whole range). Linux uses io_uring; other platforms fall back to
+//! sequential pread per worker.
 const std = @import("std");
 
 const types = @import("types.zig");

@@ -1,9 +1,9 @@
-/// Parallel bloom scan over the flat store's blooms.bin.
-///
-/// A block matches when every non-empty bloom set hits: any `target_addresses`
-/// against the addr bloom AND any `target_topics` against the topic bloom.
-/// At least one set must be non-empty (asserted). Block-level prefilter only.
-/// Per-log filtering after decompression applies the precise predicate.
+//! Parallel bloom scan over the flat store's blooms.bin.
+//!
+//! A block matches when every non-empty bloom set hits: any `target_addresses`
+//! against the addr bloom AND any `target_topics` against the topic bloom.
+//! At least one set must be non-empty (asserted). Block-level prefilter only.
+//! Per-log filtering after decompression applies the precise predicate.
 const std = @import("std");
 
 const bloom = @import("bloom.zig");

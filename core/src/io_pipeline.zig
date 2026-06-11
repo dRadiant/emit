@@ -1,6 +1,6 @@
-/// io_uring-based read pipeline for batch block reads from blocks.dat.
-/// Comptime-generic on queue depth so each worker thread gets its own ring.
-/// Linux-only. Non-Linux platforms use the pread fallback in filter workers.
+//! io_uring-based read pipeline for batch block reads from blocks.dat.
+//! Comptime-generic on queue depth so each worker thread gets its own ring.
+//! Linux-only. Non-Linux platforms use the pread fallback in filter workers.
 const std = @import("std");
 
 const builtin = @import("builtin");

@@ -1,16 +1,16 @@
-/// Thread pool: split a range across N workers, run each, join all.
-///
-/// Buffer-allocation rule. Buffers sized off `core.types.BLOCK_BUF_SIZE`
-/// (4 MB) or `core.types.MAX_LOGS_PER_BLOCK` (~2 MB) overflow Linux's default
-/// 8 MB `RLIMIT_STACK` when a function holds two or three. Main-thread-reachable
-/// functions (`scanner.replay`, `scanner.scanCreations`, anything `sdk.run`
-/// calls directly) heap-allocate such buffers. Worker-only functions
-/// (`filter_builder.filterWorker`, `engine/rocksdb_import.workerFn`) may
-/// stack-allocate. Workers always receive `WORKER_STACK_SIZE`, and stack
-/// avoids the per-run page-fault cost of fresh mmap.
-///
-/// `parallel.run` always spawns, including for `num_workers == 1`. No
-/// inline-on-caller path. A worker fn cannot land on the caller's stack.
+//! Thread pool: split a range across N workers, run each, join all.
+//!
+//! Buffer-allocation rule. Buffers sized off `core.types.BLOCK_BUF_SIZE`
+//! (4 MB) or `core.types.MAX_LOGS_PER_BLOCK` (~2 MB) overflow Linux's default
+//! 8 MB `RLIMIT_STACK` when a function holds two or three. Main-thread-reachable
+//! functions (`scanner.replay`, `scanner.scanCreations`, anything `sdk.run`
+//! calls directly) heap-allocate such buffers. Worker-only functions
+//! (`filter_builder.filterWorker`, `engine/rocksdb_import.workerFn`) may
+//! stack-allocate. Workers always receive `WORKER_STACK_SIZE`, and stack
+//! avoids the per-run page-fault cost of fresh mmap.
+//!
+//! `parallel.run` always spawns, including for `num_workers == 1`. No
+//! inline-on-caller path. A worker fn cannot land on the caller's stack.
 const std = @import("std");
 
 pub const MAX_WORKERS = 7;

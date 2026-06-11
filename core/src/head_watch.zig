@@ -1,7 +1,7 @@
-/// Watching the engine's head. Read the pending ring, diff successive snapshots
-/// into new/finalized/reorged buckets, and wake on ring updates via inotify.
-/// Shared by the sdk live loop and the engine's remote streaming server, which
-/// both tail `pending.bin` the same way.
+//! Watching the engine's head. Read the pending ring, diff successive snapshots
+//! into new/finalized/reorged buckets, and wake on ring updates via inotify.
+//! Shared by the sdk live loop and the engine's remote streaming server, which
+//! both tail `pending.bin` the same way.
 const std = @import("std");
 const builtin = @import("builtin");
 

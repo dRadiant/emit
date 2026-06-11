@@ -1,6 +1,6 @@
-/// Comptime-generic bloom filter. Topic blooms use 256 bytes (2048 bits).
-/// Address blooms use 1024 bytes (8192 bits) for lower FP on blocks with
-/// hundreds of unique addresses (~3.4% FP at 500 addresses vs 25% at 256 bytes).
+//! Comptime-generic bloom filter. Topic blooms use 256 bytes (2048 bits).
+//! Address blooms use 1024 bytes (8192 bits) for lower FP on blocks with
+//! hundreds of unique addresses (~3.4% FP at 500 addresses vs 25% at 256 bytes).
 const std = @import("std");
 
 /// k=7 hash functions from non-overlapping 2-byte windows of the 32-byte key.
