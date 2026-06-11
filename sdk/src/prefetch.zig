@@ -96,8 +96,12 @@ pub fn gatherDynamic(
             defer store.deinit();
             var i: u64 = 0;
             while (i < store.count()) : (i += 1) {
-                const payload = store.readPayload(i, payload_buf) catch continue;
-                const decoded = log_serial.decompressEntry(payload, decompress_buf) catch continue;
+                // A corrupt entry would silently drop prefetch targets, surfacing
+                // later as scattered `error.NotPrefetched`. The filtered store is
+                // SDK-written and atomic-committed, so a read or decompress
+                // failure is real corruption. Fail loud at the source.
+                const payload = try store.readPayload(i, payload_buf);
+                const decoded = try log_serial.decompressEntry(payload, decompress_buf);
                 const log_count = log_serial.deserializeLogs(decoded, log_buf);
                 try matchAndAppend(arena, &out, log_buf[0..log_count], m);
             }

@@ -45,6 +45,10 @@ pub const FilteredStore = struct {
     dat_size: u64,
     /// Number of (block, offset, length) entries in the idx file.
     entry_count: u64,
+    /// Block number of the last appended entry. Caches the monotonicity bound
+    /// so `appendEntry` checks in memory instead of re-reading the idx tail.
+    /// Meaningful only when `entry_count > 0`.
+    last_block: u64,
 
     /// Open or create the `<base>.dat`/`<base>.idx` pair under `dir`.
     /// A trailing partial idx entry is truncated. A last idx entry whose
@@ -75,6 +79,7 @@ pub const FilteredStore = struct {
         // header (dat magic occupies it, appends start after) when empty. Read
         // the last entry once. Re-read only when a drop changes which is last.
         var append_pos: u64 = HEADER_SIZE;
+        var last_block: u64 = 0;
         if (entry_count > 0) {
             var last = try readEntryAt(idx_file, entry_count - 1);
             if (last.offset + last.length > dat_file_size) {
@@ -84,7 +89,10 @@ pub const FilteredStore = struct {
                 try idx_file.setEndPos(HEADER_SIZE + entry_count * ENTRY_SIZE);
                 if (entry_count > 0) last = try readEntryAt(idx_file, entry_count - 1);
             }
-            if (entry_count > 0) append_pos = last.offset + last.length;
+            if (entry_count > 0) {
+                append_pos = last.offset + last.length;
+                last_block = last.block_number;
+            }
         }
 
         return .{
@@ -93,6 +101,7 @@ pub const FilteredStore = struct {
             .idx_file = idx_file,
             .dat_size = append_pos,
             .entry_count = entry_count,
+            .last_block = last_block,
         };
     }
 
@@ -111,10 +120,7 @@ pub const FilteredStore = struct {
         timestamp: u32,
         lz4_entry: []const u8,
     ) !void {
-        if (self.entry_count > 0) {
-            const last = try readEntryAt(self.idx_file, self.entry_count - 1);
-            if (block_number <= last.block_number) return error.OutOfOrder;
-        }
+        if (self.entry_count > 0 and block_number <= self.last_block) return error.OutOfOrder;
 
         try self.dat_file.pwriteAll(lz4_entry, self.dat_size);
 
@@ -128,6 +134,7 @@ pub const FilteredStore = struct {
 
         self.dat_size += lz4_entry.len;
         self.entry_count += 1;
+        self.last_block = block_number;
     }
 
     pub fn syncAll(self: *Self) !void {
