@@ -280,16 +280,21 @@ pub fn promoteFinalized(ctx: anytype, finalized: []const u64) !void {
     const T = std.meta.Child(@TypeOf(ctx));
     if (comptime !@hasField(T, "stores")) return;
     const Stores = @FieldType(T, "stores");
+    // Drain every finalized block's overlay into the dirty cache first, then
+    // flush the batch with one `commitCycle`. Blocks arrive ascending and
+    // `commitBlock` is newest-wins, so the accumulated cache equals the newest
+    // finalized state. One state.snap rewrite + rename for the batch, not one
+    // per block.
     for (finalized) |block| {
         inline for (std.meta.fields(Stores)) |f| {
             try @field(ctx.stores, f.name).commitBlock(block);
         }
-        if (comptime @hasField(T, "_last_dispatched_block")) {
-            ctx._last_dispatched_block = block;
-        }
-        if (comptime @hasDecl(T, "commitCycle")) {
-            try ctx.commitCycle();
-        }
+    }
+    if (comptime @hasField(T, "_last_dispatched_block")) {
+        ctx._last_dispatched_block = finalized[finalized.len - 1];
+    }
+    if (comptime @hasDecl(T, "commitCycle")) {
+        try ctx.commitCycle();
     }
 }
 

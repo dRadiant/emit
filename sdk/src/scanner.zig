@@ -142,8 +142,10 @@ pub fn replay(
     defer allocator.free(decompress_primary);
     const log_buf_primary = try allocator.alloc(RawLog, types.MAX_LOGS_PER_BLOCK);
     defer allocator.free(log_buf_primary);
-    const merge_buf = try allocator.alloc(RawLog, 2 * types.MAX_LOGS_PER_BLOCK);
-    defer allocator.free(merge_buf);
+    // Only the factory path k-way-merges primary + children. A factory-free
+    // manifest dispatches the primary's logs in place, no merge buffer.
+    const merge_buf = if (has_children) try allocator.alloc(RawLog, 2 * types.MAX_LOGS_PER_BLOCK) else &[_]RawLog{};
+    defer if (has_children) allocator.free(merge_buf);
     const decompress_children = if (has_children) try allocator.alloc(u8, types.BLOCK_BUF_SIZE) else &[_]u8{};
     defer if (has_children) allocator.free(decompress_children);
     const log_buf_children = if (has_children) try allocator.alloc(RawLog, types.MAX_LOGS_PER_BLOCK) else &[_]RawLog{};
@@ -163,28 +165,40 @@ pub fn replay(
         const block_number = pickMin(next_p, next_c);
         var block_ts: u32 = 0;
 
-        var merge_count: usize = 0;
-        if (primary) |p| if (next_p) |bn| if (bn == block_number) {
-            block_ts = p.peekedTimestamp();
-            const logs = try p.consume(block_number, decompress_primary, log_buf_primary);
-            for (logs) |log| {
-                merge_buf[merge_count] = log;
-                merge_count += 1;
-            }
-        };
-        if (children) |c| {
-            if (next_c) |bn| if (bn == block_number) {
-                if (block_ts == 0) block_ts = c.peekedTimestamp();
-                const logs = try c.consume(block_number, decompress_children, log_buf_children);
-                for (logs) |log| {
+        var logs: []const RawLog = &.{};
+        if (comptime has_children) {
+            // k-way merge of primary + children, re-sorted into canonical order.
+            var merge_count: usize = 0;
+            if (primary) |p| if (next_p) |bn| if (bn == block_number) {
+                block_ts = p.peekedTimestamp();
+                for (try p.consume(block_number, decompress_primary, log_buf_primary)) |log| {
                     merge_buf[merge_count] = log;
                     merge_count += 1;
                 }
             };
+            if (children) |c| if (next_c) |bn| if (bn == block_number) {
+                if (block_ts == 0) block_ts = c.peekedTimestamp();
+                for (try c.consume(block_number, decompress_children, log_buf_children)) |log| {
+                    merge_buf[merge_count] = log;
+                    merge_count += 1;
+                }
+            };
+            if (merge_count == 0) continue;
+            std.mem.sort(RawLog, merge_buf[0..merge_count], {}, lessByTxLog);
+            logs = merge_buf[0..merge_count];
+        } else {
+            // Single source. Dispatch the primary's logs in place, no merge
+            // buffer. The store is canonical within a block in practice, so the
+            // sort only fires for an out-of-order entry. The hot path stays
+            // O(n) on the canonical-order check.
+            const p = primary.?;
+            block_ts = p.peekedTimestamp();
+            const consumed = try p.consume(block_number, decompress_primary, log_buf_primary);
+            if (consumed.len == 0) continue;
+            if (!std.sort.isSorted(RawLog, consumed, {}, lessByTxLog))
+                std.mem.sort(RawLog, consumed, {}, lessByTxLog);
+            logs = consumed;
         }
-
-        if (merge_count == 0) continue;
-        std.mem.sort(RawLog, merge_buf[0..merge_count], {}, lessByTxLog);
 
         // Prefer the exact time carried in the FilteredStore entry. The remote
         // stream fills it from the PUSH frame. 0 means a local build, fall
@@ -195,7 +209,7 @@ pub fn replay(
         if (show_progress and (result.blocks_dispatched & 0x3FFF) == 0)
             core.log.debug("\r  replaying {d}/{d} blocks", .{ result.blocks_dispatched, total_blocks });
 
-        for (merge_buf[0..merge_count]) |log| {
+        for (logs) |log| {
             try handler_mod.dispatchLog(m, Handler, ctx, log);
             result.logs_dispatched += 1;
             events_since_commit += 1;
