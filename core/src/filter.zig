@@ -77,9 +77,14 @@ pub fn filterBlockEntry(
         pos = log_end;
 
         if (topic_count == 0) continue;
-        if (!containsAddress(filter.match_addrs, address)) continue;
-        const topic0: *const [32]u8 = @ptrCast(decompressed[log_start + 25 ..][0..32]);
-        if (!containsTopic(filter.match_topics, topic0)) continue;
+        // An empty positive set is a wildcard on that axis, mirroring the bloom
+        // scan, so a one-sided filter (addresses ^ topics) matches on the
+        // populated axis only. Both-empty is rejected upstream (tcp_server).
+        if (filter.match_addrs.len > 0 and !containsAddress(filter.match_addrs, address)) continue;
+        if (filter.match_topics.len > 0) {
+            const topic0: *const [32]u8 = @ptrCast(decompressed[log_start + 25 ..][0..32]);
+            if (!containsTopic(filter.match_topics, topic0)) continue;
+        }
         if (containsAddress(filter.exclude_addrs, address)) continue;
 
         const len = log_end - log_start;
@@ -223,4 +228,35 @@ test "filterBlockEntry skips logs with zero topics" {
         .exclude_addrs = &.{},
     };
     try testing.expectEqual(@as(?Filtered, null), try filterBlockEntry(packed_logs, filter, &serialize_buf, &compress_buf));
+}
+
+test "filterBlockEntry treats an empty positive set as a wildcard on that axis" {
+    var pack_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
+    var serialize_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
+    var compress_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
+    var decompress_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
+    var log_buf: [8]RawLog = undefined;
+
+    const logs = [_]RawLog{
+        rawLog(ADDR_A, TOPIC_X, 1, 0),
+        rawLog(ADDR_B, TOPIC_X, 1, 1),
+        rawLog(ADDR_C, TOPIC_Y, 1, 2),
+    };
+    const packed_logs = packLogs(&logs, &pack_buf);
+
+    // Topics-only: any address with topic X. Keeps the two TOPIC_X logs.
+    const topics_only: Filter = .{ .match_addrs = &.{}, .match_topics = &.{TOPIC_X}, .exclude_addrs = &.{} };
+    const f1 = (try filterBlockEntry(packed_logs, topics_only, &serialize_buf, &compress_buf)).?;
+    try testing.expectEqual(@as(u32, 2), f1.log_count);
+    const k1 = try unpack(f1.entry, &decompress_buf, &log_buf);
+    try testing.expectEqualSlices(u8, &ADDR_A, &k1[0].address);
+    try testing.expectEqualSlices(u8, &ADDR_B, &k1[1].address);
+
+    // Address-only: address A with any topic. Keeps the single ADDR_A log.
+    const addr_only: Filter = .{ .match_addrs = &.{ADDR_A}, .match_topics = &.{}, .exclude_addrs = &.{} };
+    const f2 = (try filterBlockEntry(packed_logs, addr_only, &serialize_buf, &compress_buf)).?;
+    try testing.expectEqual(@as(u32, 1), f2.log_count);
+    const k2 = try unpack(f2.entry, &decompress_buf, &log_buf);
+    try testing.expectEqualSlices(u8, &ADDR_A, &k2[0].address);
+    try testing.expectEqualSlices(u8, &TOPIC_X, &k2[0].topics[0]);
 }
