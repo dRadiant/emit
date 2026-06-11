@@ -132,6 +132,9 @@ pub fn serveConnection(
 ) !void {
     setNoDelay(stream);
     clearRecvTimeout(stream);
+    // Heartbeats detect closed peers, not wedged ones. A zero-window client
+    // would otherwise block a worker in writevAll forever.
+    setSendTimeout(stream, 2 * cfg.heartbeat_ms);
 
     const reg_payload = try readFrame(stream, .register, allocator);
     defer allocator.free(reg_payload);
@@ -165,7 +168,7 @@ fn streamBackfill(
 ) !void {
     if (reader.index_count == 0) return;
     const tip = tipOf(reader);
-    const start = reg.cursor + 1; // cursor = last block the client already has
+    const start = reg.cursor +| 1; // cursor = last block the client already has
     if (start > tip) return; // already caught up
 
     const filter: core.filter.Filter = .{
@@ -270,8 +273,32 @@ fn streamLive(
         // floor both roll the client back and re-stream. The lower fork wins.
         if (minOpt(reorgFork(classification), add_floor)) |fork| {
             try sendReorg(stream, fork);
+            // An ADD_ADDRESS floor can sit below the ring window (child created
+            // more than FINALITY_DEPTH blocks ago). REORG dropped the client's
+            // store from `fork`, so the span the ring no longer holds must
+            // re-stream from the flat store under the full filter. A fresh
+            // reader sees blocks finalized since connect. Reorg forks sit above
+            // the finalized tip, so this fires only for ADD_ADDRESS.
+            var flat_covered: u64 = 0;
+            if (fork <= last_finalized) {
+                var fresh = try FlatStoreReader.open(cfg.data_dir);
+                defer fresh.deinit();
+                const fresh_tip = tipOf(&fresh);
+                if (fork <= fresh_tip) {
+                    var dir = try std.fs.cwd().openDir(cfg.data_dir, .{});
+                    defer dir.close();
+                    var ts = try TimestampReader.open(dir);
+                    defer if (ts) |*t| t.deinit();
+                    var sink = PushSink{ .stream = stream, .ts = if (ts) |*t| t else null };
+                    const r = try core.parallel_filter.run(&fresh, match_addrs.items, filter, fork, fresh_tip, PushSink, &sink, allocator);
+                    if (r.dropped_blocks > 0) return error.BloomScanDropped;
+                    flat_covered = fresh_tip;
+                }
+            }
             for (curr.entries) |e| {
-                if (e.block_number < fork) continue;
+                // Skip blocks below the fork (client kept them) and blocks the
+                // flat re-stream already pushed (client store key is monotonic).
+                if (e.block_number < fork or e.block_number <= flat_covered) continue;
                 try filterAndPush(stream, e, filter, decompress_buf, serialize_buf, compress_buf);
             }
         } else {
@@ -385,6 +412,13 @@ fn writeFrame(stream: std.net.Stream, t: tcp_frame.FrameType, payload: []const u
 fn setNoDelay(stream: std.net.Stream) void {
     const one: c_int = 1;
     std.posix.setsockopt(stream.handle, std.posix.IPPROTO.TCP, std.os.linux.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
+}
+
+/// Bound writes so a wedged (zero-window) peer surfaces as an error instead of
+/// pinning a worker in `writevAll` forever. Best-effort, like `setNoDelay`.
+fn setSendTimeout(stream: std.net.Stream, ms: u32) void {
+    const tv = std.posix.timeval{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) };
+    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
 }
 
 /// Clear the recv timeout an accepted socket inherits from the listener (set by

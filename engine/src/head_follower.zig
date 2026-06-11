@@ -269,9 +269,13 @@ fn ingestBlockCore(
     ring: *PendingRing,
     alloc: std.mem.Allocator,
 ) !void {
-    var num_buf: [20]u8 = undefined;
-    const hex = try std.fmt.bufPrint(&num_buf, "0x{x}", .{block_number});
-    const eth_logs = try provider.getLogs(.{ .fromBlock = hex, .toBlock = hex });
+    // Pin the query to the header's hash, not the number. A reorg between
+    // `getBlock` and `getLogs` would otherwise store the new chain's logs
+    // under the old hash. The node rejects an unknown hash, so the entry can
+    // never mix two chains.
+    var hash_buf: [66]u8 = undefined;
+    const hash_hex = try std.fmt.bufPrint(&hash_buf, "0x{x}", .{&header.hash});
+    const eth_logs = try provider.getLogs(.{ .blockHash = hash_hex });
 
     // Fail loud per the contract in core/src/types.zig. A silent truncate
     // would land an incomplete block in pending + flat store.

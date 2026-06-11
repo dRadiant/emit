@@ -180,7 +180,13 @@ fn fillSlotCanonical(slot: *Slot, iter: Iterator, provider: ?*eth.provider.Provi
 
     // Fast path: next row is a different block (or EOF), single-row block.
     if (!iterValid(iter) or (iterKeyBlock(iter) orelse (bn +% 1)) != bn) {
-        if (!have_row) return .skipped;
+        // An oversized row must fail loud here. Skipping leaves a hole in the
+        // dense range and the import dies blocks later as a misleading
+        // NonDenseAppend with the wrong block number.
+        if (!have_row) {
+            core.log.err("block {d}: receipt row is {d} bytes, over the {d} byte buffer. Bump MAX_RAW_VALUE.\n", .{ bn, vlen, MAX_RAW_VALUE });
+            return error.ReceiptValueTooLarge;
+        }
         finalizeFilled(slot, bn);
         return .filled;
     }
