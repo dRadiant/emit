@@ -2,6 +2,10 @@
 
 Event Materialization & Indexing Toolkit
 
+![EMIT building a filtered index over rETH's full history, then replaying 1.25M logs in under 3s](docs/assets/demo.gif)
+
+*Full rETH backfill over the Engine's flat store (~15s, the Merge to chain tip), then a warm handler re-run replaying 1.25M logs in under 3s. Real timings, recorded against a live mainnet node.*
+
 ## What is EMIT?
 
 EMIT is an EVM indexer rooted in a no compromise ethos of free software. Achieving frontier performance, without compromising on freedom.

@@ -114,6 +114,8 @@ pub fn printStats(prog_name: []const u8, stats: sdk.RunStats) void {
     const batches = (stats.prefetch_calls_executed + sdk.DEFAULT_BATCH_SIZE - 1) / sdk.DEFAULT_BATCH_SIZE;
     sdk.log.info(
         \\{s} indexer complete
+        \\  start block:       {d}
+        \\  end block:         {d}
         \\  blocks scanned:    {d}
         \\  blocks matched:    {d}
         \\  filter logs:       {d}
@@ -138,6 +140,8 @@ pub fn printStats(prog_name: []const u8, stats: sdk.RunStats) void {
         \\
     , .{
         prog_name,
+        stats.start_block,
+        stats.end_block,
         stats.filter_blocks_scanned,
         stats.filter_blocks_matched,
         stats.filter_total_logs,

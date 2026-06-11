@@ -146,6 +146,12 @@ pub fn replay(
     const log_buf_children = if (has_children) try allocator.alloc(RawLog, types.MAX_LOGS_PER_BLOCK) else &[_]RawLog{};
     defer if (has_children) allocator.free(log_buf_children);
 
+    // Verbose-only live counter. `show_progress` short-circuits the per-block
+    // mask test off the hot path when the level is normal or silent.
+    const show_progress = core.log.getLevel() == .verbose;
+    const total_blocks: u64 = (if (primary) |p| p.store.count() else 0) +
+        (if (children) |c| c.store.count() else 0);
+
     while (true) {
         const next_p: ?u64 = if (primary) |p| p.peek() else null;
         const next_c: ?u64 = if (children) |c| c.peek() else null;
@@ -183,6 +189,8 @@ pub fn replay(
         ctx.block_number = block_number;
         ctx.timestamp = if (block_ts != 0) @as(u64, block_ts) else humanize.timestampOf(ctx, block_number);
         result.blocks_dispatched += 1;
+        if (show_progress and (result.blocks_dispatched & 0x3FFF) == 0)
+            core.log.debug("\r  replaying {d}/{d} blocks", .{ result.blocks_dispatched, total_blocks });
 
         for (merge_buf[0..merge_count]) |log| {
             try handler_mod.dispatchLog(m, Handler, ctx, log);
@@ -199,6 +207,9 @@ pub fn replay(
             events_since_commit = 0;
         }
     }
+
+    if (show_progress and total_blocks > 0)
+        core.log.debug("\r  replaying {d}/{d} blocks\n", .{ result.blocks_dispatched, total_blocks });
 
     result.elapsed_ns = timer.read();
     return result;

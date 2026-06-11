@@ -18,6 +18,7 @@ const block_filter = @import("block_filter.zig");
 const io_pipeline = @import("io_pipeline.zig");
 const parallel = @import("parallel.zig");
 const log_serial = @import("log_serial.zig");
+const log = @import("log.zig");
 
 const FlatStoreReader = flat_reader.FlatStoreReader;
 const Filter = filter_mod.Filter;
@@ -85,7 +86,12 @@ pub fn run(
         const end = @min(off + CHUNK_BLOCKS, matching.items.len);
         try filterChunk(reader, filter, matching.items[off..end], Sink, sink, &result, allocator);
         off = end;
+        // Live progress (verbose only): a `\r` line that ticks per chunk. The
+        // gate is a single int compare on the normal/silent path, so the
+        // 2M-events/s build is untouched.
+        log.debug("\r  filtering {d}/{d} matching blocks", .{ off, matching.items.len });
     }
+    if (matching.items.len > 0) log.debug("\n", .{});
 
     result.elapsed_ns = timer.read();
     return result;

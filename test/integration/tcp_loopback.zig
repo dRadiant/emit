@@ -201,6 +201,14 @@ test "remote init produces the same entity state as a local init" {
     try std.testing.expectEqual(local_ctx.stats.blocks_dispatched, remote_ctx.stats.blocks_dispatched);
     try std.testing.expectEqual(local_ctx.count(Hit), remote_ctx.count(Hit));
 
+    // Indexed span is reported on both paths, not left at 0 on remote. Local
+    // reads it from the flat reader, remote from the streamed store. Endpoints
+    // coincide here since blocks 100 and 102 both match.
+    try std.testing.expectEqual(@as(u64, 100), remote_ctx.stats.start_block);
+    try std.testing.expectEqual(@as(u64, 102), remote_ctx.stats.end_block);
+    try std.testing.expectEqual(local_ctx.stats.start_block, remote_ctx.stats.start_block);
+    try std.testing.expectEqual(local_ctx.stats.end_block, remote_ctx.stats.end_block);
+
     // Record by record: same block, and the same exact timestamp (local reads
     // it from timestamps.bin, remote from the streamed FilteredStore entry).
     var lrec: [4]Hit = undefined;

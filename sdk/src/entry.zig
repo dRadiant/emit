@@ -85,6 +85,9 @@ pub const RunStats = struct {
     discovered_children: u32 = 0,
     logs_dispatched: u64 = 0,
     blocks_dispatched: u64 = 0,
+    // Inclusive block span the run covered, from the engine store index.
+    start_block: u64 = 0,
+    end_block: u64 = 0,
     commits_performed: u32 = 0,
     prefetch_calls_gathered: u64 = 0,
     prefetch_calls_executed: u64 = 0,
@@ -405,6 +408,19 @@ pub fn init(
 ) !*Context(entities) {
     var timer = try std.time.Timer.start();
 
+    // Banner and per-phase progress are verbose-only, so normal and silent
+    // runs (and the test suite) stay quiet.
+    core.log.debug(
+        \\
+        \\   ███████ ███    ███ ██ ████████
+        \\   ██      ████  ████ ██    ██
+        \\   █████   ██ ████ ██ ██    ██
+        \\   ██      ██  ██  ██ ██    ██
+        \\   ███████ ██      ██ ██    ██
+        \\
+        \\
+    , .{});
+
     // Derive and mkdir the entity / filter / ethcall subdirs under `data_dir`.
     const entity_dir = try std.fs.path.join(allocator, &.{ options.data_dir, "entity" });
     defer allocator.free(entity_dir);
@@ -441,6 +457,15 @@ pub fn init(
     };
     errdefer ctx._state_snap.deinit();
     ctx._last_dispatched_block = ctx._state_snap.cursor;
+
+    // Local path reports the engine store's covered span from the flat reader.
+    // Both the cold build and the warm re-run reach here. The remote path has
+    // no reader and sets the span from the streamed store in remoteBackfill.
+    if (reader) |r| {
+        ctx.stats.start_block = r.first_block;
+        ctx.stats.end_block = if (r.index_count == 0) r.first_block else r.first_block + r.index_count - 1;
+        core.log.debug("  indexing blocks {d} → {d}\n", .{ ctx.stats.start_block, ctx.stats.end_block });
+    }
 
     // Open the engine's per-block timestamp index if present. Absence (older
     // stores) or a corrupt file leaves it null, and `humanize.timestampOf`
@@ -483,6 +508,7 @@ pub fn init(
         try writeFilterFingerprint(filter_dh, fp);
     } else if (shouldSkipFilterBuild(filter_dh, allocator, fp)) {
         ctx.stats.phases_skipped = true;
+        core.log.debug("  reusing filtered index, skipping build\n", .{});
         // Even with the filter reused, factory children must be rediscovered
         // so the live address gate admits them. The primary store always
         // holds the factory create-events, so scanCreations rebuilds the same
@@ -848,6 +874,21 @@ fn remoteBackfill(
         &.{},
         allocator,
     );
+
+    // Remote has no flat reader. Derive the indexed span from the streamed
+    // primary store first and last block, so the stats and the verbose range
+    // line match the local path instead of reading 0.
+    {
+        var ps = filtered_store_mod.FilteredStore.open(allocator, filter_dh, filter_builder.BASE_PRIMARY) catch null;
+        if (ps) |*store| {
+            defer store.deinit();
+            if (store.count() > 0) {
+                ctx.stats.start_block = (try store.readEntry(0)).block_number;
+                ctx.stats.end_block = (try store.readEntry(store.count() - 1)).block_number;
+                core.log.debug("  indexing blocks {d} → {d}\n", .{ ctx.stats.start_block, ctx.stats.end_block });
+            }
+        }
+    }
 
     if (comptime m.factories.len > 0) {
         const child_topics = comptime filter_builder.collectChildTopics(m);
