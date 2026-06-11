@@ -27,17 +27,25 @@ pub const StandardArgs = struct {
 
 /// Parse `--engine-data-dir`, `--data-dir`, `--commit-interval`,
 /// `--node-rpc`, `--follow`. Missing required args print usage and return
-/// `error.MissingArgs`. Caller frees the duped string fields.
-pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8) !StandardArgs {
+/// `error.MissingArgs`. Caller frees the duped string fields. `passthrough`
+/// lists value-taking flags owned by the caller (erc20-api's `--port`),
+/// skipped here. Anything else unrecognized is an error: a typo'd flag
+/// silently changing behavior (`--folow` running backfill-only) is worse
+/// than a startup failure.
+pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8, passthrough: []const []const u8) !StandardArgs {
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
 
     var engine_data_dir: ?[]const u8 = null;
+    errdefer if (engine_data_dir) |s| allocator.free(s);
     var data_dir: ?[]const u8 = null;
+    errdefer if (data_dir) |s| allocator.free(s);
     var commit_interval: u32 = 100_000;
     var node_rpc: ?[]const u8 = null;
+    errdefer if (node_rpc) |s| allocator.free(s);
     var follow: bool = false;
     var remote_engine: ?sdk.RemoteEngine = null;
+    errdefer if (remote_engine) |re| allocator.free(re.host);
     var silent = false;
     var verbose = false;
 
@@ -70,6 +78,19 @@ pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8) !S
             silent = true;
         } else if (std.mem.eql(u8, a, "--verbose")) {
             verbose = true;
+        } else {
+            const skipped = for (passthrough) |p| {
+                if (std.mem.eql(u8, a, p)) {
+                    i += 1; // skip the caller-owned flag's value
+                    break true;
+                }
+            } else false;
+            if (!skipped) {
+                // Also catches a value-taking flag as the last arg (its own
+                // branch fails the `i + 1 < argv.len` check and lands here).
+                sdk.log.err("{s}: unknown flag or missing value: {s}\n", .{ prog_name, a });
+                return error.BadFlag;
+            }
         }
     }
 
@@ -86,10 +107,7 @@ pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8) !S
             "usage: {s} --engine-data-dir <path> --data-dir <path> [--commit-interval N] [--node-rpc URL] [--remote-engine host:port] [--follow] [--silent] [--verbose]\n",
             .{prog_name},
         );
-        if (engine_data_dir) |s| allocator.free(s);
-        if (data_dir) |s| allocator.free(s);
-        if (node_rpc) |s| allocator.free(s);
-        if (remote_engine) |re| allocator.free(re.host);
+        // The errdefers at the declarations free the duped fields.
         return error.MissingArgs;
     }
 
@@ -186,7 +204,7 @@ pub fn run(
         _ = &gpa;
     };
 
-    const args = try parseStandardArgs(allocator, manifest.name);
+    const args = try parseStandardArgs(allocator, manifest.name, &.{});
     defer allocator.free(args.engine_data_dir);
     defer allocator.free(args.data_dir);
     defer if (args.node_rpc) |s| allocator.free(s);

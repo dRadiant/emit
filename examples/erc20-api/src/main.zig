@@ -41,7 +41,7 @@ pub fn main() !void {
 
     // Shared flag parser handles standard dirs + node RPC. The API-only
     // `--port` (default 8080) is pulled from argv separately.
-    const args = try cli.parseStandardArgs(allocator, "erc20-api");
+    const args = try cli.parseStandardArgs(allocator, "erc20-api", &.{"--port"});
     defer allocator.free(args.engine_data_dir);
     defer allocator.free(args.data_dir);
     defer if (args.node_rpc) |s| allocator.free(s);
@@ -120,7 +120,9 @@ fn transfers(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const n: usize = @intCast(@min(limit, remaining));
 
     var buf: [100]e.Transfer = undefined;
-    const start = total - offset - n; // ascending index of the window's oldest
+    // `remaining` is already clamped to 0, so this cannot underflow on an
+    // untrusted `offset > total`. Same value as `total - offset - n` when valid.
+    const start = remaining - n;
     const window = try app.ctx.range(e.Transfer, start, buf[0..n]);
 
     // `EventId.unpack` decodes the packed key back into its coordinates.
