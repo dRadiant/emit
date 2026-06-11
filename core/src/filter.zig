@@ -12,17 +12,39 @@
 ///
 /// Safe builds bounds-check the slice accesses. ReleaseFast does not.
 const std = @import("std");
+const builtin = @import("builtin");
 
 const log_serial = @import("log_serial.zig");
+
+/// Above this many addresses the membership test binary-searches instead of
+/// scanning. Small sets (the single/few-contract common case) stay linear,
+/// where the branch-free scan beats a binary search's overhead. A factory
+/// indexer with thousands of children crosses it and pays `O(log n)` per log.
+pub const ADDR_BINARY_SEARCH_THRESHOLD = 24;
 
 /// Per-log keep predicate. `match_addrs` and `match_topics` are positive
 /// match sets. `exclude_addrs` is a negative filter applied after the positives
 /// pass, letting a phase suppress addresses already covered elsewhere.
+///
+/// `addrs_sorted` is an opt-in: when set, `match_addrs` and `exclude_addrs` are
+/// ascending-sorted and the per-log test binary-searches. Default false keeps
+/// every caller on the order-tolerant linear scan. Only set it after sorting.
 pub const Filter = struct {
     match_addrs: []const [20]u8,
     match_topics: []const [32]u8,
     exclude_addrs: []const [20]u8,
+    addrs_sorted: bool = false,
 };
+
+fn addrLessThan(_: void, a: [20]u8, b: [20]u8) bool {
+    return std.mem.order(u8, &a, &b) == .lt;
+}
+
+/// Sort an address slice ascending in place. Establishes the `addrs_sorted`
+/// precondition for binary-search membership.
+pub fn sortAddresses(addrs: [][20]u8) void {
+    std.sort.pdq([20]u8, addrs, {}, addrLessThan);
+}
 
 /// Recompressed LZ4 entry (a slice into the caller's `compress_buf`) plus the
 /// number of logs it carries.
@@ -36,12 +58,35 @@ inline fn contains(comptime N: usize, haystack: []const [N]u8, needle: *const [N
     return false;
 }
 
+/// Binary-search membership. `haystack` MUST be ascending-sorted.
+fn containsSorted(haystack: []const [20]u8, needle: *const [20]u8) bool {
+    var lo: usize = 0;
+    var hi: usize = haystack.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        switch (std.mem.order(u8, &haystack[mid], needle)) {
+            .eq => return true,
+            .lt => lo = mid + 1,
+            .gt => hi = mid,
+        }
+    }
+    return false;
+}
+
 pub inline fn containsAddress(haystack: []const [20]u8, needle: *const [20]u8) bool {
     return contains(20, haystack, needle);
 }
 
 pub inline fn containsTopic(haystack: []const [32]u8, needle: *const [32]u8) bool {
     return contains(32, haystack, needle);
+}
+
+/// Membership against a (possibly sorted) address set. Binary-searches when
+/// `sorted` and the set is large, else scans linearly.
+inline fn addrMatch(haystack: []const [20]u8, needle: *const [20]u8, sorted: bool) bool {
+    if (sorted and haystack.len > ADDR_BINARY_SEARCH_THRESHOLD)
+        return containsSorted(haystack, needle);
+    return contains(20, haystack, needle);
 }
 
 /// Filter `decompressed` (one block's packed logs, `u32` count then logs) to
@@ -60,6 +105,15 @@ pub fn filterBlockEntry(
     serialize_buf: []u8,
     compress_buf: []u8,
 ) !?Filtered {
+    // Opt-in binary search requires the precondition the flag asserts. Check it
+    // once per block in safe builds. Compiled out in ReleaseFast.
+    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) {
+        if (filter.addrs_sorted) {
+            std.debug.assert(std.sort.isSorted([20]u8, filter.match_addrs, {}, addrLessThan));
+            std.debug.assert(std.sort.isSorted([20]u8, filter.exclude_addrs, {}, addrLessThan));
+        }
+    }
+
     var pos: usize = 0;
     const log_count: usize = std.mem.readInt(u32, decompressed[pos..][0..4], .little);
     pos += 4;
@@ -80,12 +134,12 @@ pub fn filterBlockEntry(
         // An empty positive set is a wildcard on that axis, mirroring the bloom
         // scan, so a one-sided filter (addresses ^ topics) matches on the
         // populated axis only. Both-empty is rejected upstream (tcp_server).
-        if (filter.match_addrs.len > 0 and !containsAddress(filter.match_addrs, address)) continue;
+        if (filter.match_addrs.len > 0 and !addrMatch(filter.match_addrs, address, filter.addrs_sorted)) continue;
         if (filter.match_topics.len > 0) {
             const topic0: *const [32]u8 = @ptrCast(decompressed[log_start + 25 ..][0..32]);
             if (!containsTopic(filter.match_topics, topic0)) continue;
         }
-        if (containsAddress(filter.exclude_addrs, address)) continue;
+        if (addrMatch(filter.exclude_addrs, address, filter.addrs_sorted)) continue;
 
         const len = log_end - log_start;
         @memcpy(serialize_buf[out_pos..][0..len], decompressed[log_start..log_end]);
@@ -194,6 +248,41 @@ test "filterBlockEntry applies exclude_addrs after the positive match" {
     const kept = try unpack(filtered.entry, &decompress_buf, &log_buf);
     try testing.expectEqual(@as(usize, 1), kept.len);
     try testing.expectEqualSlices(u8, &ADDR_B, &kept[0].address);
+}
+
+test "filterBlockEntry binary-searches a large sorted address set" {
+    var pack_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
+    var serialize_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
+    var compress_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
+    var decompress_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
+    var log_buf: [8]RawLog = undefined;
+
+    // 30 distinct addresses, past ADDR_BINARY_SEARCH_THRESHOLD, sorted ascending
+    // so `addrs_sorted` holds and the per-log test binary-searches.
+    var addrs: [30][20]u8 = undefined;
+    for (&addrs, 0..) |*a, i| a.* = [_]u8{@intCast(i + 1)} ** 20;
+    sortAddresses(&addrs);
+
+    const in_set = [_]u8{17} ** 20; // present in the set
+    const absent = [_]u8{200} ** 20; // beyond the largest member
+    const logs = [_]RawLog{
+        rawLog(in_set, TOPIC_X, 1, 0), // keep
+        rawLog(absent, TOPIC_X, 1, 1), // drop: not a member
+    };
+    const packed_logs = packLogs(&logs, &pack_buf);
+
+    const filter: Filter = .{
+        .match_addrs = &addrs,
+        .match_topics = &.{TOPIC_X},
+        .exclude_addrs = &.{},
+        .addrs_sorted = true,
+    };
+    const filtered = (try filterBlockEntry(packed_logs, filter, &serialize_buf, &compress_buf)).?;
+    try testing.expectEqual(@as(u32, 1), filtered.log_count);
+
+    const kept = try unpack(filtered.entry, &decompress_buf, &log_buf);
+    try testing.expectEqual(@as(usize, 1), kept.len);
+    try testing.expectEqualSlices(u8, &in_set, &kept[0].address);
 }
 
 test "filterBlockEntry returns null when nothing matches" {

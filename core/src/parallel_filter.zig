@@ -62,6 +62,29 @@ pub fn run(
     var result = Result{};
     var timer = try std.time.Timer.start();
 
+    // One filter serves every block in the range, so sort the address sets once
+    // here and binary-search per log. Below the threshold the linear scan wins,
+    // so leave the filter untouched and skip the copy.
+    var owned_match: ?[][20]u8 = null;
+    var owned_exclude: ?[][20]u8 = null;
+    defer if (owned_match) |s| allocator.free(s);
+    defer if (owned_exclude) |s| allocator.free(s);
+    var filt = filter;
+    if (filter.match_addrs.len > filter_mod.ADDR_BINARY_SEARCH_THRESHOLD or
+        filter.exclude_addrs.len > filter_mod.ADDR_BINARY_SEARCH_THRESHOLD)
+    {
+        owned_match = try allocator.dupe([20]u8, filter.match_addrs);
+        owned_exclude = try allocator.dupe([20]u8, filter.exclude_addrs);
+        filter_mod.sortAddresses(owned_match.?);
+        filter_mod.sortAddresses(owned_exclude.?);
+        filt = .{
+            .match_addrs = owned_match.?,
+            .match_topics = filter.match_topics,
+            .exclude_addrs = owned_exclude.?,
+            .addrs_sorted = true,
+        };
+    }
+
     var matching = std.ArrayListUnmanaged(u64){};
     defer matching.deinit(allocator);
     try block_filter.scanBloomsParallel(
@@ -84,7 +107,7 @@ pub fn run(
     var off: usize = 0;
     while (off < matching.items.len) {
         const end = @min(off + CHUNK_BLOCKS, matching.items.len);
-        try filterChunk(reader, filter, matching.items[off..end], Sink, sink, &result, allocator);
+        try filterChunk(reader, filt, matching.items[off..end], Sink, sink, &result, allocator);
         off = end;
         // Live progress (verbose only): a `\r` line that ticks per chunk. The
         // gate is a single int compare on the normal/silent path, so the
@@ -100,6 +123,12 @@ pub fn run(
 /// Filter one chunk in parallel, then emit its survivors in ascending order and
 /// free the chunk's arenas. Worker ranges are contiguous over the sorted chunk
 /// and each worker sorts its own output, so a flat walk is globally ascending.
+///
+/// Per-chunk pipeline + arena teardown is deliberate. Freeing per chunk keeps
+/// held memory at one chunk's working set instead of pinning the largest
+/// chunk's for the whole run. Ring re-setup is marginal next to the NVMe
+/// reads, and reuse would need run-scoped pipelines threaded through the
+/// per-chunk workers. Revisit only with a measured win on a real build.
 fn filterChunk(
     reader: *const FlatStoreReader,
     filter: Filter,
