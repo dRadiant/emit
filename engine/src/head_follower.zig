@@ -132,24 +132,21 @@ fn followWs(
         // Providers occasionally re-broadcast. Re-appending breaks the dense-ring invariant.
         if (block_number <= tip) continue;
 
-        // Partial gap-fill would leave the ring non-dense and break getHash.
-        // Abort on any failure and let the next notification retry from the tip.
+        // Finalize each block as it is ingested so pending.bin never persists
+        // more than FINALITY_DEPTH entries. Finalizing only after the whole gap
+        // would grow the ring past the cap, write an oversized file that
+        // parseValidated rejects on the next open (bricking follow), and rewrite
+        // the full file O(gap²) times. Finalize before each insert so the
+        // on-disk count never overshoots the cap, even by one. On any failure
+        // stop. The next notification retries from the new tip, ring stays dense.
         var bn = tip + 1;
-        var gap_ok = true;
-        while (bn < block_number) : (bn += 1) {
+        while (bn <= block_number) : (bn += 1) {
+            finalizeReady(ring, writer, bn, alloc, ts_writer);
             ingestBlock(bn, provider, ring, alloc) catch |err| {
-                core.log.info("Gap-fill block {d}: {s}\n", .{ bn, @errorName(err) });
-                gap_ok = false;
+                core.log.info("Block {d}: {s}\n", .{ bn, @errorName(err) });
                 break;
             };
         }
-        if (!gap_ok) continue;
-
-        ingestBlock(block_number, provider, ring, alloc) catch |err| {
-            core.log.info("Block {d}: {s}\n", .{ block_number, @errorName(err) });
-            continue;
-        };
-        finalizeReady(ring, writer, block_number, alloc, ts_writer);
     }
 }
 
@@ -167,13 +164,15 @@ fn followPoll(
         if (writer.meta.last_finalized_block > 0) writer.meta.last_finalized_block else latest -| 1;
     if (latest <= tip) return;
 
+    // Finalize before each insert so the ring stays within FINALITY_DEPTH on
+    // disk even across a large catch-up. See followWs for the full rationale.
     for (tip + 1..latest + 1) |bn| {
+        finalizeReady(ring, writer, @intCast(bn), alloc, ts_writer);
         ingestBlock(@intCast(bn), provider, ring, alloc) catch |err| {
             core.log.info("Block {d}: {s}\n", .{ bn, @errorName(err) });
             break;
         };
     }
-    finalizeReady(ring, writer, latest, alloc, ts_writer);
 }
 
 // ── Shared ───────────────────────────────────────────────────────────────
@@ -273,15 +272,18 @@ fn resolveReorg(ring: *PendingRing, from: u64, provider: *eth.provider.Provider)
     var canonical: [pending_ring.FINALITY_DEPTH][32]u8 = undefined;
     const oldest = ring.oldestBlock() orelse return from;
     const depth = @min(from - oldest, pending_ring.FINALITY_DEPTH);
-    var filled: usize = 0;
     for (0..depth) |i| {
-        const hdr = (provider.getBlock(from - 1 - i) catch break) orelse break;
+        // Propagate fetch failures. Swallowing one shortens the canonical window
+        // and pushes the fork point above the true fork, graduating orphan
+        // blocks into the never-mutated flat store. The caller's gap-fill abort
+        // retries the whole reorg on a transient error.
+        const hdr = (try provider.getBlock(from - 1 - i)) orelse return error.ReorgBlockUnavailable;
         canonical[i] = hdr.hash;
-        filled += 1;
     }
 
-    // Pass only the filled prefix. Uninitialized slots would corrupt the comparison.
-    const fork = ring.findForkPoint(from, canonical[0..filled]);
+    // Null means the divergence runs deeper than the ring holds. Refuse rather
+    // than guess a fork above the true one and orphan-finalize.
+    const fork = ring.findForkPoint(from, canonical[0..depth]) orelse return error.ReorgExceedsRing;
     const removed = try ring.truncateFrom(fork);
     try ring.flush();
     core.log.info("Reorg: fork at {d}, removed {d} blocks\n", .{ fork, removed });
@@ -405,4 +407,44 @@ test "finalizeReady mirrors finalized timestamps into timestamps.bin" {
     defer reader.deinit();
     try std.testing.expectEqual(@as(?u64, 1_700_000_000), reader.get(100));
     try std.testing.expectEqual(@as(?u64, null), reader.get(101)); // not yet finalized
+}
+
+test "catch-up finalizes as it ingests so the ring stays within FINALITY_DEPTH" {
+    // Regression for the catch-up brick: ingesting a gap larger than the ring
+    // while finalizing only afterward grows pending.bin past FINALITY_DEPTH,
+    // which parseValidated rejects on the next open. Mirror the gap-fill cadence
+    // (finalize before each insert) and assert the persisted ring never exceeds
+    // the cap and reopens cleanly.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const alloc = std.testing.allocator;
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpath(".", &path_buf);
+
+    const topic = [_]u8{0} ** core.bloom.BLOOM_SIZE;
+    const addr = [_]u8{0} ** core.bloom.ADDR_BLOOM_SIZE;
+    const entry = [_]u8{ 0, 0, 0, 0 }; // packed payload, log_count = 0
+    const hash = [_]u8{0xAB} ** 32;
+
+    const last: u64 = pending_ring.FINALITY_DEPTH * 2;
+    {
+        var writer = try FlatStoreWriter.open(path);
+        defer writer.deinit();
+        var ring = try PendingRing.open(tmp.dir, alloc);
+        defer ring.deinit();
+
+        var bn: u64 = 1;
+        while (bn <= last) : (bn += 1) {
+            finalizeReady(&ring, &writer, bn, alloc, null);
+            try ring.insert(bn, 0, hash, &topic, &addr, &entry);
+            try std.testing.expect(ring.count() <= pending_ring.FINALITY_DEPTH);
+        }
+    }
+
+    // The persisted ring must reopen: it never wrote an oversized count.
+    var ring2 = try PendingRing.open(tmp.dir, alloc);
+    defer ring2.deinit();
+    try std.testing.expect(ring2.count() <= pending_ring.FINALITY_DEPTH);
+    try std.testing.expectEqual(last, ring2.latestBlock().?);
 }

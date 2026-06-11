@@ -148,18 +148,22 @@ pub const PendingRing = struct {
     }
 
     /// Walk backwards from `from` comparing stored hashes against `canonical`.
-    /// Returns the first block number where they diverge (the fork point).
     /// `canonical[0]` is the hash for `from - 1`, `canonical[1]` for `from - 2`.
-    pub fn findForkPoint(self: *const PendingRing, from: u64, canonical: []const [32]u8) u64 {
-        const oldest = self.oldestBlock() orelse return from;
+    /// Returns the fork point (lowest block at or above which the ring diverges
+    /// from canonical), or null when the canonical window is exhausted without a
+    /// match. Null means the reorg runs deeper than the ring holds, which the
+    /// caller must treat as unrecoverable rather than guess a fork above the true
+    /// one. A too-high fork leaves orphan blocks that finalize into the flat store.
+    pub fn findForkPoint(self: *const PendingRing, from: u64, canonical: []const [32]u8) ?u64 {
+        const oldest = self.oldestBlock() orelse return null;
         var fork = from;
         for (canonical) |hash| {
             if (fork <= oldest) break;
             const stored = self.getHash(fork - 1) orelse break;
-            if (std.mem.eql(u8, &stored, &hash)) break;
+            if (std.mem.eql(u8, &stored, &hash)) return fork;
             fork -= 1;
         }
-        return fork;
+        return null;
     }
 
     /// Delete all entries with block_number >= from_block. Returns count deleted.
@@ -386,7 +390,7 @@ test "findForkPoint walks back to matching hash" {
     // Canonical matches at 105, diverges above
     const hash_b = [_]u8{0xBB} ** 32;
     const canonical = [_][32]u8{ hash_b, hash_b, hash_b, hash_a }; // 108,107,106,105
-    const fork = ring.findForkPoint(109, &canonical);
+    const fork = ring.findForkPoint(109, &canonical).?;
     try testing.expectEqual(@as(u64, 106), fork);
 }
 
@@ -403,18 +407,37 @@ test "findForkPoint returns from when all match" {
 
     // First canonical hash matches immediately (no reorg)
     const canonical = [_][32]u8{hash_a};
-    const fork = ring.findForkPoint(105, &canonical);
+    const fork = ring.findForkPoint(105, &canonical).?;
     try testing.expectEqual(@as(u64, 105), fork);
 }
 
-test "findForkPoint on empty ring returns from" {
+test "findForkPoint returns null when no canonical hash matches" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ring = try PendingRing.open(tmp.dir, testing.allocator);
+    defer ring.deinit();
+
+    const hash_a = [_]u8{0xAA} ** 32;
+    for (100..110) |i| {
+        try ring.insert(i, 0, hash_a, &dummy_topic, &dummy_addr, &dummy_entry);
+    }
+
+    // Every compared block diverges (the reorg is deeper than the fetched
+    // window). Walking the whole array without a match must signal failure, not
+    // guess a fork above the true one and orphan-finalize.
+    const hash_b = [_]u8{0xBB} ** 32;
+    const canonical = [_][32]u8{ hash_b, hash_b, hash_b };
+    try testing.expectEqual(@as(?u64, null), ring.findForkPoint(109, &canonical));
+}
+
+test "findForkPoint on empty ring returns null" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var ring = try PendingRing.open(tmp.dir, testing.allocator);
     defer ring.deinit();
 
     const canonical = [_][32]u8{[_]u8{0} ** 32};
-    try testing.expectEqual(@as(u64, 100), ring.findForkPoint(100, &canonical));
+    try testing.expectEqual(@as(?u64, null), ring.findForkPoint(100, &canonical));
 }
 
 // Dense-ring invariant that head_follower's reorg recovery depends on. After
