@@ -630,69 +630,79 @@ pub fn init(
     try ctx.commitCycle();
     ctx.stats.elapsed_ns = timer.read();
 
-    // Remote follow handles the gap differently: the live REGISTER re-streams
-    // from the committed cursor, so the engine fills any advance during backfill.
+    // Local follow gap-fills the flat-store advance the engine made during
+    // backfill so `spawn` returns a caught-up ctx. Remote follow re-streams from
+    // the cursor via REGISTER instead. followLoop runs the gap-fill again at the
+    // live handoff to catch any advance since this point.
     if (options.follow and options.remote_engine == null) {
-        // Gap fill. The engine may have advanced during backfill. Re-open
-        // the reader so any flat-store entries added since the start of
-        // init are visible (the original `reader` mmap was sized at open).
-        const engine_last = try live.readMeta(options.engine_data_dir);
-        if (engine_last > ctx._last_dispatched_block) {
-            var gap_reader = try core.FlatStoreReader.open(options.engine_data_dir);
-            defer gap_reader.deinit();
-
-            const gap_from = ctx._last_dispatched_block + 1;
-            const gap_result = try filter_builder.appendBlocks(
-                &gap_reader,
-                m,
-                gap_from,
-                engine_last,
-                filter_dh,
-                allocator,
-            );
-            try requireCompleteFilter("follow gap-fill", gap_result);
-
-            // The gap may hold create-events for children unknown to the
-            // backfill pass (and child events from already-known children).
-            // Rediscover over the now-extended primary, merge into the live set,
-            // and extend children.dat across the gap so replay sees them. The
-            // gap range is strictly above the children store's tail, so the
-            // append stays monotonic.
-            if (comptime m.factories.len > 0) {
-                var gap_children = try scanner.scanCreations(filter_dh, m, allocator);
-                defer gap_children.deinit();
-                if (ctx._child_addresses) |set| {
-                    var it = gap_children.keyIterator();
-                    while (it.next()) |addr| try set.put(addr.*, {});
-                    if (set.count() > 0) {
-                        const addrs = try allocator.alloc([20]u8, set.count());
-                        defer allocator.free(addrs);
-                        var i: usize = 0;
-                        var ks = set.keyIterator();
-                        while (ks.next()) |a| : (i += 1) addrs[i] = a.*;
-                        const cres = try filter_builder.appendChildrenBlocks(
-                            &gap_reader,
-                            m,
-                            addrs,
-                            gap_from,
-                            engine_last,
-                            filter_dh,
-                            allocator,
-                        );
-                        try requireCompleteFilter("follow gap-fill children", cres);
-                    }
-                }
-            }
-
-            _ = try scanner.replay(filter_dh, m, Handler, ctx, .{
-                .commit_interval = options.commit_interval,
-                .start_block = ctx._last_dispatched_block,
-            });
-            try ctx.commitCycle();
-        }
+        try followGapFill(m, Handler, ctx, options, allocator);
     }
     // init never enters the live loop. run/spawn drive followLoop below.
     return ctx;
+}
+
+/// Replay the flat-store advance the engine made past the cursor. Re-reads meta
+/// and dispatches `(cursor, last_finalized]` from a freshly opened reader. The
+/// reader `init` mmap'd at open never sees blocks appended during backfill. Run
+/// once after backfill so `spawn` returns a caught-up ctx, and again at the live
+/// handoff. The engine can finalize more blocks between the two, and the live
+/// loop reads only the pending ring, so a block finalizing in that window would
+/// be dispatched by no one. Idempotent when meta has not advanced.
+///
+/// A sub-tick residual remains. meta and pending are separate files read
+/// non-atomically, so a block whose full finalize lands between this meta read
+/// and the live loop's first pending read is still missed. Closing it needs a
+/// pending-before-meta read with boundary dedup, or an atomic engine checkpoint.
+fn followGapFill(
+    comptime m: sdk_manifest.Manifest,
+    comptime Handler: type,
+    ctx: anytype,
+    options: Options,
+    allocator: std.mem.Allocator,
+) !void {
+    const engine_last = try live.readMeta(options.engine_data_dir);
+    if (engine_last <= ctx._last_dispatched_block) return;
+
+    const filter_dir = try std.fs.path.join(allocator, &.{ options.data_dir, "filter" });
+    defer allocator.free(filter_dir);
+    var filter_dh = try std.fs.cwd().openDir(filter_dir, .{});
+    defer filter_dh.close();
+
+    var gap_reader = try core.FlatStoreReader.open(options.engine_data_dir);
+    defer gap_reader.deinit();
+
+    const gap_from = ctx._last_dispatched_block + 1;
+    const gap_result = try filter_builder.appendBlocks(&gap_reader, m, gap_from, engine_last, filter_dh, allocator);
+    try requireCompleteFilter("follow gap-fill", gap_result);
+
+    // The gap may hold create-events for children unknown to the backfill pass
+    // (and child events from already-known children). Rediscover over the
+    // now-extended primary, merge into the live set, and extend children.dat so
+    // replay sees them. The gap range sits above the children tail, append stays
+    // monotonic.
+    if (comptime m.factories.len > 0) {
+        var gap_children = try scanner.scanCreations(filter_dh, m, allocator);
+        defer gap_children.deinit();
+        if (ctx._child_addresses) |set| {
+            var it = gap_children.keyIterator();
+            while (it.next()) |addr| try set.put(addr.*, {});
+            if (set.count() > 0) {
+                const addrs = try allocator.alloc([20]u8, set.count());
+                defer allocator.free(addrs);
+                var i: usize = 0;
+                var ks = set.keyIterator();
+                while (ks.next()) |a| : (i += 1) addrs[i] = a.*;
+                const cres = try filter_builder.appendChildrenBlocks(&gap_reader, m, addrs, gap_from, engine_last, filter_dh, allocator);
+                try requireCompleteFilter("follow gap-fill children", cres);
+            }
+        }
+    }
+
+    _ = try scanner.replay(filter_dh, m, Handler, ctx, .{
+        .commit_interval = options.commit_interval,
+        .start_block = ctx._last_dispatched_block,
+    });
+    try ctx.commitCycle();
 }
 
 /// Live loop body. Sets up the Multicall (when a node RPC is configured) and
@@ -716,6 +726,12 @@ fn followLoop(
             ctx._allocator,
         );
     }
+
+    // Close the init->live handoff window. The engine may have finalized more
+    // blocks since init's gap-fill. Replay that advance from the flat store
+    // before the live loop (which reads only the pending ring) takes over.
+    try followGapFill(m, Handler, ctx, options, ctx._allocator);
+
     if (options.node_rpc) |rpc_url| {
         var http = eth.http_transport.HttpTransport.init(ctx._allocator, rpc_url);
         var provider = eth.provider.Provider.init(ctx._allocator, &http);
@@ -1363,6 +1379,71 @@ test "init: backfills planted Transfers and final balances match" {
     try testing.expectEqual(@as(u64, 90), alice.balance);
     try testing.expectEqual(@as(u64, 30), bob.balance);
     try testing.expectEqual(@as(u64, 30), carl.balance);
+}
+
+fn writeTestMeta(dir: std.fs.Dir, last_finalized: u64) !void {
+    const meta = flat_reader.Meta{
+        .last_finalized_block = last_finalized,
+        .blocks_dat_size = 0,
+        .blocks_idx_count = 0,
+        .blooms_count = 0,
+        .checksum = 0,
+    };
+    var buf: [flat_reader.META_SIZE]u8 = undefined;
+    meta.serialize(&buf);
+    var f = try dir.createFile("meta.bin", .{});
+    defer f.close();
+    try f.writeAll(&buf);
+}
+
+test "follow gap-fill dispatches blocks the engine finalized after backfill" {
+    // Residual fix for the init->live handoff. The engine can finalize blocks
+    // into the flat store after init's backfill, and the live loop reads only
+    // the pending ring, so followGapFill must replay that advance or the blocks
+    // are dispatched by no one. Backfill 100-101, grow the store to 100-103 with
+    // meta past the cursor, then assert followGapFill dispatches 102-103 without
+    // re-dispatching 100-101.
+    const allocator = testing.allocator;
+
+    const ALICE: [20]u8 = [_]u8{0xA1} ** 20;
+    var d: [4][32]u8 = undefined;
+    const log100 = makeTransferLog(100, 0, [_]u8{0} ** 20, ALICE, 100, &d[0]);
+    const log101 = makeTransferLog(101, 0, [_]u8{0} ** 20, ALICE, 10, &d[1]);
+
+    var src_tmp = testing.tmpDir(.{});
+    defer src_tmp.cleanup();
+    try writeFlatStoreFromLogs(src_tmp.dir, &.{ &.{log100}, &.{log101} }, allocator);
+    var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
+
+    var data_tmp = testing.tmpDir(.{});
+    defer data_tmp.cleanup();
+    var data_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_path = try data_tmp.dir.realpath(".", &data_path_buf);
+
+    const Manifest: sdk_manifest.Manifest = .{
+        .name = "erc20",
+        .chain_id = 1,
+        .start_block = 0,
+        .contracts = &.{.{ .name = "T", .address = ADDR_TOKEN, .events = &.{Transfer} }},
+    };
+    const options: Options = .{ .engine_data_dir = src_path, .data_dir = data_path, .commit_interval = 100_000 };
+
+    const ctx = try init(Manifest, TransferHandler, .{Account}, options, allocator);
+    defer ctx.deinit();
+    try testing.expectEqual(@as(u64, 101), ctx._last_dispatched_block);
+
+    // The engine appends two finalized blocks and advances meta past the cursor.
+    const log102 = makeTransferLog(102, 0, [_]u8{0} ** 20, ALICE, 5, &d[2]);
+    const log103 = makeTransferLog(103, 0, [_]u8{0} ** 20, ALICE, 1, &d[3]);
+    try writeFlatStoreFromLogs(src_tmp.dir, &.{ &.{log100}, &.{log101}, &.{log102}, &.{log103} }, allocator);
+    try writeTestMeta(src_tmp.dir, 103);
+
+    try followGapFill(Manifest, TransferHandler, ctx, options, allocator);
+
+    try testing.expectEqual(@as(u64, 103), ctx._last_dispatched_block);
+    const alice = (try ctx.stores.accounts.load(ALICE)) orelse return error.MissingAlice;
+    try testing.expectEqual(@as(u64, 116), alice.balance); // 100 + 10 + 5 + 1
 }
 
 test "Context read/count/range/cursor over an immutable store after backfill" {
