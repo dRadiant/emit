@@ -196,6 +196,9 @@ const PushSink = struct {
 
 /// Highest block number stored (the last dense index slot).
 fn tipOf(reader: *const FlatStoreReader) u64 {
+    // Empty flat store (serve before import). Return 0 so a backfill range
+    // `(cursor, tip]` is empty rather than underflowing to maxInt.
+    if (reader.index_count == 0) return 0;
     return reader.first_block + reader.index_count - 1;
 }
 

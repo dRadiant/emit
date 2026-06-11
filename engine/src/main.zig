@@ -104,27 +104,45 @@ pub fn main() !void {
 }
 
 fn status(data_dir: []const u8) void {
-    const meta = core.flat_reader.FlatStoreReader.readMeta(data_dir);
-    if (meta) |m| {
-        log.info(
-            \\=== Flat Store Status ===
-            \\Data dir:            {s}
-            \\Last finalized block: {d}
-            \\blocks.dat size:     {d} bytes ({d:.1} GB)
-            \\Index entries:       {d}
-            \\Bloom entries:       {d}
-            \\
-        , .{
-            data_dir,
-            m.last_finalized_block,
-            m.blocks_dat_size,
-            @as(f64, @floatFromInt(m.blocks_dat_size)) / (1024 * 1024 * 1024),
-            m.blocks_idx_count,
-            m.blooms_count,
-        });
-    } else {
+    const alloc = std.heap.page_allocator;
+    const m = core.flat_reader.FlatStoreReader.readMeta(data_dir) orelse {
         log.err("No flat store found at {s}\n", .{data_dir});
-    }
+        std.process.exit(1);
+    };
+    log.info(
+        \\=== Flat Store Status ===
+        \\Data dir:            {s}
+        \\Last finalized block: {d}
+        \\blocks.dat size:     {d} bytes ({d:.1} GB)
+        \\Index entries:       {d}
+        \\Bloom entries:       {d}
+        \\
+    , .{
+        data_dir,
+        m.last_finalized_block,
+        m.blocks_dat_size,
+        @as(f64, @floatFromInt(m.blocks_dat_size)) / (1024 * 1024 * 1024),
+        m.blocks_idx_count,
+        m.blooms_count,
+    });
+
+    // Pending ring span: the pre-finalization window above the finalized tip.
+    if (core.head_watch.readPending(alloc, data_dir)) |snap| {
+        var s = snap;
+        defer s.deinit(alloc);
+        if (s.entries.len > 0)
+            log.info("Pending ring:        blocks {d}..{d} ({d} blocks)\n", .{ s.entries[0].block_number, s.entries[s.entries.len - 1].block_number, s.entries.len })
+        else
+            log.info("Pending ring:        empty\n", .{});
+    } else |_| {}
+
+    // Timestamps coverage (u32 LE per block, dense from first_block).
+    var dir = std.fs.cwd().openDir(data_dir, .{}) catch return;
+    defer dir.close();
+    if (dir.statFile("timestamps.bin")) |st|
+        log.info("Timestamps:          {d} blocks covered\n", .{st.size / 4})
+    else |_|
+        log.info("Timestamps:          absent (formula fallback)\n", .{});
 }
 
 fn getFlag(args: []const [:0]u8, flag: []const u8) ?[]const u8 {
@@ -139,7 +157,7 @@ fn hasFlag(args: []const [:0]u8, flag: []const u8) bool {
     return false;
 }
 
-fn usage() void {
+fn usage() noreturn {
     log.err(
         \\Usage: emit-engine <command> [options]
         \\
@@ -156,4 +174,5 @@ fn usage() void {
         \\Global: [--silent] errors only · [--verbose] add per-step detail
         \\
     , .{});
+    std.process.exit(2);
 }
