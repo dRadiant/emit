@@ -144,8 +144,11 @@ pub fn follow(
     while (!live.stopRequested(ctx)) {
         followOnce(m, Handler, ctx, host, port, addresses, topics, decompress_buf, log_buf, &payload_buf, &live_blocks, allocator) catch |e| {
             // A fork below finality can't be recovered by reconnecting. Surface
-            // it. Everything else is a dropped connection: back off and retry.
+            // it. Everything else is a dropped connection: back off and retry,
+            // visibly. A silent retry loop reads as a healthy indexer while the
+            // engine is unreachable.
             if (e == error.ReorgExceedsFinalityDepth) return e;
+            core.log.info("remote follow: {s}, reconnecting\n", .{@errorName(e)});
             std.Thread.sleep(RECONNECT_BACKOFF_NS);
         };
     }

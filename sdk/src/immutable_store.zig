@@ -361,6 +361,50 @@ test "flushAppends + markCommitted advance the durable count" {
     try testing.expectEqual(@as(u64, 100), got.value);
 }
 
+test "crash between flushAppends and the snap commit leaves orphans invisible and overwritten" {
+    // commitCycle's ordering: events.dat append + fsync first, state.snap
+    // rename second. A crash between the two leaves orphan records past the
+    // committed count. On restart the store must not serve them through any
+    // read path, and the replayed appends must overwrite them in place.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // First run: two records flushed to disk, then "crash" before the snap
+    // commit (markCommitted never runs, the durable count stays 0).
+    {
+        var log = try event_log_mod.EventLog(E).open(testing.allocator, tmp.dir, "ev.events.dat");
+        defer log.deinit();
+        var store = try ImmutableStore(E).open(testing.allocator, &log, 0);
+        defer store.deinit();
+        try store.save(.{ .id = idKey(1, 0), .value = 100 });
+        try store.save(.{ .id = idKey(1, 1), .value = 101 });
+        try store.flushAppends();
+    }
+
+    // Restart: the snap still says zero records. The orphan tail is invisible.
+    var log = try event_log_mod.EventLog(E).open(testing.allocator, tmp.dir, "ev.events.dat");
+    defer log.deinit();
+    var store = try ImmutableStore(E).open(testing.allocator, &log, 0);
+    defer store.deinit();
+
+    var buf: [4]E = undefined;
+    try testing.expectEqual(@as(u64, 0), store.count());
+    try testing.expectEqual(@as(?E, null), try store.get(idKey(1, 0)));
+    try testing.expectEqual(@as(usize, 0), (try store.range(0, &buf)).len);
+
+    // Replay writes different values at the same positions and commits. The
+    // re-append at the stale count must overwrite the orphan bytes.
+    try store.save(.{ .id = idKey(1, 0), .value = 200 });
+    try store.save(.{ .id = idKey(1, 1), .value = 201 });
+    try store.flushAppends();
+    store.markCommitted();
+
+    const got = try store.range(0, &buf);
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expectEqual(@as(u64, 200), got[0].value);
+    try testing.expectEqual(@as(u64, 201), got[1].value);
+}
+
 test "live save buffers per block; commitBlock moves into the append queue" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();

@@ -51,13 +51,15 @@ pub const Options = struct {
     /// for chains without the canonical deployment.
     multicall_address: [20]u8 = CANONICAL_MULTICALL3,
     multicall_batch_size: usize = ethcall.DEFAULT_BATCH_SIZE,
-    /// When true, `run` and `init` block after backfill and enter the
-    /// live head-following loop. `init` never returns.
+    /// When true, `run` blocks after backfill in the live head-following
+    /// loop and `spawn` runs that loop on a background thread. `init`
+    /// backfills (including the follow gap-fill) and returns without
+    /// entering the loop.
     follow: bool = false,
     /// When set, stream the filtered backfill from a remote engine `serve`
     /// listener instead of reading a local flat store at `engine_data_dir`.
-    /// Backfill only. Live following over the stream is a separate capability,
-    /// so remote with `follow` is rejected.
+    /// With `follow`, live blocks stream over the same connection
+    /// (`tcp_client.follow`), reconnecting from the committed cursor.
     remote_engine: ?RemoteEngine = null,
 };
 
@@ -118,6 +120,8 @@ pub fn Context(comptime entities: anytype) type {
     const EventLogs = EventLogsStruct(entities);
     return struct {
         const Self = @This();
+        /// Resolved entity type list, evaluated once for every `inline for`.
+        const entity_list = resolveEntities(entities);
         pub const Snap = state_snap_mod.StateSnap(mutableCount(entities), immutableCount(entities));
 
         block_number: u64 = 0,
@@ -183,6 +187,9 @@ pub fn Context(comptime entities: anytype) type {
         /// `T` in ascending key order, returning the filled prefix. Tip-overlay
         /// aware and taken under the Context lock, so callers never lock
         /// directly. Build a newest-first page with `start = count(T) - n`.
+        /// `count` and `range` take the lock separately, so a commit between
+        /// the two can shift the page by a few records. Never incoherent data,
+        /// just a moved window. Wrap both in `lock`/`unlock` for a pinned page.
         /// Mutable entities are point-read by key via `read`.
         pub fn range(self: *Self, comptime T: type, start: u64, out: []T) ![]T {
             comptime assertImmutable(T, "range");
@@ -248,14 +255,14 @@ pub fn Context(comptime entities: anytype) type {
         pub fn commitCycle(self: *Self) !void {
             // Flush ImmutableStore appends to events.dat first. Their new
             // record counts feed the next state.snap.
-            inline for (comptime resolveEntities(entities)) |T| {
+            inline for (entity_list) |T| {
                 if (comptime T.storage == .immutable) {
                     const field_name = comptime entityFieldName(T);
                     var store = &@field(self.stores, field_name);
                     try store.flushAppends();
                 }
             }
-            inline for (comptime resolveEntities(entities)) |T| {
+            inline for (entity_list) |T| {
                 if (comptime T.storage == .immutable) {
                     const field_name = comptime entityFieldName(T);
                     var log = &@field(self._event_logs, field_name);
@@ -267,7 +274,7 @@ pub fn Context(comptime entities: anytype) type {
             var slabs: [Snap.mutable_count][]const u8 = undefined;
             var slab_bufs: [Snap.mutable_count][]u8 = undefined;
             comptime var slab_idx_init: usize = 0;
-            inline for (comptime resolveEntities(entities)) |T| {
+            inline for (entity_list) |T| {
                 if (comptime T.storage == .mutable) {
                     const field_name = comptime entityFieldName(T);
                     var store = &@field(self.stores, field_name);
@@ -282,7 +289,7 @@ pub fn Context(comptime entities: anytype) type {
             // Collect new immutable record counts.
             var counts: [Snap.immutable_count]u64 = undefined;
             comptime var count_idx_init: usize = 0;
-            inline for (comptime resolveEntities(entities)) |T| {
+            inline for (entity_list) |T| {
                 if (comptime T.storage == .immutable) {
                     const field_name = comptime entityFieldName(T);
                     const store = &@field(self.stores, field_name);
@@ -295,7 +302,7 @@ pub fn Context(comptime entities: anytype) type {
 
             // Rebind each MutableStore's slab to the new state.snap body.
             comptime var refresh_idx: usize = 0;
-            inline for (comptime resolveEntities(entities)) |T| {
+            inline for (entity_list) |T| {
                 if (comptime T.storage == .mutable) {
                     const field_name = comptime entityFieldName(T);
                     var store = &@field(self.stores, field_name);
@@ -305,7 +312,7 @@ pub fn Context(comptime entities: anytype) type {
             }
 
             // Advance each ImmutableStore's committed count.
-            inline for (comptime resolveEntities(entities)) |T| {
+            inline for (entity_list) |T| {
                 if (comptime T.storage == .immutable) {
                     const field_name = comptime entityFieldName(T);
                     var store = &@field(self.stores, field_name);
@@ -446,6 +453,7 @@ pub fn init(
     defer if (reader) |*r| r.deinit();
 
     const C = Context(entities);
+    const entity_list = comptime resolveEntities(entities);
     const ctx = try allocator.create(C);
     errdefer allocator.destroy(ctx);
 
@@ -483,17 +491,30 @@ pub fn init(
         ctx._timestamps = core.timestamps.TimestampReader.open(engine_dh) catch null;
     }
     errdefer if (ctx._timestamps) |*ts| ts.deinit();
+    // Function-scope cleanup for ownership set inside blocks below. The
+    // block-local errdefers expire when their blocks exit, so a later init
+    // failure (replay, gap-fill) must free through the ctx fields. Matters to
+    // spawn-embedding callers that catch the error and retry instead of
+    // exiting.
+    errdefer if (ctx._cache) |c| {
+        c.deinit();
+        allocator.destroy(c);
+    };
+    errdefer if (ctx._child_addresses) |set| {
+        set.deinit();
+        allocator.destroy(set);
+    };
 
     // Open every ImmutableStore's events.dat. Logs live on the Context so
     // each ImmutableStore can hold a stable pointer into the field.
-    inline for (comptime resolveEntities(entities)) |T| {
+    inline for (entity_list) |T| {
         if (comptime T.storage == .immutable) {
             const field_name = comptime entityFieldName(T);
             const log_file_name = comptime field_name ++ ".events.dat";
             @field(ctx._event_logs, field_name) = try event_log_mod.EventLog(T).open(allocator, entity_dh, log_file_name);
         }
     }
-    errdefer inline for (comptime resolveEntities(entities)) |T| {
+    errdefer inline for (entity_list) |T| {
         if (comptime T.storage == .immutable) {
             const field_name = comptime entityFieldName(T);
             @field(ctx._event_logs, field_name).deinit();
@@ -544,11 +565,8 @@ pub fn init(
             ctx.stats.discovered_children = discovered.count();
 
             if (discovered.count() > 0) {
-                const child_addrs = try allocator.alloc([20]u8, discovered.count());
+                const child_addrs = try keysToSlice(&discovered, allocator);
                 defer allocator.free(child_addrs);
-                var i: usize = 0;
-                var it = discovered.keyIterator();
-                while (it.next()) |addr| : (i += 1) child_addrs[i] = addr.*;
 
                 const child_result = try filter_builder.appendChildren(
                     &reader.?,
@@ -597,7 +615,7 @@ pub fn init(
     {
         comptime var mut_slot: usize = 0;
         comptime var imm_slot: usize = 0;
-        inline for (comptime resolveEntities(entities)) |T| {
+        inline for (entity_list) |T| {
             const field_name = comptime entityFieldName(T);
             if (comptime T.storage == .mutable) {
                 @field(ctx.stores, field_name) = mutable_store_mod.MutableStore(T).open(
@@ -692,11 +710,8 @@ fn followGapFill(
             var it = gap_children.keyIterator();
             while (it.next()) |addr| try set.put(addr.*, {});
             if (set.count() > 0) {
-                const addrs = try allocator.alloc([20]u8, set.count());
+                const addrs = try keysToSlice(set, allocator);
                 defer allocator.free(addrs);
-                var i: usize = 0;
-                var ks = set.keyIterator();
-                while (ks.next()) |a| : (i += 1) addrs[i] = a.*;
                 const cres = try filter_builder.appendChildrenBlocks(&gap_reader, m, addrs, gap_from, engine_last, filter_dh, allocator);
                 try requireCompleteFilter("follow gap-fill children", cres);
             }
@@ -918,11 +933,8 @@ fn remoteBackfill(
         ctx.stats.discovered_children = discovered.count();
 
         if (discovered.count() > 0 and child_topics.len > 0) {
-            const child_addrs = try allocator.alloc([20]u8, discovered.count());
+            const child_addrs = try keysToSlice(&discovered, allocator);
             defer allocator.free(child_addrs);
-            var i: usize = 0;
-            var it = discovered.keyIterator();
-            while (it.next()) |a| : (i += 1) child_addrs[i] = a.*;
 
             ctx.stats.children_blocks_matched = try streamInto(
                 re,
@@ -939,6 +951,15 @@ fn remoteBackfill(
         // moves to ctx, freed by Context.deinit.
         try setChildAddresses(C, ctx, allocator, discovered);
     }
+}
+
+/// Copy a `[20]u8` key set into a freshly-allocated slice. Caller frees.
+fn keysToSlice(set: *const std.AutoHashMap([20]u8, void), allocator: std.mem.Allocator) ![][20]u8 {
+    const out = try allocator.alloc([20]u8, set.count());
+    var i: usize = 0;
+    var it = set.keyIterator();
+    while (it.next()) |a| : (i += 1) out[i] = a.*;
+    return out;
 }
 
 /// Move `discovered` onto the heap and hand ownership to `ctx`. The set has
