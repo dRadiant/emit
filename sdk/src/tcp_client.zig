@@ -268,7 +268,9 @@ fn dispatchPush(
     allocator: std.mem.Allocator,
 ) !void {
     const decoded = try core.log_serial.decompressEntry(p.lz4_entry, decompress_buf);
-    const log_count = core.log_serial.deserializeLogs(decoded, log_buf);
+    // Untrusted network input. The bounds-checked parse rejects a forged frame
+    // (error propagates to follow's reconnect) instead of an OOB in ReleaseFast.
+    const log_count = try core.log_serial.deserializeLogsChecked(decoded, log_buf);
     for (log_buf[0..log_count]) |*log| log.block_number = p.block_number;
 
     // Factory children spawned in this block. Their same-block events were
