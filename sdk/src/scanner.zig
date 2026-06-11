@@ -70,8 +70,11 @@ pub fn scanCreations(
     var i: u64 = 0;
     while (i < primary.count()) : (i += 1) {
         const entry = try primary.readEntry(i);
-        const payload = primary.readPayload(i, payload_buf) catch continue;
-        const decoded = log_serial.decompressEntry(payload, decompress_buf) catch continue;
+        // A corrupt entry here would silently drop a factory child spawned in
+        // this block. The filtered store is engine-written and atomic-committed,
+        // so a read or decompress failure is real corruption: fail loud.
+        const payload = try primary.readPayload(i, payload_buf);
+        const decoded = try log_serial.decompressEntry(payload, decompress_buf);
         const log_count = log_serial.deserializeLogs(decoded, log_buf);
 
         for (log_buf[0..log_count]) |*log| {
@@ -153,8 +156,8 @@ pub fn replay(
         (if (children) |c| c.store.count() else 0);
 
     while (true) {
-        const next_p: ?u64 = if (primary) |p| p.peek() else null;
-        const next_c: ?u64 = if (children) |c| c.peek() else null;
+        const next_p: ?u64 = if (primary) |p| try p.peek() else null;
+        const next_c: ?u64 = if (children) |c| try c.peek() else null;
         if (next_p == null and next_c == null) break;
 
         const block_number = pickMin(next_p, next_c);
@@ -288,10 +291,12 @@ const CursorWalker = struct {
         self.store.deinit();
     }
 
-    fn peek(self: *CursorWalker) ?u64 {
+    fn peek(self: *CursorWalker) !?u64 {
         if (self.next_index >= self.store.count()) return null;
         if (self.peeked == null) {
-            self.peeked = self.store.readEntry(self.next_index) catch return null;
+            // A read failure here is corruption, not end of stream. Propagate so
+            // replay fails loud instead of silently truncating the dispatch.
+            self.peeked = try self.store.readEntry(self.next_index);
         }
         return self.peeked.?.block_number;
     }
