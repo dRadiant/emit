@@ -35,6 +35,10 @@ const GAP_REFUSE_THRESHOLD: u64 = 1000;
 /// so a half-open connection reconnects instead of hanging forever.
 const WS_READ_TIMEOUT_S: u32 = 60;
 
+/// Liveness heartbeat cadence. Finalization advances about one block per 12s,
+/// so a log per 300 finalized blocks is roughly hourly
+const HEARTBEAT_BLOCKS: u64 = 300;
+
 /// Best-effort SO_RCVTIMEO so a blocking read returns instead of hanging on a
 /// silent socket. A failure leaves the prior blocking behavior.
 fn setReadTimeout(handle: std.posix.socket_t, seconds: u32) void {
@@ -99,6 +103,7 @@ pub fn run(config: FollowConfig) !void {
 
     // Prefer WebSocket. On connect failure or a dropped stream, fall back to one
     // poll cycle and reconnect, rather than degrading to HTTP polling forever.
+    var poll_fails: u32 = 0;
     while (true) {
         if (config.ws_url) |ws_url| ws: {
             core.log.info("Connecting to {s}...\n", .{ws_url});
@@ -117,9 +122,19 @@ pub fn run(config: FollowConfig) !void {
 
         // One poll cycle. The only mode when --ws is absent, a stopgap between
         // WS reconnects otherwise. A healthy WS never returns, so this is skipped.
+        var poll_ok = true;
         followPoll(&provider, &writer, &ring, alloc, if (ts_writer) |*w| w else null) catch |err| {
-            core.log.debug("Poll error: {s}\n", .{@errorName(err)});
+            poll_ok = false;
+            poll_fails += 1;
+            // Visible at the default level on the first failure and periodically
+            // after, so a node that went away is not silently invisible.
+            if (poll_fails == 1 or poll_fails % 60 == 0)
+                core.log.info("Poll failing: {s} ({d} consecutive)\n", .{ @errorName(err), poll_fails });
         };
+        if (poll_ok and poll_fails > 0) {
+            core.log.info("Poll recovered after {d} failures\n", .{poll_fails});
+            poll_fails = 0;
+        }
         std.Thread.sleep(config.poll_interval_ms * std.time.ns_per_ms);
     }
 }
@@ -324,6 +339,7 @@ fn finalizeReady(
 ) void {
     var popped_count: u32 = 0;
     var finalized: u32 = 0;
+    const start_finalized = writer.meta.last_finalized_block;
     while (ring.canFinalize(head)) {
         const oldest = ring.peekOldest() orelse break;
         const pre = writer.meta.last_finalized_block;
@@ -351,6 +367,11 @@ fn finalizeReady(
     // doesn't keep re-presenting the same finalized blocks.
     if (popped_count > 0) ring.flush() catch {};
     if (finalized > 0) core.log.debug("Finalized {d} blocks\n", .{finalized});
+
+    // Fire once per HEARTBEAT_BLOCKS of finalization, on the boundary crossing so jumps never skip it.
+    const tip = writer.meta.last_finalized_block;
+    if (start_finalized > 0 and tip / HEARTBEAT_BLOCKS != start_finalized / HEARTBEAT_BLOCKS)
+        core.log.info("Following: finalized through block {d}\n", .{tip});
 }
 
 fn toRawLog(log: eth.receipt.Log, block_number: u64, alloc: std.mem.Allocator) !types.RawLog {
