@@ -84,6 +84,11 @@ pub fn ReadPipeline(comptime QUEUE_DEPTH: u32) type {
         }
 
         pub fn waitAtLeastOne(self: *Self, out: []*Completion) !usize {
+            // copy_cqes drains up to QUEUE_DEPTH completions from the ring. A
+            // smaller `out` would silently discard the surplus: `in_flight`
+            // never decremented, slots never released, the next wait blocks
+            // forever.
+            std.debug.assert(out.len >= QUEUE_DEPTH);
             var cqes: [QUEUE_DEPTH]linux.io_uring_cqe = undefined;
             const wait_nr: u32 = if (self.in_flight > 0) 1 else 0;
             const n = try self.ring.copy_cqes(&cqes, wait_nr);
@@ -103,4 +108,70 @@ pub fn ReadPipeline(comptime QUEUE_DEPTH: u32) type {
             return self.bufs[c.buf_slot][0..bytes];
         }
     };
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "pipeline round-trips submitted reads and recycles slots" {
+    if (!supported) return;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try tmp.dir.createFile("blocks.dat", .{ .read = true });
+    defer file.close();
+    // Two entries at known offsets, lengths chosen to differ.
+    try file.writeAll("aaaaaaaa" ++ "bbbbbbbbbbbb");
+
+    const P = ReadPipeline(4);
+    var p = try P.init(testing.allocator, file.handle);
+    defer p.deinit();
+
+    // Claim every slot, the stack must then be exhausted.
+    const s0 = p.claimSlot().?;
+    const s1 = p.claimSlot().?;
+    const s2 = p.claimSlot().?;
+    const s3 = p.claimSlot().?;
+    try testing.expectEqual(@as(?u16, null), p.claimSlot());
+    p.releaseSlot(s2);
+    p.releaseSlot(s3);
+
+    try p.submit(s0, 100, 0, 8);
+    try p.submit(s1, 101, 8, 12);
+    _ = try p.flush();
+
+    var done: usize = 0;
+    var out: [4]*Completion = undefined;
+    while (done < 2) {
+        const n = try p.waitAtLeastOne(&out);
+        for (out[0..n]) |c| {
+            if (c.block_number == 100) {
+                try testing.expectEqualStrings("aaaaaaaa", p.getBuffer(c));
+            } else {
+                try testing.expectEqual(@as(u64, 101), c.block_number);
+                try testing.expectEqualStrings("bbbbbbbbbbbb", p.getBuffer(c));
+            }
+            p.releaseSlot(c.buf_slot);
+            done += 1;
+        }
+    }
+
+    // Every completion decremented in_flight and every slot recycled.
+    try testing.expectEqual(@as(u32, 0), p.in_flight);
+    for (0..4) |_| try testing.expect(p.claimSlot() != null);
+}
+
+test "submit rejects an entry larger than the slot buffer" {
+    if (!supported) return;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile("blocks.dat", .{ .read = true });
+    defer file.close();
+
+    const P = ReadPipeline(2);
+    var p = try P.init(testing.allocator, file.handle);
+    defer p.deinit();
+    const slot = p.claimSlot().?;
+    try testing.expectError(error.EntryExceedsBuffer, p.submit(slot, 1, 0, types.BLOCK_BUF_SIZE + 1));
 }

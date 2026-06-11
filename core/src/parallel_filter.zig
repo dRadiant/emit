@@ -362,3 +362,52 @@ test "dedupAdjacent collapses runs of equal block numbers" {
     dedupAdjacent(&list);
     try testing.expectEqualSlices(u64, &.{ 100, 101, 102, 103 }, list.items);
 }
+
+test "run crosses a chunk boundary with a globally ascending sink" {
+    // CHUNK_BLOCKS + 100 matching blocks force two filterChunk calls. The
+    // sink asserts strict ascent across the seam and the final count proves
+    // no block is lost or duplicated at the boundary. Pins the invariant the
+    // FilteredStore append and the TCP PUSH stream both depend on.
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const ADDR = [_]u8{0xAB} ** 20;
+    const TOPIC = [_]u8{0xCD} ** 32;
+    const total: usize = CHUNK_BLOCKS + 100;
+
+    const logs = [_]flat_reader.TestLog{.{ .address = ADDR, .topic0 = TOPIC }};
+    const blocks = try alloc.alloc(flat_reader.TestBlock, total);
+    defer alloc.free(blocks);
+    for (blocks, 0..) |*b, i| b.* = .{ .block_number = i + 1, .logs = &logs };
+    try flat_reader.writeTestStore(tmp.dir, blocks, alloc);
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpath(".", &path_buf);
+    var reader = try FlatStoreReader.open(path);
+    defer reader.deinit();
+
+    const Sink = struct {
+        alloc: std.mem.Allocator,
+        seen: std.ArrayListUnmanaged(u64) = .{},
+        pub fn emit(self: *@This(), block_number: u64, entry: []const u8, log_count: u32) !void {
+            _ = entry;
+            if (log_count != 1) return error.WrongLogCount;
+            if (self.seen.items.len > 0 and block_number <= self.seen.items[self.seen.items.len - 1])
+                return error.OutOfOrder;
+            try self.seen.append(self.alloc, block_number);
+        }
+    };
+    var sink = Sink{ .alloc = alloc };
+    defer sink.seen.deinit(alloc);
+
+    const addrs = [_][20]u8{ADDR};
+    const topics = [_][32]u8{TOPIC};
+    const filter: Filter = .{ .match_addrs = &addrs, .match_topics = &topics, .exclude_addrs = &.{} };
+    const r = try run(&reader, &addrs, filter, 1, total, Sink, &sink, alloc);
+
+    try testing.expectEqual(@as(u64, 0), r.dropped_blocks);
+    try testing.expectEqual(@as(usize, total), sink.seen.items.len);
+    try testing.expectEqual(@as(u64, 1), sink.seen.items[0]);
+    try testing.expectEqual(@as(u64, total), sink.seen.items[sink.seen.items.len - 1]);
+}
