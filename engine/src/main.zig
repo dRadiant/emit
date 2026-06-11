@@ -63,15 +63,26 @@ pub fn main() !void {
                 &.{ "rocksdb-import", rocksdb_path, data_dir, "--rpc", rpc_url }
             else
                 &.{ "rocksdb-import", rocksdb_path, data_dir };
-            const result = std.process.Child.run(.{
-                .allocator = alloc,
-                .argv = argv,
-            });
-            if (result) |r| {
-                if (r.stdout.len > 0) log.info("{s}", .{r.stdout});
-                if (r.stderr.len > 0) log.info("{s}", .{r.stderr});
-            } else |_| {
-                log.err("Failed to exec rocksdb-import. Build it with: zig build import\n", .{});
+            // Inherit stdio so the importer's progress streams live. `Child.run`
+            // buffered output into a 50 KB pipe, which a full import overflows
+            // (then surfaced as a spawn failure), and it never checked the exit
+            // status, so a failed import looked successful.
+            var child = std.process.Child.init(argv, alloc);
+            child.stdout_behavior = .Inherit;
+            child.stderr_behavior = .Inherit;
+            const term = child.spawnAndWait() catch |err| {
+                log.err("Failed to exec rocksdb-import ({s}). Build it with: zig build import\n", .{@errorName(err)});
+                return error.RocksdbImportFailed;
+            };
+            switch (term) {
+                .Exited => |code| if (code != 0) {
+                    log.err("rocksdb-import exited with code {d}\n", .{code});
+                    return error.RocksdbImportFailed;
+                },
+                else => {
+                    log.err("rocksdb-import terminated abnormally\n", .{});
+                    return error.RocksdbImportFailed;
+                },
             }
             return;
         }
