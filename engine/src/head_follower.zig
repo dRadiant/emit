@@ -498,3 +498,79 @@ test "catch-up finalizes as it ingests so the ring stays within FINALITY_DEPTH" 
     try std.testing.expect(ring2.count() <= pending_ring.FINALITY_DEPTH);
     try std.testing.expectEqual(last, ring2.latestBlock().?);
 }
+
+// Mock chain for resolveReorg tests: canonical hashes indexed by block number.
+// Satisfies the `getBlock(u64) !?Header` shape resolveReorg requires.
+const MockChain = struct {
+    base: u64,
+    hashes: []const [32]u8,
+    fail_at: ?u64 = null,
+
+    pub fn getBlock(self: *MockChain, n: u64) !?struct { hash: [32]u8 } {
+        if (self.fail_at) |f| if (n == f) return error.RpcUnavailable;
+        return .{ .hash = self.hashes[@intCast(n - self.base)] };
+    }
+};
+
+const reorg_test = struct {
+    const topic = [_]u8{0} ** core.bloom.BLOOM_SIZE;
+    const addr = [_]u8{0} ** core.bloom.ADDR_BLOOM_SIZE;
+    const entry = [_]u8{ 0, 0, 0, 0 }; // packed payload, log_count = 0
+    const old_hash = [_]u8{0xAA} ** 32;
+    const new_hash = [_]u8{0xBB} ** 32;
+
+    fn ringOf(dir: std.fs.Dir, alloc: std.mem.Allocator) !PendingRing {
+        var ring = try PendingRing.open(dir, alloc);
+        errdefer ring.deinit();
+        for (100..110) |bn| try ring.insert(bn, 0, old_hash, &topic, &addr, &entry);
+        return ring;
+    }
+};
+
+test "resolveReorg truncates to the verified fork point" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ring = try reorg_test.ringOf(tmp.dir, std.testing.allocator);
+    defer ring.deinit();
+
+    // Canonical chain: 100..105 unchanged, 106..109 replaced.
+    var hashes: [10][32]u8 = undefined;
+    for (&hashes, 0..) |*h, i| h.* = if (i <= 5) reorg_test.old_hash else reorg_test.new_hash;
+    var chain = MockChain{ .base = 100, .hashes = &hashes };
+
+    const fork = try resolveReorg(&ring, 109, &chain);
+    try std.testing.expectEqual(@as(u64, 106), fork);
+    try std.testing.expectEqual(@as(u64, 105), ring.latestBlock().?);
+}
+
+test "resolveReorg propagates a canonical fetch failure without truncating" {
+    // Regression: a swallowed fetch error used to shorten the canonical
+    // window, pick a too-high fork, and orphan-finalize blocks below it.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ring = try reorg_test.ringOf(tmp.dir, std.testing.allocator);
+    defer ring.deinit();
+
+    var hashes: [10][32]u8 = undefined;
+    for (&hashes) |*h| h.* = reorg_test.new_hash;
+    var chain = MockChain{ .base = 100, .hashes = &hashes, .fail_at = 107 };
+
+    try std.testing.expectError(error.RpcUnavailable, resolveReorg(&ring, 109, &chain));
+    try std.testing.expectEqual(@as(u64, 109), ring.latestBlock().?);
+}
+
+test "resolveReorg refuses a divergence deeper than the ring" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ring = try reorg_test.ringOf(tmp.dir, std.testing.allocator);
+    defer ring.deinit();
+
+    // Every fetched canonical hash mismatches: the true fork is below the
+    // ring's oldest entry. Guessing would orphan-finalize, so it must error.
+    var hashes: [10][32]u8 = undefined;
+    for (&hashes) |*h| h.* = reorg_test.new_hash;
+    var chain = MockChain{ .base = 100, .hashes = &hashes };
+
+    try std.testing.expectError(error.ReorgExceedsRing, resolveReorg(&ring, 109, &chain));
+    try std.testing.expectEqual(@as(u64, 109), ring.latestBlock().?);
+}
