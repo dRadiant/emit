@@ -8,6 +8,7 @@
 //! shown only under `--verbose`. The level is a write-once-at-startup global,
 //! read-only for the run, so there is no synchronization concern.
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const Level = enum(u8) {
     /// Errors only. For scripted / CI runs.
@@ -18,7 +19,9 @@ pub const Level = enum(u8) {
     verbose = 2,
 };
 
-var level: Level = .normal;
+/// Test binaries default to silent so suite output carries only failures.
+/// Level-behavior tests set and restore the level explicitly.
+var level: Level = if (builtin.is_test) .silent else .normal;
 
 pub fn setLevel(l: Level) void {
     level = l;

@@ -65,7 +65,7 @@ pub fn main() !void {
     router.get("/allowance/:owner/:spender", allowance, .{});
     router.get("/transfers", transfers, .{});
 
-    std.debug.print("erc20-api serving on http://127.0.0.1:{d}\n", .{port});
+    sdk.log.info("erc20-api serving on http://127.0.0.1:{d}\n", .{port});
     try server.listen();
 }
 

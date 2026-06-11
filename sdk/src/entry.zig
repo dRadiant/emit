@@ -103,6 +103,82 @@ pub const RunStats = struct {
     elapsed_ns: u64 = 0,
 };
 
+/// Render the full stats block at info level. Shown automatically under
+/// `--verbose` at run completion. Default runs get a one-line summary
+/// instead. Factory fields read zero for non-factory indexers, kept visible
+/// so users can confirm no children were unexpectedly discovered.
+pub fn printStats(prog_name: []const u8, stats: RunStats) void {
+    const ms = std.time.ns_per_ms;
+    const phases = stats.filter_build_ns + stats.scan_creations_ns + stats.append_children_ns + stats.prefetch_ns + stats.replay_ns;
+    const overhead_ns = if (stats.elapsed_ns > phases) stats.elapsed_ns - phases else 0;
+    // Batch count derived from executed pairs and the default Multicall3
+    // chunk. Exact count would need the per-run override routed through stats.
+    const batches = (stats.prefetch_calls_executed + ethcall.DEFAULT_BATCH_SIZE - 1) / ethcall.DEFAULT_BATCH_SIZE;
+    core.log.info(
+        \\{s} indexer complete
+        \\  start block:       {d}
+        \\  end block:         {d}
+        \\  blocks scanned:    {d}
+        \\  blocks matched:    {d}
+        \\  filter logs:       {d}
+        \\  discovered child:  {d}
+        \\  child blocks:      {d}
+        \\  child logs:        {d}
+        \\  logs dispatched:   {d}
+        \\  blocks dispatched: {d}
+        \\  commits:           {d}
+        \\  phases skipped:    {}
+        \\  prefetch gathered: {d}
+        \\  prefetch executed: {d}
+        \\  prefetch batches:  {d}
+        \\  ── timing ──
+        \\  filter build:      {d} ms
+        \\  scan creations:    {d} ms
+        \\  append children:   {d} ms
+        \\  prefetch:          {d} ms
+        \\  replay:            {d} ms
+        \\  overhead:          {d} ms
+        \\  elapsed:           {d} ms
+        \\
+    , .{
+        prog_name,
+        stats.start_block,
+        stats.end_block,
+        stats.filter_blocks_scanned,
+        stats.filter_blocks_matched,
+        stats.filter_total_logs,
+        stats.discovered_children,
+        stats.children_blocks_matched,
+        stats.children_total_logs,
+        stats.logs_dispatched,
+        stats.blocks_dispatched,
+        stats.commits_performed,
+        stats.phases_skipped,
+        stats.prefetch_calls_gathered,
+        stats.prefetch_calls_executed,
+        batches,
+        stats.filter_build_ns / ms,
+        stats.scan_creations_ns / ms,
+        stats.append_children_ns / ms,
+        stats.prefetch_ns / ms,
+        stats.replay_ns / ms,
+        overhead_ns / ms,
+        stats.elapsed_ns / ms,
+    });
+}
+
+/// Backfill-completion announcement for the blocking entry points that never
+/// return (`run --follow`, `spawn`). One line at the default level, the full
+/// stats block under `--verbose`. Backfill-only `run` returns stats and the
+/// caller owns the print.
+fn announceBackfill(comptime m: sdk_manifest.Manifest, stats: RunStats) void {
+    if (core.log.getLevel() == .verbose)
+        printStats(m.name, stats)
+    else
+        core.log.info("{s}: backfill done in {d} ms ({d} logs dispatched)\n", .{ m.name, stats.elapsed_ns / std.time.ns_per_ms, stats.logs_dispatched });
+    core.log.info("{s}: following the chain head\n", .{m.name});
+}
+
 /// Comptime-generate the long-lived context type. `entities` is the user's
 /// tuple of entity types, each declaring
 /// `pub const storage: sdk.StorageMode = .mutable | .immutable;`.
@@ -398,7 +474,10 @@ pub fn run(
     defer ctx.deinit();
     // Headless follow runs the live loop inline on this thread (blocks forever
     // under normal operation). Backfill-only (`follow = false`) returns stats.
-    if (options.follow) try followLoop(m, Handler, ctx, options);
+    if (options.follow) {
+        announceBackfill(m, ctx.stats);
+        try followLoop(m, Handler, ctx, options);
+    }
     return ctx.stats;
 }
 
@@ -420,8 +499,8 @@ pub fn init(
 
     var timer = try std.time.Timer.start();
 
-    // Banner and per-phase progress are verbose-only, so normal and silent
-    // runs (and the test suite) stay quiet.
+    // Banner is verbose-only. Per-phase progress prints at the default level
+    // (the test suite stays quiet via the is_test silent default).
     core.log.debug(
         \\
         \\   ███████ ███    ███ ██ ████████
@@ -477,7 +556,7 @@ pub fn init(
     if (reader) |r| {
         ctx.stats.start_block = r.first_block;
         ctx.stats.end_block = if (r.index_count == 0) r.first_block else r.first_block + r.index_count - 1;
-        core.log.debug("  indexing blocks {d} → {d}\n", .{ ctx.stats.start_block, ctx.stats.end_block });
+        core.log.info("  indexing blocks {d} → {d}\n", .{ ctx.stats.start_block, ctx.stats.end_block });
     }
 
     // Open the engine's per-block timestamp index if present. Absence (older
@@ -534,7 +613,7 @@ pub fn init(
         try writeFilterFingerprint(filter_dh, fp);
     } else if (shouldSkipFilterBuild(filter_dh, allocator, fp)) {
         ctx.stats.phases_skipped = true;
-        core.log.debug("  reusing filtered index, skipping build\n", .{});
+        core.log.info("  reusing filtered index, skipping build\n", .{});
         // Even with the filter reused, factory children must be rediscovered
         // so the live address gate admits them. The primary store always
         // holds the factory create-events, so scanCreations rebuilds the same
@@ -782,6 +861,7 @@ pub fn spawn(
     opts.follow = true;
     const ctx = try init(m, Handler, entities, opts, allocator);
     errdefer ctx.deinit();
+    announceBackfill(m, ctx.stats);
 
     const Ctx = Context(entities);
     const Thunk = struct {
@@ -921,7 +1001,7 @@ fn remoteBackfill(
             if (store.count() > 0) {
                 ctx.stats.start_block = (try store.readEntry(0)).block_number;
                 ctx.stats.end_block = (try store.readEntry(store.count() - 1)).block_number;
-                core.log.debug("  indexing blocks {d} → {d}\n", .{ ctx.stats.start_block, ctx.stats.end_block });
+                core.log.info("  indexing blocks {d} → {d}\n", .{ ctx.stats.start_block, ctx.stats.end_block });
             }
         }
     }

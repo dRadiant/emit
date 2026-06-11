@@ -50,6 +50,7 @@ pub const PrefetchDef = manifest.PrefetchDef;
 pub const run = entry.run;
 pub const spawn = entry.spawn;
 pub const RunStats = entry.RunStats;
+pub const printStats = entry.printStats;
 pub const StaticCall = manifest.StaticCall;
 /// Leveled CLI output, shared with the engine. Set via `log.setLevel` from the
 /// indexer's `--silent` / `--verbose` flags.

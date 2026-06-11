@@ -38,6 +38,10 @@ pub const RunOptions = struct {
     multicall_batch_size: usize = ethcall.DEFAULT_BATCH_SIZE,
 };
 
+/// Liveness heartbeat cadence in finalized blocks. ~300 × 12 s ≈ hourly,
+/// matching the engine follower's cadence.
+const HEARTBEAT_BLOCKS: u64 = 300;
+
 /// Resources that persist across ticks: watcher, last-seen pending
 /// snapshot, per-block decompress + log buffers. Held here so `tick`
 /// doesn't reallocate per call. `run` constructs one session and loops.
@@ -121,7 +125,14 @@ const LiveSession = struct {
         // Promote first so a finalized block's overlay slice is committed
         // through state.snap before this tick's dispatches could overwrite
         // its tag.
+        const cursor_before = cursorOf(ctx);
         try promoteFinalized(ctx, classification.finalized);
+
+        // Liveness heartbeat on a finalization boundary crossing, mirroring
+        // the engine's cadence, so a default-level follow is visibly alive.
+        const cursor_after = cursorOf(ctx);
+        if (cursor_before > 0 and cursor_before / HEARTBEAT_BLOCKS != cursor_after / HEARTBEAT_BLOCKS)
+            core.log.info("{s}: finalized through block {d}\n", .{ m.name, cursor_after });
 
         if (classification.reorg_from != null or classification.reorged_out.len > 0) {
             if (classification.reorg_from) |rf| {

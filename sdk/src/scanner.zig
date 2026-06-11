@@ -151,9 +151,9 @@ pub fn replay(
     const log_buf_children = if (has_children) try allocator.alloc(RawLog, types.MAX_LOGS_PER_BLOCK) else &[_]RawLog{};
     defer if (has_children) allocator.free(log_buf_children);
 
-    // Verbose-only live counter. `show_progress` short-circuits the per-block
-    // mask test off the hot path when the level is normal or silent.
-    const show_progress = core.log.getLevel() == .verbose;
+    // Default-level live counter. `show_progress` short-circuits the per-block
+    // mask test off the hot path when the level is silent.
+    const show_progress = core.log.getLevel() != .silent;
     const total_blocks: u64 = (if (primary) |p| p.store.count() else 0) +
         (if (children) |c| c.store.count() else 0);
 
@@ -207,7 +207,7 @@ pub fn replay(
         ctx.timestamp = if (block_ts != 0) @as(u64, block_ts) else humanize.timestampOf(ctx, block_number);
         result.blocks_dispatched += 1;
         if (show_progress and (result.blocks_dispatched & 0x3FFF) == 0)
-            core.log.debug("\r  replaying {d}/{d} blocks", .{ result.blocks_dispatched, total_blocks });
+            core.log.info("\r  replaying {d}/{d} blocks", .{ result.blocks_dispatched, total_blocks });
 
         for (logs) |log| {
             try handler_mod.dispatchLog(m, Handler, ctx, log);
@@ -226,7 +226,7 @@ pub fn replay(
     }
 
     if (show_progress and total_blocks > 0)
-        core.log.debug("\r  replaying {d}/{d} blocks\n", .{ result.blocks_dispatched, total_blocks });
+        core.log.info("\r  replaying {d}/{d} blocks\n", .{ result.blocks_dispatched, total_blocks });
 
     result.elapsed_ns = timer.read();
     return result;

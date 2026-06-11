@@ -109,12 +109,12 @@ pub fn run(
         const end = @min(off + CHUNK_BLOCKS, matching.items.len);
         try filterChunk(reader, filt, matching.items[off..end], Sink, sink, &result, allocator);
         off = end;
-        // Live progress (verbose only): a `\r` line that ticks per chunk. The
-        // gate is a single int compare on the normal/silent path, so the
+        // Live progress at the default level: a `\r` line that ticks per
+        // chunk. The gate is a single int compare under --silent, so the
         // 2M-events/s build is untouched.
-        log.debug("\r  filtering {d}/{d} matching blocks", .{ off, matching.items.len });
+        log.info("\r  filtering {d}/{d} matching blocks", .{ off, matching.items.len });
     }
-    if (matching.items.len > 0) log.debug("\n", .{});
+    if (matching.items.len > 0) log.info("\n", .{});
 
     result.elapsed_ns = timer.read();
     return result;

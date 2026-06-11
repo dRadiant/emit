@@ -121,68 +121,9 @@ pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8, pa
     };
 }
 
-/// Canonical RunStats printout covering both factory and non-factory
-/// manifests. Factory fields read zero for non-factory indexers, kept
-/// visible so users can confirm no children were unexpectedly discovered.
-pub fn printStats(prog_name: []const u8, stats: sdk.RunStats) void {
-    const ms = std.time.ns_per_ms;
-    const phases = stats.filter_build_ns + stats.scan_creations_ns + stats.append_children_ns + stats.prefetch_ns + stats.replay_ns;
-    const overhead_ns = if (stats.elapsed_ns > phases) stats.elapsed_ns - phases else 0;
-    // Batch count derived from executed pairs and the default Multicall3
-    // chunk. Exact count would need the per-run override routed through stats.
-    const batches = (stats.prefetch_calls_executed + sdk.DEFAULT_BATCH_SIZE - 1) / sdk.DEFAULT_BATCH_SIZE;
-    sdk.log.info(
-        \\{s} indexer complete
-        \\  start block:       {d}
-        \\  end block:         {d}
-        \\  blocks scanned:    {d}
-        \\  blocks matched:    {d}
-        \\  filter logs:       {d}
-        \\  discovered child:  {d}
-        \\  child blocks:      {d}
-        \\  child logs:        {d}
-        \\  logs dispatched:   {d}
-        \\  blocks dispatched: {d}
-        \\  commits:           {d}
-        \\  phases skipped:    {}
-        \\  prefetch gathered: {d}
-        \\  prefetch executed: {d}
-        \\  prefetch batches:  {d}
-        \\  ── timing ──
-        \\  filter build:      {d} ms
-        \\  scan creations:    {d} ms
-        \\  append children:   {d} ms
-        \\  prefetch:          {d} ms
-        \\  replay:            {d} ms
-        \\  overhead:          {d} ms
-        \\  elapsed:           {d} ms
-        \\
-    , .{
-        prog_name,
-        stats.start_block,
-        stats.end_block,
-        stats.filter_blocks_scanned,
-        stats.filter_blocks_matched,
-        stats.filter_total_logs,
-        stats.discovered_children,
-        stats.children_blocks_matched,
-        stats.children_total_logs,
-        stats.logs_dispatched,
-        stats.blocks_dispatched,
-        stats.commits_performed,
-        stats.phases_skipped,
-        stats.prefetch_calls_gathered,
-        stats.prefetch_calls_executed,
-        batches,
-        stats.filter_build_ns / ms,
-        stats.scan_creations_ns / ms,
-        stats.append_children_ns / ms,
-        stats.prefetch_ns / ms,
-        stats.replay_ns / ms,
-        overhead_ns / ms,
-        stats.elapsed_ns / ms,
-    });
-}
+/// Canonical RunStats printout, owned by the SDK so blocking entry points
+/// (`run --follow`, `spawn`) can render it before entering the live loop.
+pub const printStats = sdk.printStats;
 
 /// All-in-one: GPA, parse args, run, print stats. Returns the wrapped
 /// error if anything fails before stats print.
@@ -219,7 +160,11 @@ pub fn run(
         .remote_engine = args.remote_engine,
     }, allocator);
 
-    // Unreachable under `--follow`. sdk.run enters the live loop and never
-    // returns. Reaching here means backfill-only completed.
-    printStats(manifest.name, stats);
+    // Unreachable under `--follow` (sdk.run announces completion itself and
+    // never returns). Reaching here means backfill-only completed: one line
+    // by default, the full stats block under --verbose.
+    if (sdk.log.getLevel() == .verbose)
+        printStats(manifest.name, stats)
+    else
+        sdk.log.info("{s}: done in {d} ms ({d} logs dispatched)\n", .{ manifest.name, stats.elapsed_ns / std.time.ns_per_ms, stats.logs_dispatched });
 }
