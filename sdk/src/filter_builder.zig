@@ -13,6 +13,11 @@
 ///       AND (address ∉ filter.exclude_addrs)
 /// Phase 1 leaves exclude_addrs empty. Phase 3 sets it to static∪factory so a
 /// static contract that's also a factory child does not appear in both pairs.
+///
+/// The rule matches manifest-level sets, not per-contract pairs. A declared
+/// address emitting another contract's topic is kept (cross product). Dispatch
+/// owns per-contract scoping via the comptime emitter gate in `handler.zig`,
+/// so the over-inclusion costs index bytes, never a mis-dispatched handler.
 const std = @import("std");
 
 const core = @import("core");

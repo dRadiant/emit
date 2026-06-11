@@ -380,10 +380,13 @@ pub fn Log(comptime E: type) type {
 /// in one step. Backfill (`scanner.replay`) and live mode share this single
 /// per-log path.
 ///
-/// Routes by topic0 only, does NOT gate by emitter address. Callers feeding
-/// *untrusted* logs (the live path's raw pending blocks) MUST pre-filter by
-/// address first. Backfill is safe because `filter_builder` already pruned
-/// non-matching addresses before the filtered store was written.
+/// Routes by topic0, then applies the comptime per-contract gate so a known
+/// static address that did not declare the event never reaches its handler
+/// (`dispatchGateNeeded`). The gate refines which declared handler fires, it
+/// does not admit addresses. Callers feeding *untrusted* logs (the live path's
+/// raw pending blocks) MUST still pre-filter by address. Backfill is safe
+/// because `filter_builder` already pruned non-matching addresses before the
+/// filtered store was written.
 pub fn dispatchLog(
     comptime m: manifest.Manifest,
     comptime Handler: type,
@@ -394,9 +397,11 @@ pub fn dispatchLog(
 }
 
 /// Build the comptime dispatch table for a manifest. Returns a type that
-/// switches on `log.topics[0]` against each declared event's topic0 and invokes
-/// `Handler.handle ++ event.name`. Logs whose topic0 matches no declared event
-/// are silently skipped.
+/// switches on `log.topics[0]` against each declared event's topic0, applies
+/// the per-contract emitter gate (`isLegitEmitter`, comptime-elided unless the
+/// manifest needs it), and invokes `Handler.handle ++ event.name`. Logs whose
+/// topic0 matches no declared event, or whose emitter the gate rejects, are
+/// silently skipped.
 ///
 /// `validateHandler(Handler, m)` runs at comptime. Any required handler method
 /// missing from `Handler` produces a `@compileError` listing the method name
@@ -409,6 +414,13 @@ pub fn dispatcherFor(comptime m: manifest.Manifest) type {
             inline for (events) |E| {
                 const topic = comptime manifest.eventTopic0(E);
                 if (std.mem.eql(u8, &log.topics[0], &topic)) {
+                    // Per-contract gate, comptime-elided unless a known static
+                    // address could reach `E` without declaring it. Degenerate
+                    // manifests and both flagship paths (single contract, single
+                    // factory) compile to the un-gated switch.
+                    if (comptime manifest.dispatchGateNeeded(m, E)) {
+                        if (!manifest.isLegitEmitter(m, E, log.address)) return;
+                    }
                     const method_name = comptime "handle" ++ manifest.eventName(E);
                     return @field(Handler, method_name)(Log(E).fromDecoded(log), ctx);
                 }
@@ -474,6 +486,126 @@ fn makeLog(topic0: [32]u8) DecodedLog {
         .topic_count = 1,
         .data = &.{},
     };
+}
+
+fn makeLogFrom(topic0: [32]u8, address: [20]u8) DecodedLog {
+    var d = makeLog(topic0);
+    d.address = address;
+    return d;
+}
+
+test "dispatch gates a cross-emitted event to its declaring contract" {
+    // Disjoint per-contract events: A declares Transfer, B declares Approval.
+    // B emitting a Transfer (an LP token under a Swap-only entry, say) must not
+    // reach handleTransfer. Single-contract and homogeneous manifests skip the
+    // gate (compiled identically), so this disjoint manifest is the only one
+    // that pays for it.
+    const A: [20]u8 = [_]u8{0xA1} ** 20;
+    const B: [20]u8 = [_]u8{0xB2} ** 20;
+    const HetManifest: manifest.Manifest = .{
+        .name = "het",
+        .chain_id = 1,
+        .start_block = 0,
+        .contracts = &.{
+            .{ .name = "A", .address = A, .events = &.{Transfer} },
+            .{ .name = "B", .address = B, .events = &.{Approval} },
+        },
+    };
+    // Degenerate manifests carry no gate, the disjoint one gates both events.
+    try std.testing.expect(comptime !manifest.dispatchGateNeeded(TestManifest, Transfer));
+    try std.testing.expect(comptime manifest.dispatchGateNeeded(HetManifest, Transfer));
+    try std.testing.expect(comptime manifest.dispatchGateNeeded(HetManifest, Approval));
+
+    const D = dispatcherFor(HetManifest);
+    comptime D.validateHandler(Counter);
+    const tt = comptime manifest.eventTopic0(Transfer);
+    const at = comptime manifest.eventTopic0(Approval);
+
+    var c = Counter{};
+    try D.dispatch(Counter, makeLogFrom(tt, A), &c); // A's Transfer, dispatched
+    try D.dispatch(Counter, makeLogFrom(tt, B), &c); // B's Transfer, gated out
+    try D.dispatch(Counter, makeLogFrom(at, B), &c); // B's Approval, dispatched
+    try D.dispatch(Counter, makeLogFrom(at, A), &c); // A's Approval, gated out
+
+    try std.testing.expectEqual(@as(u32, 1), c.transfers);
+    try std.testing.expectEqual(@as(u32, 1), c.approvals);
+}
+
+test "dispatch passes every declarer of a shared event through the gate" {
+    // A and B both declare Transfer, C does not: the gate compiles for
+    // Transfer with two declarers and both must pass its unrolled compare
+    // chain. The single-declarer tests never run the second compare.
+    const A: [20]u8 = [_]u8{0xA1} ** 20;
+    const B: [20]u8 = [_]u8{0xB2} ** 20;
+    const C: [20]u8 = [_]u8{0xC3} ** 20;
+    const TriManifest: manifest.Manifest = .{
+        .name = "tri",
+        .chain_id = 1,
+        .start_block = 0,
+        .contracts = &.{
+            .{ .name = "A", .address = A, .events = &.{Transfer} },
+            .{ .name = "B", .address = B, .events = &.{Transfer} },
+            .{ .name = "C", .address = C, .events = &.{Approval} },
+        },
+    };
+    try std.testing.expect(comptime manifest.dispatchGateNeeded(TriManifest, Transfer));
+
+    const D = dispatcherFor(TriManifest);
+    comptime D.validateHandler(Counter);
+    const tt = comptime manifest.eventTopic0(Transfer);
+
+    var c = Counter{};
+    try D.dispatch(Counter, makeLogFrom(tt, A), &c); // first declarer, dispatched
+    try D.dispatch(Counter, makeLogFrom(tt, B), &c); // second declarer, dispatched
+    try D.dispatch(Counter, makeLogFrom(tt, C), &c); // non-declarer, gated out
+
+    try std.testing.expectEqual(@as(u32, 2), c.transfers);
+}
+
+test "a factory child cannot cross-emit a static-only event" {
+    // A token declares Transfer; a factory spawns children. A child is an
+    // arbitrary contract that can emit Transfer (an LP-token pair), but no
+    // factory declared Transfer, so the dispatcher gates it: the comptime
+    // static-declarer check excludes every non-token address, children included.
+    const X: [20]u8 = [_]u8{0x11} ** 20;
+    const PairCreated = struct {
+        pub const signature = "PairCreated(address,address,address,uint256)";
+    };
+    const Swap = struct {
+        pub const signature = "Swap(address,uint256,uint256,uint256,uint256,address)";
+    };
+    const FacManifest: manifest.Manifest = .{
+        .name = "fac",
+        .chain_id = 1,
+        .start_block = 0,
+        .contracts = &.{.{ .name = "X", .address = X, .events = &.{Transfer} }},
+        .factories = &.{.{ .name = "F", .address = [_]u8{0x33} ** 20, .create_event = PairCreated, .spawn_param = "pair", .child_events = &.{Swap} }},
+    };
+    // Transfer (static-only, factory present) gates; the token passes, a child does not.
+    try std.testing.expect(comptime manifest.dispatchGateNeeded(FacManifest, Transfer));
+    try std.testing.expect(comptime manifest.contractDeclaredEvent(FacManifest, Transfer, X));
+    try std.testing.expect(comptime !manifest.contractDeclaredEvent(FacManifest, Transfer, [_]u8{0x22} ** 20));
+    // Swap is a factory child event, but a static contract present didn't
+    // declare it, so it gates too: the contract is rejected, children pass.
+    try std.testing.expect(comptime manifest.dispatchGateNeeded(FacManifest, Swap));
+    try std.testing.expect(comptime !manifest.isLegitEmitter(FacManifest, Swap, X));
+    try std.testing.expect(comptime manifest.isLegitEmitter(FacManifest, Swap, [_]u8{0x22} ** 20));
+
+    // End to end: the token's stray Swap is gated out, a child's Swap dispatches.
+    const HandlerS = struct {
+        swaps: u32 = 0,
+        pub fn handleTransfer(_: Log(Transfer), _: *@This()) !void {}
+        pub fn handleSwap(_: Log(Swap), self: *@This()) !void {
+            self.swaps += 1;
+        }
+        pub fn handlePairCreated(_: Log(PairCreated), _: *@This()) !void {}
+    };
+    const D = dispatcherFor(FacManifest);
+    const st = comptime manifest.eventTopic0(Swap);
+    var h = HandlerS{};
+    try D.dispatch(HandlerS, makeLogFrom(st, X), &h); // token's Swap, gated out
+    try D.dispatch(HandlerS, makeLogFrom(st, [_]u8{0x22} ** 20), &h); // child's Swap, dispatched
+    try std.testing.expectEqual(@as(u32, 1), h.swaps);
 }
 
 test "dispatch routes by topic0" {
