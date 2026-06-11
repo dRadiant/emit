@@ -525,9 +525,20 @@ fn runInner(
 
     var worker_args: [parallel.MAX_WORKERS]WorkerArgs = undefined;
     var workers: [parallel.MAX_WORKERS]std.Thread = undefined;
+    var spawned: usize = 0;
+    // Workers spin on `slots`. A post-spawn error returns through the
+    // `defer allocator.destroy(slots)` above, freeing the ring out from under
+    // them (use-after-free that corrupts the heap and masks the real error).
+    // Stop and join first. errdefer runs before the destroy by LIFO order and
+    // joins only the workers actually spawned.
+    errdefer {
+        slots[0].block_number = std.math.maxInt(u64);
+        for (workers[0..spawned]) |*w| w.join();
+    }
     for (0..parallel.MAX_WORKERS) |i| {
         worker_args[i] = .{ .slots = slots, .worker_id = i };
         workers[i] = try std.Thread.spawn(.{ .stack_size = parallel.WORKER_STACK_SIZE }, workerFn, .{&worker_args[i]});
+        spawned += 1;
     }
 
     // Reader + writer loop. `read_done` flips once consumed past
@@ -590,9 +601,11 @@ fn runInner(
         }
     }
 
-    // Signal workers to exit (max block_number sentinel), then join.
+    // Signal workers to exit (max block_number sentinel), then join. Disarm the
+    // errdefer (spawned = 0) so a later error does not double-join these threads.
     slots[0].block_number = std.math.maxInt(u64);
-    for (&workers) |*w| w.join();
+    for (workers[0..spawned]) |*w| w.join();
+    spawned = 0;
     if (ts_thread) |t| t.join();
 
     try writer.finalize();
