@@ -111,27 +111,24 @@ fn workerFn(args: *WorkerArgs) void {
                 &log_buf,
                 &data_buf,
             ) catch |e| {
-                std.debug.print("decode error block {d}: {}\n", .{ slot.block_number, e });
+                core.log.err("decode error block {d}: {}\n", .{ slot.block_number, e });
                 failSlot(slot, &serialize_buf);
                 continue;
             };
 
-            // No-log blocks still flow through here. serializeLogs writes a
+            // No-log blocks still flow through here. packBlock writes a
             // zero-count entry, blooms come out empty, the writer appends it so
             // the dense block index stays contiguous. Skipping them corrupts
             // every later block's number.
-            const topic_bloom = log_serial.buildTopicBloom(log_buf[0..log_count]);
-            const addr_bloom = log_serial.buildAddrBloom(log_buf[0..log_count]);
-            const serialized_len = log_serial.serializeLogs(log_buf[0..log_count], &serialize_buf);
-
-            slot.entry_len = log_serial.compressEntry(serialize_buf[0..serialized_len], &slot.entry) catch {
-                std.debug.print("compress error block {d}\n", .{slot.block_number});
+            const pack = log_serial.packBlock(log_buf[0..log_count], &serialize_buf, &slot.entry) catch {
+                core.log.err("compress error block {d}\n", .{slot.block_number});
                 failSlot(slot, &serialize_buf);
                 continue;
             };
 
-            slot.topic_bloom = topic_bloom.bits;
-            slot.addr_bloom = addr_bloom.bits;
+            slot.entry_len = pack.entry_len;
+            slot.topic_bloom = pack.topic_bloom.bits;
+            slot.addr_bloom = pack.addr_bloom.bits;
             slot.log_count = log_count;
             slot.state.store(Slot.DONE, .release);
         }
@@ -194,7 +191,7 @@ fn fillSlotCanonical(slot: *Slot, iter: Iterator, provider: ?*eth.provider.Provi
     // Duplicate group: keep the row whose hash is canonical for this number.
     dup_blocks.* += 1;
     const p = provider orelse {
-        std.debug.print("block {d} has reorg-duplicate receipt rows; rerun with --rpc <url> to resolve canonical.\n", .{bn});
+        core.log.err("block {d} has reorg-duplicate receipt rows; rerun with --rpc <url> to resolve canonical.\n", .{bn});
         return error.DuplicateNeedsRpc;
     };
     const canon = (try p.getBlock(bn)) orelse return error.CanonicalBlockNotFound;
@@ -216,7 +213,7 @@ fn fillSlotCanonical(slot: *Slot, iter: Iterator, provider: ?*eth.provider.Provi
         c.rocksdb_iter_next(iter);
     }
     if (!found) {
-        std.debug.print("block {d}: no receipt row matched the canonical hash among duplicates.\n", .{bn});
+        core.log.err("block {d}: no receipt row matched the canonical hash among duplicates.\n", .{bn});
         return error.CanonicalRowMissing;
     }
     finalizeFilled(slot, bn);
@@ -231,10 +228,68 @@ fn finalizeFilled(slot: *Slot, bn: u64) void {
     slot.state.store(Slot.FILLED, .release);
 }
 
+/// Read-only RocksDB handle plus a bulk-read iterator over one column family.
+/// Shared by the receipts pass and the headers timestamp pass. Bulk-read
+/// options: 4 MB readahead, no block cache, no checksum verification.
+/// `target` picks the CF the iterator walks. `deinit` releases everything.
+fn ReadOnlyCf(comptime N: usize) type {
+    return struct {
+        opts: ?*c.rocksdb_options_t,
+        read_opts: ?*c.rocksdb_readoptions_t,
+        db: ?*c.rocksdb_t,
+        cf_handles: [N]?*c.rocksdb_column_family_handle_t,
+        iter: Iterator,
+
+        fn open(path: [*:0]const u8, cf_names: [N][*c]const u8, target: usize) !@This() {
+            var err: ?[*:0]u8 = null;
+            const opts = c.rocksdb_options_create();
+            errdefer c.rocksdb_options_destroy(opts);
+
+            var cf_opts: [N]?*const c.rocksdb_options_t = undefined;
+            for (&cf_opts) |*o| o.* = opts;
+            var cf_handles: [N]?*c.rocksdb_column_family_handle_t = .{null} ** N;
+            const db = c.rocksdb_open_for_read_only_column_families(
+                opts,
+                path,
+                N,
+                &cf_names,
+                &cf_opts,
+                &cf_handles,
+                0,
+                @ptrCast(&err),
+            );
+            try rocksErr(&err);
+            if (db == null) return error.RocksDBError;
+            errdefer c.rocksdb_close(db);
+            errdefer for (&cf_handles) |h| if (h) |handle| c.rocksdb_column_family_handle_destroy(handle);
+            const cf = cf_handles[target] orelse return error.RocksDBError;
+
+            const read_opts = c.rocksdb_readoptions_create();
+            errdefer c.rocksdb_readoptions_destroy(read_opts);
+            c.rocksdb_readoptions_set_readahead_size(read_opts, 4 * 1024 * 1024);
+            c.rocksdb_readoptions_set_fill_cache(read_opts, 0);
+            c.rocksdb_readoptions_set_verify_checksums(read_opts, 0);
+
+            const iter = c.rocksdb_create_iterator_cf(db, read_opts, cf);
+            if (iter == null) return error.RocksDBError;
+
+            return .{ .opts = opts, .read_opts = read_opts, .db = db, .cf_handles = cf_handles, .iter = iter };
+        }
+
+        fn deinit(self: *@This()) void {
+            c.rocksdb_iter_destroy(self.iter);
+            for (&self.cf_handles) |h| if (h) |handle| c.rocksdb_column_family_handle_destroy(handle);
+            c.rocksdb_close(self.db);
+            c.rocksdb_readoptions_destroy(self.read_opts);
+            c.rocksdb_options_destroy(self.opts);
+        }
+    };
+}
+
 /// Convert a RocksDB error pointer to a Zig error. Frees the C string.
 fn rocksErr(err_ptr: *?[*:0]u8) !void {
     if (err_ptr.*) |e| {
-        std.debug.print("RocksDB error: {s}\n", .{std.mem.span(e)});
+        core.log.err("RocksDB error: {s}\n", .{std.mem.span(e)});
         c.rocksdb_free(@ptrCast(e));
         err_ptr.* = null;
         return error.RocksDBError;
@@ -266,10 +321,10 @@ fn importHeaderTimestamps(
     cutoff: u64,
 ) void {
     const n = runHeaderTimestamps(headers_path, output_path, first_block, cutoff) catch |err| {
-        std.debug.print("Timestamp pass skipped: {s} (timestamps fall back to the formula)\n", .{@errorName(err)});
+        core.log.info("Timestamp pass skipped: {s} (timestamps fall back to the formula)\n", .{@errorName(err)});
         return;
     };
-    if (n > 0) std.debug.print("Imported {d} block timestamps from headers\n", .{n});
+    if (n > 0) core.log.info("Imported {d} block timestamps from headers\n", .{n});
 }
 
 /// Iterate Nethermind's `headers` DB over [start_block, cutoff], decode each
@@ -283,44 +338,15 @@ fn runHeaderTimestamps(
     first_block: u64,
     cutoff: u64,
 ) !u64 {
-    var err: ?[*:0]u8 = null;
-    const opts = c.rocksdb_options_create();
-    defer c.rocksdb_options_destroy(opts);
-
     // headers has a single "default" CF, open read-only like the receipts DB.
-    const cf_names = [_][*c]const u8{@ptrCast("default")};
-    const cf_opts = [1]?*const c.rocksdb_options_t{opts};
-    var cf_handles: [1]?*c.rocksdb_column_family_handle_t = .{null};
-    const db = c.rocksdb_open_for_read_only_column_families(
-        opts,
-        headers_path,
-        1,
-        &cf_names,
-        &cf_opts,
-        &cf_handles,
-        0,
-        @ptrCast(&err),
-    );
-    try rocksErr(&err);
-    if (db == null) return error.RocksDBError;
-    defer c.rocksdb_close(db);
-    defer for (&cf_handles) |h| if (h) |handle| c.rocksdb_column_family_handle_destroy(handle);
-    const default_cf = cf_handles[0] orelse return error.RocksDBError;
+    var rdb = try ReadOnlyCf(1).open(headers_path, .{@ptrCast("default")}, 0);
+    defer rdb.deinit();
+    const iter = rdb.iter;
 
     var dir = try std.fs.cwd().openDir(output_path, .{});
     defer dir.close();
     var ts_writer = try core.timestamps.TimestampWriter.open(dir, first_block);
     defer ts_writer.deinit();
-
-    const read_opts = c.rocksdb_readoptions_create();
-    defer c.rocksdb_readoptions_destroy(read_opts);
-    c.rocksdb_readoptions_set_readahead_size(read_opts, 4 * 1024 * 1024);
-    c.rocksdb_readoptions_set_fill_cache(read_opts, 0);
-    c.rocksdb_readoptions_set_verify_checksums(read_opts, 0);
-
-    const iter = c.rocksdb_create_iterator_cf(db, read_opts, default_cf);
-    if (iter == null) return error.RocksDBError;
-    defer c.rocksdb_iter_destroy(iter);
 
     // Resume from the first un-backfilled block so re-runs only fill the gap.
     const start_block = first_block + ts_writer.count;
@@ -354,7 +380,7 @@ pub fn main() !void {
     const alloc = std.heap.page_allocator;
     const args = try std.process.argsAlloc(alloc);
     if (args.len < 3) {
-        std.debug.print(
+        core.log.err(
             "Usage: rocksdb-import <receipts_db_path> <data_dir> [--start N] [--end N] [--rpc URL]\n",
             .{},
         );
@@ -366,6 +392,8 @@ pub fn main() !void {
     var start_override: ?u64 = null;
     var end_override: ?u64 = null;
     var rpc_url: ?[:0]const u8 = null;
+    var silent = false;
+    var verbose = false;
     var i: usize = 3;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--start") and i + 1 < args.len) {
@@ -377,8 +405,13 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, args[i], "--rpc") and i + 1 < args.len) {
             rpc_url = args[i + 1];
             i += 1;
+        } else if (std.mem.eql(u8, args[i], "--silent")) {
+            silent = true;
+        } else if (std.mem.eql(u8, args[i], "--verbose")) {
+            verbose = true;
         }
     }
+    core.log.setLevel(core.log.levelFromFlags(silent, verbose));
     try run(args[1], args[2], start_override, end_override, rpc_url);
 }
 
@@ -411,59 +444,31 @@ fn runInner(
 
     // Open Nethermind's receipts DB read-only with column families.
     // "Blocks" CF holds receipts keyed by block number (u64 BE).
-    var err: ?[*:0]u8 = null;
-    const opts = c.rocksdb_options_create();
-    defer c.rocksdb_options_destroy(opts);
-
-    const cf_names = [_][*c]const u8{ @ptrCast("default"), @ptrCast("Transactions"), @ptrCast("Blocks") };
-    const cf_opts = [3]?*const c.rocksdb_options_t{ opts, opts, opts };
-    var cf_handles: [3]?*c.rocksdb_column_family_handle_t = .{ null, null, null };
-
-    const db = c.rocksdb_open_for_read_only_column_families(
-        opts,
+    var rdb = try ReadOnlyCf(3).open(
         receipts_path,
-        3,
-        &cf_names,
-        &cf_opts,
-        &cf_handles,
-        0,
-        @ptrCast(&err),
+        .{ @ptrCast("default"), @ptrCast("Transactions"), @ptrCast("Blocks") },
+        2,
     );
-    try rocksErr(&err);
-    if (db == null) return error.RocksDBError;
-    defer c.rocksdb_close(db);
-    defer for (&cf_handles) |h| if (h) |handle| c.rocksdb_column_family_handle_destroy(handle);
-
-    const blocks_cf = cf_handles[2] orelse return error.RocksDBError;
+    defer rdb.deinit();
+    const iter = rdb.iter;
 
     std.fs.cwd().makeDir(output_path) catch {};
     var writer = try flat_writer.FlatStoreWriter.open(output_path);
     defer writer.deinit();
-
-    // Sequential bulk read: 4 MB readahead, skip block cache and checksums
-    const read_opts = c.rocksdb_readoptions_create();
-    defer c.rocksdb_readoptions_destroy(read_opts);
-    c.rocksdb_readoptions_set_readahead_size(read_opts, 4 * 1024 * 1024);
-    c.rocksdb_readoptions_set_fill_cache(read_opts, 0);
-    c.rocksdb_readoptions_set_verify_checksums(read_opts, 0);
-
-    const iter = c.rocksdb_create_iterator_cf(db, read_opts, blocks_cf);
-    if (iter == null) return error.RocksDBError;
-    defer c.rocksdb_iter_destroy(iter);
 
     // Cap import at head - FINALITY_DEPTH so the flat store holds only
     // finalized blocks. The pending ring (head_follower) fills the trailing
     // edge canonically.
     c.rocksdb_iter_seek_to_last(iter);
     if (!iterValid(iter)) {
-        std.debug.print("Receipts DB is empty; nothing to import.\n", .{});
+        core.log.info("Receipts DB is empty; nothing to import.\n", .{});
         return;
     }
     const head = iterKeyBlock(iter) orelse return error.InvalidKey;
     const head_cutoff: u64 = if (head > FINALITY_DEPTH) head - FINALITY_DEPTH else 0;
     // An explicit end caps the import below finality for bounded/isolation runs.
     const finality_cutoff: u64 = if (end_override) |e| @min(head_cutoff, e) else head_cutoff;
-    std.debug.print("Chain head: {d}; finality cutoff: {d} (head - {d}).\n", .{ head, finality_cutoff, FINALITY_DEPTH });
+    core.log.info("Chain head: {d}; finality cutoff: {d} (head - {d}).\n", .{ head, finality_cutoff, FINALITY_DEPTH });
 
     // Backfill timestamps.bin from the sibling `headers` DB over the store's
     // full finalized range, concurrent with the receipts decode (different DB,
@@ -496,7 +501,7 @@ fn runInner(
     else
         core.types.MERGE_BLOCK;
     if (start_block > finality_cutoff) {
-        std.debug.print(
+        core.log.info(
             "Flat store already covers the finalized prefix (last_finalized={d}); only timestamps backfilled.\n",
             .{writer.meta.last_finalized_block},
         );
@@ -508,7 +513,7 @@ fn runInner(
         var resume_key: [8]u8 = undefined;
         std.mem.writeInt(u64, &resume_key, start_block, .big);
         c.rocksdb_iter_seek(iter, @ptrCast(&resume_key), resume_key.len);
-        std.debug.print("Resuming from block {} (flat store size: {} bytes)\n", .{ start_block, writer.meta.blocks_dat_size });
+        core.log.info("Resuming from block {} (flat store size: {} bytes)\n", .{ start_block, writer.meta.blocks_dat_size });
     } else {
         c.rocksdb_iter_seek_to_first(iter);
     }
@@ -525,7 +530,7 @@ fn runInner(
     var skipped_raw: u64 = 0;
     var dup_blocks: u64 = 0;
 
-    std.debug.print("Importing receipts ({} workers) from {s} → {s}\n", .{
+    core.log.info("Importing receipts ({} workers) from {s} → {s}\n", .{
         parallel.MAX_WORKERS, std.mem.span(receipts_path), output_path,
     });
 
@@ -600,7 +605,7 @@ fn runInner(
 
         if (blocks_processed % 100_000 == 0) {
             const elapsed_s = @as(f64, @floatFromInt(std.time.nanoTimestamp() - t_start)) / 1e9;
-            std.debug.print("  {d:>10} blocks | {d:>12} logs | {d:.1}s | {d:.0} blk/s | {d:.0} logs/s\n", .{
+            core.log.info("  {d:>10} blocks | {d:>12} logs | {d:.1}s | {d:.0} blk/s | {d:.0} logs/s\n", .{
                 blocks_processed,                                      total_logs,                                      elapsed_s,
                 @as(f64, @floatFromInt(blocks_processed)) / elapsed_s, @as(f64, @floatFromInt(total_logs)) / elapsed_s,
             });
@@ -617,7 +622,7 @@ fn runInner(
     try writer.finalize();
 
     const elapsed_s = @as(f64, @floatFromInt(std.time.nanoTimestamp() - t_start)) / 1e9;
-    std.debug.print(
+    core.log.info(
         \\
         \\=== Import Complete ===
         \\Blocks processed:  {d}
@@ -629,14 +634,14 @@ fn runInner(
         \\
     , .{ blocks_processed, blocks_with_logs, total_logs, decode_errors, dup_blocks, elapsed_s });
     if (elapsed_s > 0) {
-        std.debug.print("Blocks/sec:        {d:.0}\nLogs/sec:          {d:.0}\n", .{
+        core.log.info("Blocks/sec:        {d:.0}\nLogs/sec:          {d:.0}\n", .{
             @as(f64, @floatFromInt(blocks_processed)) / elapsed_s,
             @as(f64, @floatFromInt(total_logs)) / elapsed_s,
         });
     }
 
     if (skipped_raw > 0) {
-        std.debug.print(
+        core.log.info(
             "\nERROR: skipped {d} RocksDB entries (short key or oversized value > {d}B). " ++
                 "Flat store is incomplete.\n",
             .{ skipped_raw, MAX_RAW_VALUE },
@@ -645,7 +650,7 @@ fn runInner(
     }
 
     if (decode_errors > 0) {
-        std.debug.print(
+        core.log.info(
             "\nERROR: {d} blocks failed to decode — flat store is incomplete. " ++
                 "Likely MAX_LOGS_PER_BLOCK in core/src/types.zig.\n",
             .{decode_errors},

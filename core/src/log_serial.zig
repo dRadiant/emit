@@ -181,6 +181,26 @@ pub fn buildAddrBloom(logs: []const RawLog) bloom.AddrBloom {
     return b;
 }
 
+/// One block's full pack: blooms over the logs, serialize, LZ4 compress into
+/// `compress_buf`. The single sequence behind every ingestion path (RocksDB
+/// import, RPC import, head follower), so the entry format is built in
+/// exactly one place. An empty `logs` packs a valid zero-count entry with
+/// empty blooms, required for dense block numbering.
+pub const PackedBlock = struct {
+    topic_bloom: bloom.Bloom,
+    addr_bloom: bloom.AddrBloom,
+    entry_len: usize,
+};
+
+pub fn packBlock(logs: []const RawLog, serialize_buf: []u8, compress_buf: []u8) !PackedBlock {
+    const serialized_len = serializeLogs(logs, serialize_buf);
+    return .{
+        .topic_bloom = buildTopicBloom(logs),
+        .addr_bloom = buildAddrBloom(logs),
+        .entry_len = try compressEntry(serialize_buf[0..serialized_len], compress_buf),
+    };
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 test "serializeLogs/deserializeLogs roundtrip" {

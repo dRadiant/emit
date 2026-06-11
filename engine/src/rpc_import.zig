@@ -357,42 +357,20 @@ fn writeBatch(
             return error.TooManyLogsInBlock;
         }
 
-        for (block_logs, 0..) |log, i| scratch.raw_logs[i] = toRawLog(log, bn);
+        for (block_logs, 0..) |log, i| scratch.raw_logs[i] = try toRawLog(log, bn, null);
         const raw = scratch.raw_logs[0..block_logs.len];
 
-        const topic_bloom = log_serial.buildTopicBloom(raw);
-        const addr_bloom = log_serial.buildAddrBloom(raw);
-        const serialized_len = log_serial.serializeLogs(raw, scratch.serialize_buf);
-        const entry_len = try log_serial.compressEntry(scratch.serialize_buf[0..serialized_len], scratch.compress_buf);
-
-        try writer.appendBlock(bn, scratch.compress_buf[0..entry_len], &topic_bloom.bits, &addr_bloom.bits);
+        const pack = try log_serial.packBlock(raw, scratch.serialize_buf, scratch.compress_buf);
+        try writer.appendBlock(bn, scratch.compress_buf[0..pack.entry_len], &pack.topic_bloom.bits, &pack.addr_bloom.bits);
     }
 
     if (cursor != logs.len) return error.UnexpectedLogOrder;
     return @intCast(logs.len);
 }
 
-/// Convert an eth.zig log to a `RawLog`, borrowing `log.data` (consumed by
-/// `serializeLogs` before the batch arena is freed, no copy needed).
-fn toRawLog(log: eth.receipt.Log, block_number: u64) types.RawLog {
-    var topics: [types.MAX_TOPICS][32]u8 = std.mem.zeroes([types.MAX_TOPICS][32]u8);
-    var topic_count: u8 = 0;
-    for (log.topics) |t| {
-        if (topic_count >= types.MAX_TOPICS) break;
-        topics[topic_count] = t;
-        topic_count += 1;
-    }
-    return .{
-        .block_number = block_number,
-        .log_index = @intCast(log.log_index orelse 0),
-        .tx_index = @intCast(log.transaction_index orelse 0),
-        .address = log.address,
-        .topic_count = topic_count,
-        .topics = topics,
-        .data = log.data,
-        .tx_hash = log.transaction_hash orelse std.mem.zeroes([32]u8),
-    };
-}
+// Shared conversion, null allocator borrows `log.data` (consumed by
+// `packBlock` before the batch arena is freed, no copy needed).
+const toRawLog = @import("head_follower.zig").toRawLog;
 
 /// One-off chain-tip query with its own short-lived arena.
 fn queryTip(rpc_url: []const u8, parent_alloc: std.mem.Allocator) !u64 {

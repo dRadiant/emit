@@ -94,7 +94,7 @@ pub const PendingRing = struct {
             .addr_bloom = addr_bloom.*,
             .lz4_entry = owned,
         });
-        try self.persist();
+        try self.flush();
     }
 
     /// Block hash for reorg detection. O(1) via index arithmetic since entries
@@ -142,9 +142,12 @@ pub const PendingRing = struct {
         return self.entries.orderedRemove(0);
     }
 
-    /// Persist current state to disk. Call after batch mutations.
+    /// Persist current state to disk via atomic rewrite. Mutating methods call
+    /// it themselves; batch operations (`popOldest` runs) call it once after.
     pub fn flush(self: *PendingRing) !void {
-        try self.persist();
+        const buf = try pending_format.serialize(self.alloc, self.entries.items);
+        defer self.alloc.free(buf);
+        try core.atomic_file.write(self.dir, "pending.bin.tmp", "pending.bin", buf);
     }
 
     /// Walk backwards from `from` comparing stored hashes against `canonical`.
@@ -176,17 +179,11 @@ pub const PendingRing = struct {
             _ = self.entries.pop();
             deleted += 1;
         }
-        if (deleted > 0) try self.persist();
+        if (deleted > 0) try self.flush();
         return deleted;
     }
 
     // ── Persistence ──────────────────────────────────────────────────────
-
-    fn persist(self: *PendingRing) !void {
-        const buf = try pending_format.serialize(self.alloc, self.entries.items);
-        defer self.alloc.free(buf);
-        try core.atomic_file.write(self.dir, "pending.bin.tmp", "pending.bin", buf);
-    }
 
     /// Load pending.bin on startup via `core.pending_format.parse`.
     /// Dupes each `lz4_entry` into ring-owned memory.

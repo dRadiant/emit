@@ -1,11 +1,5 @@
-/// emit-engine. Imports EVM logs, follows chain head.
-///
-/// Commands:
-///   import --rocksdb <path> --data-dir <path>   Bulk import from Nethermind receipts DB
-///   import --rpc <url> --data-dir <path>        Import via eth_getLogs range queries
-///   follow --rpc <url> --data-dir <path>        Follow chain head (HTTP polling)
-///   serve --listen <host:port> --data-dir <path> Stream filtered blocks to remote indexers
-///   status --data-dir <path>                    Print flat store status
+//! emit-engine CLI. Imports EVM logs, follows the chain head, serves remote
+//! indexers, reports store status. Command table lives in `usage()`.
 const std = @import("std");
 
 const core = @import("core");
@@ -57,12 +51,17 @@ pub fn main() !void {
 
         if (getFlag(args, "--rocksdb")) |rocksdb_path| {
             // RocksDB import is a separate binary, avoids linking ~20MB of C into engine.
-            // Pass --rpc through so the importer can resolve the canonical receipt row
-            // for blocks with reorg-history duplicates (Nethermind keeps orphan rows past finality).
-            const argv: []const []const u8 = if (getFlag(args, "--rpc")) |rpc_url|
-                &.{ "rocksdb-import", rocksdb_path, data_dir, "--rpc", rpc_url }
-            else
-                &.{ "rocksdb-import", rocksdb_path, data_dir };
+            // Forward --rpc (canonical-row resolution for reorg-history receipt
+            // duplicates), the --start/--end bounds, and the log-level flags.
+            var argv_list: std.ArrayListUnmanaged([]const u8) = .{};
+            defer argv_list.deinit(alloc);
+            try argv_list.appendSlice(alloc, &.{ "rocksdb-import", rocksdb_path, data_dir });
+            if (getFlag(args, "--rpc")) |v| try argv_list.appendSlice(alloc, &.{ "--rpc", v });
+            if (getFlag(args, "--start")) |v| try argv_list.appendSlice(alloc, &.{ "--start", v });
+            if (getFlag(args, "--end")) |v| try argv_list.appendSlice(alloc, &.{ "--end", v });
+            if (hasFlag(args, "--silent")) try argv_list.append(alloc, "--silent");
+            if (hasFlag(args, "--verbose")) try argv_list.append(alloc, "--verbose");
+            const argv = argv_list.items;
             // Inherit stdio so the importer's progress streams live. `Child.run`
             // buffered output into a 50 KB pipe, which a full import overflows
             // (then surfaced as a spawn failure), and it never checked the exit

@@ -291,23 +291,20 @@ fn ingestBlockCore(
         raw_logs[i] = try toRawLog(log, block_number, alloc);
     }
 
-    const topic_bloom = log_serial.buildTopicBloom(raw_logs);
-    const addr_bloom = log_serial.buildAddrBloom(raw_logs);
-
     const serialize_buf = try alloc.alloc(u8, types.BLOCK_BUF_SIZE);
-    const serialized_len = log_serial.serializeLogs(raw_logs, serialize_buf);
-
     const compress_buf = try alloc.alloc(u8, types.BLOCK_BUF_SIZE);
-    const entry_len = try log_serial.compressEntry(serialize_buf[0..serialized_len], compress_buf);
+    const pack = try log_serial.packBlock(raw_logs, serialize_buf, compress_buf);
 
     const ts: u32 = std.math.cast(u32, header.timestamp) orelse 0; // exact block time, valid until 2106
-    try ring.insert(block_number, ts, header.hash, &topic_bloom.bits, &addr_bloom.bits, compress_buf[0..entry_len]);
+    try ring.insert(block_number, ts, header.hash, &pack.topic_bloom.bits, &pack.addr_bloom.bits, compress_buf[0..pack.entry_len]);
     core.log.debug("Block {d}: {d} logs\n", .{ block_number, raw_logs.len });
 }
 
 /// Truncate divergent pending entries down to the fork point and return it,
 /// so the caller can re-ingest the canonical chain from `fork..from`.
-fn resolveReorg(ring: *PendingRing, from: u64, provider: *eth.provider.Provider) !u64 {
+/// `provider` is any type with `getBlock(u64) !?Header` where the header
+/// carries `hash`. Comptime generic so tests inject a mock chain.
+fn resolveReorg(ring: *PendingRing, from: u64, provider: anytype) !u64 {
     // Walk backwards. Most reorgs are 1-2 blocks.
     var canonical: [pending_ring.FINALITY_DEPTH][32]u8 = undefined;
     const oldest = ring.oldestBlock() orelse return from;
@@ -378,7 +375,11 @@ fn finalizeReady(
         core.log.info("Following: finalized through block {d}\n", .{tip});
 }
 
-fn toRawLog(log: eth.receipt.Log, block_number: u64, alloc: std.mem.Allocator) !types.RawLog {
+/// Convert an eth.zig log to a `RawLog`. With `alloc`, `data` is duped so the
+/// RawLog outlives the RPC response. Null borrows `log.data`, valid only until
+/// the response frees (rpc_import consumes it before the batch arena resets).
+/// Shared with rpc_import, the one conversion for both ingestion paths.
+pub fn toRawLog(log: eth.receipt.Log, block_number: u64, alloc: ?std.mem.Allocator) !types.RawLog {
     var topics: [types.MAX_TOPICS][32]u8 = std.mem.zeroes([types.MAX_TOPICS][32]u8);
     var topic_count: u8 = 0;
     for (log.topics) |t| {
@@ -387,7 +388,10 @@ fn toRawLog(log: eth.receipt.Log, block_number: u64, alloc: std.mem.Allocator) !
         topic_count += 1;
     }
 
-    const data: []const u8 = if (log.data.len > 0) try alloc.dupe(u8, log.data) else &.{};
+    const data: []const u8 = if (alloc) |a|
+        (if (log.data.len > 0) try a.dupe(u8, log.data) else &.{})
+    else
+        log.data;
 
     return .{
         .block_number = block_number,
