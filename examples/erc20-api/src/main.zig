@@ -12,6 +12,7 @@
 ///   GET /allowance/:owner/:spender    allowance (mutable point read)
 ///   GET /transfers?limit=&offset=     newest-first transfer page (immutable range)
 const std = @import("std");
+const builtin = @import("builtin");
 const sdk = @import("sdk");
 const httpz = @import("httpz");
 const cli = @import("cli");
@@ -27,9 +28,16 @@ const Ctx = sdk.Context(e);
 const App = struct { ctx: *Ctx };
 
 pub fn main() !void {
+    // Same split as `cli.run`: DebugAllocator catches leaks in dev builds,
+    // smp_allocator drops the safety bookkeeping in ReleaseFast serving.
+    const dev = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
     var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = if (comptime dev) gpa.allocator() else std.heap.smp_allocator;
+    defer if (comptime dev) {
+        _ = gpa.deinit();
+    } else {
+        _ = &gpa;
+    };
 
     // Shared flag parser handles standard dirs + node RPC. The API-only
     // `--port` (default 8080) is pulled from argv separately.

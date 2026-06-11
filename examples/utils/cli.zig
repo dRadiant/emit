@@ -6,6 +6,7 @@
 /// structured logging) skip `cli.run` and call `sdk.run` directly,
 /// composing `parseStandardArgs` and `printStats`.
 const std = @import("std");
+const builtin = @import("builtin");
 const sdk = @import("sdk");
 
 pub const StandardArgs = struct {
@@ -172,9 +173,18 @@ pub fn run(
     comptime handlers: type,
     comptime entities: anytype,
 ) !void {
+    // DebugAllocator catches leaks under Debug/ReleaseSafe. ReleaseFast
+    // benchmarks use smp_allocator to drop the per-alloc safety metadata and
+    // bucket bookkeeping. The store hot path runs on per-thread arenas, so this
+    // allocator only sees setup and entity-store growth.
+    const dev = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
     var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = if (comptime dev) gpa.allocator() else std.heap.smp_allocator;
+    defer if (comptime dev) {
+        _ = gpa.deinit();
+    } else {
+        _ = &gpa;
+    };
 
     const args = try parseStandardArgs(allocator, manifest.name);
     defer allocator.free(args.engine_data_dir);

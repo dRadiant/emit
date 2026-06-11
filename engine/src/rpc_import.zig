@@ -208,6 +208,11 @@ fn importTimestamps(ts_writer: *core.timestamps.TimestampWriter, rpc_url: []cons
 /// return. The writer and scratch live across batches. The provider and
 /// transport share the arena allocator, `getLogs` frees the transport's
 /// response with the provider's allocator, so they must be the same.
+///
+/// The per-batch client (one TLS handshake per batch) is deliberate.
+/// `HttpTransport` embeds `std.http.Client` by value, so connection reuse
+/// needs vendoring eth.zig. The import is bottlenecked on provider latency
+/// and rate limits, not handshakes. Disproportionate for a one-time fallback.
 fn importBatch(
     writer: *FlatStoreWriter,
     rpc_url: []const u8,
