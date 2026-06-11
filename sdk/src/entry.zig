@@ -406,6 +406,11 @@ pub fn init(
     options: Options,
     allocator: std.mem.Allocator,
 ) !*Context(entities) {
+    // Fail the build on a malformed manifest (empty method strings, a factory
+    // spawn_param of the wrong type that would otherwise yield garbage child
+    // addresses at runtime).
+    comptime sdk_manifest.validateManifest(m);
+
     var timer = try std.time.Timer.start();
 
     // Banner and per-phase progress are verbose-only, so normal and silent
