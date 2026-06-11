@@ -226,9 +226,11 @@ pub fn ImmutableStore(comptime T: type) type {
 
             var n: usize = 0;
             var i = start;
-            while (i < end and i < self.committed_count) : (i += 1) {
-                out[n] = try self.log.read(i);
-                n += 1;
+            if (i < self.committed_count) {
+                const fin_end = @min(end, self.committed_count);
+                n = @intCast(fin_end - i);
+                try self.log.readRange(i, out[0..n]);
+                i = fin_end;
             }
             if (i >= end) return out[0..n];
 

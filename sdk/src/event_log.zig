@@ -80,6 +80,28 @@ pub fn EventLog(comptime T: type) type {
             return entity_serial.deserialize(T, &buf);
         }
 
+        /// Read records `[start, start + out.len)` with chunked preads, one
+        /// syscall per ~16 KB of records instead of one per record. Same
+        /// contract as `read`: caller must ensure the range is within the
+        /// authoritative count.
+        pub fn readRange(self: *Self, start: u64, out: []T) !void {
+            const per_chunk = comptime @max(1, (16 * 1024) / RECORD_SIZE);
+            var buf: [per_chunk * RECORD_SIZE]u8 = undefined;
+            var done: usize = 0;
+            while (done < out.len) {
+                // Explicit usize. `@min` with a comptime bound narrows the
+                // result type and `n * RECORD_SIZE` would overflow it.
+                const n: usize = @min(per_chunk, out.len - done);
+                const bytes = buf[0 .. n * RECORD_SIZE];
+                const offset = HEADER_SIZE + (start + done) * RECORD_SIZE;
+                if ((try self.file.pread(bytes, offset)) != bytes.len) return error.Truncated;
+                for (out[done..][0..n], 0..) |*rec, k| {
+                    rec.* = entity_serial.deserialize(T, bytes[k * RECORD_SIZE ..][0..RECORD_SIZE]);
+                }
+                done += n;
+            }
+        }
+
         /// Read the key bytes of record `i` without deserializing the full
         /// entity. Used by binary search.
         pub fn readKey(self: *Self, i: u64) !KeyBytes {
@@ -168,6 +190,32 @@ test "append then read round-trips records" {
     try testing.expectEqual(@as(u256, 1000), r0.value);
     try testing.expectEqualSlices(u8, &recs[2].to, &r2.to);
     try testing.expectEqual(@as(u256, 3000), r2.value);
+}
+
+test "readRange crosses the pread chunk boundary" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var log = try EventLog(TransferEvent).open(testing.allocator, tmp.dir, "transfer.events.dat");
+    defer log.deinit();
+
+    // 400 records at 88 bytes each spans three ~16 KB pread chunks, so the
+    // loop's chunk stitching and per-chunk offsets are exercised.
+    const COUNT = 400;
+    const recs = try testing.allocator.alloc(TransferEvent, COUNT);
+    defer testing.allocator.free(recs);
+    for (recs, 0..) |*r, i| {
+        r.* = .{ .id = keyAt(i, 0), .from = [_]u8{0xAA} ** 20, .to = [_]u8{0xBB} ** 20, .value = i };
+    }
+    try log.append(recs, 0);
+
+    const out = try testing.allocator.alloc(TransferEvent, COUNT - 1);
+    defer testing.allocator.free(out);
+    try log.readRange(1, out);
+    for (out, 1..) |r, i| {
+        try testing.expectEqual(@as(u256, i), r.value);
+        try testing.expectEqualSlices(u8, &keyAt(i, 0), &r.id);
+    }
 }
 
 test "binarySearch finds present keys and returns null for absent" {
