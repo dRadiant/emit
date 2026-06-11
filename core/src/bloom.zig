@@ -28,19 +28,11 @@ pub fn BloomFilter(comptime SIZE: comptime_int) type {
         }
 
         pub fn mightContain(self: *const Self, key: [32]u8) bool {
-            inline for (0..NUM_HASHES) |i| {
-                const pos = bitPosition(key, i);
-                if (self.bits[pos / 8] & (@as(u8, 1) << @intCast(pos % 8)) == 0)
-                    return false;
-            }
-            return true;
+            return bytesContain(&self.bits, key);
         }
 
         pub fn mightContainAny(self: *const Self, keys: []const [32]u8) bool {
-            for (keys) |k| {
-                if (self.mightContain(k)) return true;
-            }
-            return false;
+            return bytesContainAny(&self.bits, keys);
         }
 
         /// Check bloom from a raw byte pointer (e.g., directly from mmap'd blooms.bin).
