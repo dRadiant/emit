@@ -98,6 +98,53 @@ pub fn decodeReceipts(
     return log_count;
 }
 
+/// Per-transaction sender + produced-logs mask, the tx-fields pass's view of
+/// a receipt row (ADR-006). Nethermind persists the recovered sender per
+/// receipt, the same field `decodeReceipts` skips.
+pub const TxSenderInfo = struct {
+    sender: [20]u8,
+    /// False when the row carries no 20-byte sender. The record then sets
+    /// `FLAG_FROM_UNRECOVERED` rather than guessing.
+    has_sender: bool,
+    has_logs: bool,
+};
+
+/// Walk a CompactReceiptStore value extracting `out[i]` for tx_index `i`.
+/// Returns the transaction count. Empty and non-compact rows return 0,
+/// mirroring `decodeReceipts`.
+pub fn decodeSenders(value: []const u8, out: []TxSenderInfo) !usize {
+    if (value.len == 0) return 0;
+    if (value[0] == 0xC0) return 0;
+    if (value[0] != COMPACT_MARKER) return 0;
+
+    var rlp = Rlp.init(value[1..]);
+    _ = try rlp.enterList();
+
+    var n: usize = 0;
+    while (!rlp.done()) {
+        if (n >= out.len) return error.TooManyTxsInBlock;
+        const receipt_end = try rlp.enterList();
+
+        try rlp.skip(); // status
+        const sender_raw = try rlp.bytes();
+        var info = TxSenderInfo{
+            .sender = std.mem.zeroes([20]u8),
+            .has_sender = sender_raw.len == 20,
+            .has_logs = false,
+        };
+        if (info.has_sender) info.sender = sender_raw[0..20].*;
+
+        try rlp.skip(); // gas_used_total
+        const logs_end = try rlp.enterList();
+        info.has_logs = rlp.pos < logs_end;
+
+        out[n] = info;
+        rlp.pos = receipt_end;
+        n += 1;
+    }
+    return n;
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 /// Build compact receipt test data at comptime.
@@ -200,6 +247,62 @@ test "compact receipt with one log decodes correctly" {
     var expected_from: [32]u8 = std.mem.zeroes([32]u8);
     @memcpy(expected_from[12..], &from_stripped);
     try std.testing.expectEqualSlices(u8, &expected_from, &log.topics[1]);
+}
+
+test "decodeSenders captures the sender field decodeReceipts skips" {
+    // Two receipts: tx0 with a sender and one log, tx1 with no sender (0x80)
+    // and an empty logs list.
+    const addr: [20]u8 = .{0xAA} ** 20;
+    const topic0: [32]u8 = .{0xDD} ** 32;
+    const sender0: [20]u8 = .{0x55} ** 20;
+
+    const value = comptime buildTestReceipt(struct {
+        fn build(b: *TestBuf) void {
+            const topics_len = TestBuf.rlpStrLen(&topic0);
+            const log_len = TestBuf.rlpStrLen(&addr) + TestBuf.listHdrLen(topics_len) + topics_len + 1 + 1;
+            const logs_len = TestBuf.listHdrLen(log_len) + log_len;
+            const r0_len = 1 + TestBuf.rlpStrLen(&sender0) + 1 + TestBuf.listHdrLen(logs_len) + logs_len;
+            const r1_len = 1 + 1 + 1 + 1; // status, empty sender, gas, empty logs
+            const outer_len = TestBuf.listHdrLen(r0_len) + r0_len + TestBuf.listHdrLen(r1_len) + r1_len;
+
+            b.putByte(0x7F);
+            b.listHdr(outer_len);
+            // receipt 0
+            b.listHdr(r0_len);
+            b.putByte(0x01); // status
+            b.rlpStr(&sender0);
+            b.putByte(0x01); // gas_used_total
+            b.listHdr(logs_len);
+            b.listHdr(log_len);
+            b.rlpStr(&addr);
+            b.listHdr(topics_len);
+            b.rlpStr(&topic0);
+            b.putByte(0x80); // zero_prefix
+            b.putByte(0x42); // data remainder
+            // receipt 1
+            b.listHdr(r1_len);
+            b.putByte(0x01); // status
+            b.putByte(0x80); // sender absent
+            b.putByte(0x01); // gas_used_total
+            b.putByte(0xC0); // empty logs
+        }
+    }.build);
+
+    var out: [4]TxSenderInfo = undefined;
+    const n = try decodeSenders(value, &out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expect(out[0].has_sender);
+    try std.testing.expectEqualSlices(u8, &sender0, &out[0].sender);
+    try std.testing.expect(out[0].has_logs);
+    try std.testing.expect(!out[1].has_sender);
+    try std.testing.expect(!out[1].has_logs);
+}
+
+test "decodeSenders returns zero for empty and non-compact rows" {
+    var out: [2]TxSenderInfo = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try decodeSenders(&.{}, &out));
+    try std.testing.expectEqual(@as(usize, 0), try decodeSenders(&.{0xC0}, &out));
+    try std.testing.expectEqual(@as(usize, 0), try decodeSenders(&.{ 0xF8, 0x01, 0xC0 }, &out));
 }
 
 test "zero-stripped data reconstructs correctly" {

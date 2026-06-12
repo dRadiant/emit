@@ -1,10 +1,18 @@
 //! `to`/`value` extraction from raw signed transactions as they appear in a
 //! block body's transaction list. Legacy txs are RLP lists, typed envelopes
 //! (EIP-2718) are type byte ‖ rlp list. Field positions are fixed per type,
-//! so extraction is a skip-walk over the existing `rlp.zig` cursor. No field
-//! materialization, no allocation, no signature work. Senders come from the
-//! receipt rows (ADR-006), never from recovery here.
+//! so extraction is a skip-walk over the existing `rlp.zig` cursor with no
+//! field materialization.
+//!
+//! `decodeSigned` adds the sender-recovery inputs via the *splice sighash*
+//! (ADR-006): a typed envelope's signing payload is its signed bytes with the
+//! trailing `(y_parity, r, s)` dropped and the list header re-lengthened, so
+//! the hash needs no per-type re-encoder and is shape-generic over future
+//! types. Used when a receipt row carries no stored sender (Nethermind's
+//! compact format leaves the slot empty).
 const std = @import("std");
+
+const eth = @import("eth");
 
 const Rlp = @import("rlp.zig").Rlp;
 
@@ -71,6 +79,125 @@ pub fn decode(raw: []const u8) Error!TxFields {
     };
 }
 
+pub const SignedTx = struct {
+    fields: TxFields,
+    sighash: [32]u8,
+    /// Recovery-ready: `v` is the y-parity (0/1) `secp256k1.recover` expects.
+    sig: eth.signature.Signature,
+};
+
+/// Generous bound on tx list items. The largest current envelope (4844) has
+/// 14. A fork pushing past 16 fails loud here.
+const MAX_TX_ITEMS = 16;
+
+/// Decode fields plus the signing hash and signature for sender recovery.
+/// `scratch` holds the rebuilt unsigned payload, sized ≥ raw.len + 16 and
+/// 8-aligned (the XKCP keccak does u64 lane loads).
+pub fn decodeSigned(raw: []const u8, scratch: []u8) Error!SignedTx {
+    const fields = try decode(raw);
+    const body = if (fields.tx_type != 0) raw[1..] else raw;
+
+    var rlp = Rlp.init(body);
+    const end = try rlp.enterList();
+    const payload_start = rlp.pos;
+
+    var starts: [MAX_TX_ITEMS]usize = undefined;
+    var n: usize = 0;
+    while (rlp.pos < end) {
+        if (n >= MAX_TX_ITEMS) return error.Malformed;
+        starts[n] = rlp.pos;
+        try rlp.skip();
+        n += 1;
+    }
+    if (n < 4) return error.Malformed;
+    const sig_off = starts[n - 3];
+
+    var sig_rlp = Rlp.init(body);
+    sig_rlp.pos = sig_off;
+    const v_raw = try sig_rlp.uint();
+    const r_b = try sig_rlp.bytes();
+    const s_b = try sig_rlp.bytes();
+    if (r_b.len > 32 or s_b.len > 32) return error.Malformed;
+    var sig = eth.signature.Signature{
+        .r = Rlp.padLeft(32, r_b),
+        .s = Rlp.padLeft(32, s_b),
+        .v = 0,
+    };
+
+    const content = body[payload_start..sig_off];
+    var hash_len: usize = 0;
+
+    if (fields.tx_type != 0) {
+        // Typed: keccak(type ‖ rlp([fields…])), the splice.
+        if (v_raw > 1) return error.Malformed;
+        sig.v = @intCast(v_raw);
+        scratch[0] = fields.tx_type;
+        const hdr = writeListHdr(scratch[1..], content.len);
+        if (1 + hdr + content.len > scratch.len) return error.Malformed;
+        @memcpy(scratch[1 + hdr ..][0..content.len], content);
+        hash_len = 1 + hdr + content.len;
+    } else {
+        // Legacy: pre-155 hashes the six fields, EIP-155 appends
+        // (chain_id, 0, 0) with chain_id derived from v.
+        var suffix_buf: [11]u8 = undefined;
+        var suffix: []const u8 = &.{};
+        if (v_raw == 27 or v_raw == 28) {
+            sig.v = @intCast(v_raw - 27);
+        } else if (v_raw >= 35) {
+            sig.v = @intCast((v_raw - 35) & 1);
+            const sl = uintRlp(&suffix_buf, (v_raw - 35) >> 1);
+            suffix_buf[sl] = 0x80;
+            suffix_buf[sl + 1] = 0x80;
+            suffix = suffix_buf[0 .. sl + 2];
+        } else return error.Malformed;
+        const hdr = writeListHdr(scratch, content.len + suffix.len);
+        if (hdr + content.len + suffix.len > scratch.len) return error.Malformed;
+        @memcpy(scratch[hdr..][0..content.len], content);
+        @memcpy(scratch[hdr + content.len ..][0..suffix.len], suffix);
+        hash_len = hdr + content.len + suffix.len;
+    }
+
+    return .{ .fields = fields, .sighash = eth.keccak.hash(scratch[0..hash_len]), .sig = sig };
+}
+
+/// Sender address from a recovered signature. Equivalent to eth.zig's
+/// `recoverAddress`, but hashes an 8-aligned copy of the pubkey: the XKCP
+/// keccak does u64 lane loads, and eth.zig feeds it `pubkey[1..]` (odd
+/// offset), which UBSan rejects in Debug test builds.
+pub fn recoverSender(sig: eth.signature.Signature, sighash: [32]u8) ![20]u8 {
+    const pk = try eth.secp256k1.recover(sig, sighash);
+    var xy: [64]u8 align(8) = undefined;
+    @memcpy(&xy, pk[1..65]);
+    const h = eth.keccak.hash(&xy);
+    return h[12..32].*;
+}
+
+fn writeListHdr(buf: []u8, len: usize) usize {
+    if (len <= 55) {
+        buf[0] = 0xC0 + @as(u8, @intCast(len));
+        return 1;
+    }
+    const nbytes: usize = (64 - @as(usize, @clz(@as(u64, @intCast(len)))) + 7) / 8;
+    buf[0] = 0xF7 + @as(u8, @intCast(nbytes));
+    for (0..nbytes) |i| buf[1 + i] = @truncate(len >> @intCast(8 * (nbytes - 1 - i)));
+    return 1 + nbytes;
+}
+
+fn uintRlp(buf: []u8, v: u64) usize {
+    if (v == 0) {
+        buf[0] = 0x80;
+        return 1;
+    }
+    if (v < 0x80) {
+        buf[0] = @intCast(v);
+        return 1;
+    }
+    const nbytes: usize = (64 - @as(usize, @clz(v)) + 7) / 8;
+    buf[0] = 0x80 + @as(u8, @intCast(nbytes));
+    for (0..nbytes) |i| buf[1 + i] = @truncate(v >> @intCast(8 * (nbytes - 1 - i)));
+    return 1 + nbytes;
+}
+
 /// Forward iterator over the transactions list of a full block RLP
 /// (`[header, [txs…], [ommers…], …]`, the Nethermind blocks-DB value shape).
 /// Yields each tx item as decode-ready bytes: the list slice for legacy txs,
@@ -103,6 +230,16 @@ pub const BodyTxs = struct {
 const testing = std.testing;
 
 const TO = [_]u8{0xAA} ** 20;
+
+/// Test signer derivation through the same aligned-hash path as
+/// `recoverSender`.
+fn signerOf(priv: [32]u8) ![20]u8 {
+    const pk = try eth.secp256k1.derivePublicKey(priv);
+    var xy: [64]u8 align(8) = undefined;
+    @memcpy(&xy, pk[1..65]);
+    const h = eth.keccak.hash(&xy);
+    return h[12..32].*;
+}
 
 /// Legacy tx list: [nonce=1, gas_price=2, gas=3, to, value, data="", v, r, s].
 fn legacyTx(comptime to_item: []const u8, comptime value_item: []const u8) []const u8 {
@@ -177,6 +314,84 @@ test "unknown envelope type fails loud" {
 test "string-prefixed input is rejected, not misparsed" {
     // The enclosing RLP string of a typed tx, not its payload.
     try testing.expectError(error.Malformed, decode(&[_]u8{ 0x83, 0x02, 0xC1, 0x01 }));
+}
+
+test "decodeSigned recovers the signer eth.zig signed with (closed loop)" {
+    // Independent implementations validate each other: eth.zig encodes and
+    // signs, the splice sighash must reproduce the hash and recover the key.
+    const priv = [_]u8{0x42} ** 31 ++ [_]u8{0x01};
+    const signer = try signerOf(priv);
+    var scratch: [1024]u8 align(8) = undefined;
+
+    const cases = [_]eth.transaction.Transaction{
+        .{ .legacy = .{ .nonce = 7, .gas_price = 30, .gas_limit = 21_000, .to = TO, .value = 12_345, .data = &.{ 0xAB, 0xCD }, .chain_id = 1 } },
+        .{ .legacy = .{ .nonce = 7, .gas_price = 30, .gas_limit = 21_000, .to = TO, .value = 5, .data = &.{}, .chain_id = null } },
+        .{ .eip2930 = .{ .chain_id = 1, .nonce = 9, .gas_price = 30, .gas_limit = 50_000, .to = TO, .value = 0, .data = &.{0x01}, .access_list = &.{} } },
+        .{ .eip1559 = .{ .chain_id = 1, .nonce = 3, .max_priority_fee_per_gas = 2, .max_fee_per_gas = 100, .gas_limit = 21_000, .to = TO, .value = 1_000_000_000_000_000_000, .data = &.{}, .access_list = &.{} } },
+    };
+    for (cases) |tx| {
+        const sighash = try eth.transaction.hashForSigning(testing.allocator, tx);
+        const sig = try eth.secp256k1.sign(priv, sighash);
+        // Wire v: typed carries the parity, legacy folds it into 27/28 or
+        // the EIP-155 form.
+        const wire_v: u8 = switch (tx) {
+            .legacy => |l| if (l.chain_id) |cid| @intCast(35 + 2 * cid + sig.v) else 27 + sig.v,
+            else => sig.v,
+        };
+        const raw = try eth.transaction.serializeSigned(testing.allocator, tx, sig.r, sig.s, wire_v);
+        defer testing.allocator.free(raw);
+
+        const st = try decodeSigned(raw, &scratch);
+        try testing.expectEqualSlices(u8, &sighash, &st.sighash);
+        const recovered = try recoverSender(st.sig, st.sighash);
+        try testing.expectEqualSlices(u8, &signer, &recovered);
+    }
+}
+
+test "decodeSigned recovers a hand-built EIP-7702 envelope (shape-generic)" {
+    // eth.zig has no 7702 type. Build the envelope by hand: the splice must
+    // still reproduce the signing payload because it never names the fields.
+    // [chain, nonce, max_pri, max_fee, gas, to, value, data, access, auth_list]
+    const priv = [_]u8{0x42} ** 31 ++ [_]u8{0x01};
+    const signer = try signerOf(priv);
+
+    const head = [_]u8{ 0x01, 0x07, 0x02, 0x64, 0x83, 0x01, 0x00, 0x00 }; // chain,nonce,pri,fee,gas(3B)
+    const to_item = [_]u8{0x94} ++ TO;
+    const tail = [_]u8{ 0x05, 0x80, 0xC0, 0xC0 }; // value=5, data="", access=[], auth=[]
+    const payload = head ++ to_item ++ tail;
+
+    var unsigned_buf: [64]u8 = undefined;
+    unsigned_buf[0] = 0x04;
+    unsigned_buf[1] = 0xC0 + @as(u8, payload.len);
+    @memcpy(unsigned_buf[2..][0..payload.len], &payload);
+    const sighash = eth.keccak.hash(unsigned_buf[0 .. 2 + payload.len]);
+    const sig = try eth.secp256k1.sign(priv, sighash);
+
+    // Signed envelope: 0x04 ‖ rlp([fields…, y_parity, r, s]). The content
+    // (~100 B) needs the long-form list header.
+    var signed_buf: [160]u8 = undefined;
+    signed_buf[0] = 0x04;
+    signed_buf[1] = 0xF8;
+    var pos: usize = 3;
+    @memcpy(signed_buf[pos..][0..payload.len], &payload);
+    pos += payload.len;
+    signed_buf[pos] = if (sig.v == 0) 0x80 else 0x01;
+    pos += 1;
+    signed_buf[pos] = 0xA0;
+    @memcpy(signed_buf[pos + 1 ..][0..32], &sig.r);
+    pos += 33;
+    signed_buf[pos] = 0xA0;
+    @memcpy(signed_buf[pos + 1 ..][0..32], &sig.s);
+    pos += 33;
+    signed_buf[2] = @intCast(pos - 3);
+
+    var scratch: [256]u8 align(8) = undefined;
+    const st = try decodeSigned(signed_buf[0..pos], &scratch);
+    try testing.expectEqual(@as(u8, 0x04), st.fields.tx_type);
+    try testing.expectEqual(@as(u256, 5), st.fields.value);
+    try testing.expectEqualSlices(u8, &sighash, &st.sighash);
+    const recovered = try recoverSender(st.sig, st.sighash);
+    try testing.expectEqualSlices(u8, &signer, &recovered);
 }
 
 test "BodyTxs walks a block's tx list yielding decode-ready items" {
