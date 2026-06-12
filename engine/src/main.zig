@@ -31,6 +31,7 @@ pub fn main() !void {
             .ws_url = getFlag(args, "--ws"),
             .data_dir = data_dir,
             .allow_rpc_catchup = hasFlag(args, "--catch-up-rpc"),
+            .tx_fields = !hasFlag(args, "--no-tx-fields"),
         });
     }
 
@@ -95,6 +96,7 @@ pub fn main() !void {
                 .from_block = if (getFlag(args, "--from")) |f| try std.fmt.parseInt(u64, f, 10) else null,
                 .to_block = if (getFlag(args, "--to")) |t| try std.fmt.parseInt(u64, t, 10) else null,
                 .timestamps = !hasFlag(args, "--no-timestamps"),
+                .tx_fields = !hasFlag(args, "--no-tx-fields"),
             });
         }
 
@@ -173,9 +175,9 @@ fn usage() noreturn {
         \\
         \\Commands:
         \\  import --rocksdb <path> --data-dir <path>   Bulk import from Nethermind
-        \\  import --rpc <url> --data-dir <path> [--from N] [--to N] [--no-timestamps]
+        \\  import --rpc <url> --data-dir <path> [--from N] [--to N] [--no-timestamps] [--no-tx-fields]
         \\                                              Import via eth_getLogs (+ timestamps)
-        \\  follow --rpc <url> [--ws <url>] --data-dir <path> [--catch-up-rpc]
+        \\  follow --rpc <url> [--ws <url>] --data-dir <path> [--catch-up-rpc] [--no-tx-fields]
         \\                                              Follow chain head
         \\  serve [--listen <host:port>] [--max-connections <n>] --data-dir <path>
         \\                                              Stream filtered blocks to remote indexers (default 127.0.0.1:9090, 16 workers)

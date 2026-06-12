@@ -258,10 +258,21 @@ pub const TxsWriter = struct {
         serialize_buf: []u8,
         compress_buf: []u8,
     ) !void {
+        const written = serializeRecords(records, serialize_buf);
+        try self.appendSerialized(block, serialize_buf[0..written], compress_buf);
+    }
+
+    /// Append a pre-serialized table payload (count ‖ records), the
+    /// pending-ring mirror path. Same dense contract as `append`.
+    pub fn appendSerialized(
+        self: *TxsWriter,
+        block: u64,
+        payload: []const u8,
+        compress_buf: []u8,
+    ) !void {
         if (block != self.first_block + self.count) return error.NonDenseAppend;
 
-        const written = serializeRecords(records, serialize_buf);
-        const entry_len = try log_serial.compressEntry(serialize_buf[0..written], compress_buf);
+        const entry_len = try log_serial.compressEntry(payload, compress_buf);
         try self.dat.pwriteAll(compress_buf[0..entry_len], self.dat_size);
 
         var e: [IDX_ENTRY_SIZE]u8 = undefined;

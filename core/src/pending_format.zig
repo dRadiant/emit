@@ -14,6 +14,8 @@
 //!     addr_bloom(ADDR_BLOOM_SIZE = 1024)
 //!     lz4_len(u32 LE)
 //!     lz4_data(lz4_len)
+//!     tx_len(u32 LE)
+//!     tx_table(tx_len)       serialized core.txs records (count u32 ‖ records)
 //!
 //! Magic distinguishes a pre-magic/foreign file from a corrupt one. Mismatch
 //! surfaces `error.InvalidMagic`, treated as "no usable ring" (follower
@@ -25,10 +27,12 @@ const types = @import("types.zig");
 
 pub const FINALITY_DEPTH = types.FINALITY_DEPTH;
 pub const HASH_SIZE: usize = 32;
-pub const MAGIC: [8]u8 = "EMITPEND".*;
+// "EMITPND2": v2 appends the per-block tx table (ADR-006). The magic gate
+// makes the migration free, a v1 ring reads as empty and re-baselines.
+pub const MAGIC: [8]u8 = "EMITPND2".*;
 pub const HEADER_SIZE: usize = MAGIC.len + 4; // magic(8) + count(u32 LE)
 pub const FIXED_ENTRY_SIZE: usize =
-    8 + 4 + HASH_SIZE + bloom.BLOOM_SIZE + bloom.ADDR_BLOOM_SIZE + 4;
+    8 + 4 + HASH_SIZE + bloom.BLOOM_SIZE + bloom.ADDR_BLOOM_SIZE + 4 + 4;
 
 /// A parsed entry. `lz4_entry` is a non-owning slice into the source buffer
 /// passed to `parse`. Callers must keep that buffer alive while reading.
@@ -39,6 +43,10 @@ pub const Entry = struct {
     topic_bloom: [bloom.BLOOM_SIZE]u8,
     addr_bloom: [bloom.ADDR_BLOOM_SIZE]u8,
     lz4_entry: []const u8,
+    /// Serialized `core.txs` table for the block's log-producing txs
+    /// (count u32 ‖ TxRecords), parse via `txs.deserializeRecords`. Empty
+    /// when the source had no table (no log txs, or fields disabled).
+    tx_table: []const u8 = &.{},
 };
 
 pub const ParseError = error{ Truncated, InvalidMagic, OutOfMemory };
@@ -49,7 +57,7 @@ pub const ValidateError = ParseError || error{ NonDense, Oversized };
 /// `pending_format.Entry` (zero-copy view) and engine-side owning variants.
 pub fn serialize(allocator: std.mem.Allocator, entries: anytype) ![]u8 {
     var total_size: usize = HEADER_SIZE;
-    for (entries) |e| total_size += FIXED_ENTRY_SIZE + e.lz4_entry.len;
+    for (entries) |e| total_size += FIXED_ENTRY_SIZE + e.lz4_entry.len + e.tx_table.len;
 
     const buf = try allocator.alloc(u8, total_size);
     errdefer allocator.free(buf);
@@ -73,6 +81,10 @@ pub fn serialize(allocator: std.mem.Allocator, entries: anytype) ![]u8 {
         pos += 4;
         @memcpy(buf[pos..][0..e.lz4_entry.len], e.lz4_entry);
         pos += e.lz4_entry.len;
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(e.tx_table.len), .little);
+        pos += 4;
+        @memcpy(buf[pos..][0..e.tx_table.len], e.tx_table);
+        pos += e.tx_table.len;
     }
     return buf;
 }
@@ -108,9 +120,14 @@ pub fn parse(allocator: std.mem.Allocator, buf: []const u8) ParseError![]Entry {
         pos += bloom.ADDR_BLOOM_SIZE;
         const lz4_len: usize = std.mem.readInt(u32, buf[pos..][0..4], .little);
         pos += 4;
-        if (pos + lz4_len > buf.len) return error.Truncated;
+        if (pos + lz4_len + 4 > buf.len) return error.Truncated;
         e.lz4_entry = buf[pos..][0..lz4_len];
         pos += lz4_len;
+        const tx_len: usize = std.mem.readInt(u32, buf[pos..][0..4], .little);
+        pos += 4;
+        if (pos + tx_len > buf.len) return error.Truncated;
+        e.tx_table = buf[pos..][0..tx_len];
+        pos += tx_len;
     }
     return entries;
 }
@@ -165,6 +182,7 @@ test "serialize + parse round-trip preserves every field" {
     const topic = [_]u8{0xAA} ** bloom.BLOOM_SIZE;
     const addr = [_]u8{0xBB} ** bloom.ADDR_BLOOM_SIZE;
     const lz4 = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
+    const table = [_]u8{ 0x01, 0x00, 0x00, 0x00 } ++ [_]u8{0x7E} ** 76; // count=1 + one record
 
     const original = [_]Entry{.{
         .block_number = 12345,
@@ -173,6 +191,7 @@ test "serialize + parse round-trip preserves every field" {
         .topic_bloom = topic,
         .addr_bloom = addr,
         .lz4_entry = &lz4,
+        .tx_table = &table,
     }};
 
     const buf = try serialize(testing.allocator, &original);
@@ -189,6 +208,7 @@ test "serialize + parse round-trip preserves every field" {
     try testing.expectEqualSlices(u8, &topic, &parsed[0].topic_bloom);
     try testing.expectEqualSlices(u8, &addr, &parsed[0].addr_bloom);
     try testing.expectEqualSlices(u8, &lz4, parsed[0].lz4_entry);
+    try testing.expectEqualSlices(u8, &table, parsed[0].tx_table);
 }
 
 test "serialize empty slice produces just the magic + count header" {

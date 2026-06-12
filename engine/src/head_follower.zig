@@ -9,6 +9,8 @@ const eth = @import("eth");
 
 const FlatStoreWriter = @import("flat_writer.zig").FlatStoreWriter;
 const pending_ring = @import("pending_ring.zig");
+const rpc_import = @import("rpc_import.zig");
+const tx_json = @import("tx_json.zig");
 
 const PendingRing = pending_ring.PendingRing;
 const log_serial = core.log_serial;
@@ -23,6 +25,17 @@ pub const FollowConfig = struct {
     /// `GAP_REFUSE_THRESHOLD` blocks behind tip. Default refuses loud and
     /// points the operator at `import --rocksdb`.
     allow_rpc_catchup: bool = false,
+    /// Build per-block tx tables (ADR-006): one full-block fetch per new
+    /// block, mirrored into txs.dat on finalization. `--no-tx-fields` off.
+    tx_fields: bool = true,
+};
+
+/// Live tx-table support: the full-block fetch transport plus the txs.dat
+/// mirror target. Null end-to-end under --no-tx-fields.
+const TxTables = struct {
+    http: *eth.http_transport.HttpTransport,
+    /// Null when the store is fresh (first_block unknown), mirror skipped.
+    writer: ?*core.txs.TxsWriter,
 };
 
 /// Block count above which `follow` start refuses an RPC-only catch-up.
@@ -73,6 +86,21 @@ pub fn run(config: FollowConfig) !void {
             null;
     defer if (ts_writer) |*w| w.deinit();
 
+    // Tx tables ride their own transport (the provider owns `http`) and
+    // mirror into txs.dat with the same advisory semantics as timestamps.
+    var txs_http = eth.http_transport.HttpTransport.init(alloc, config.rpc_url);
+    var txs_writer: ?core.txs.TxsWriter =
+        if (config.tx_fields and writer.first_block != 0)
+            core.txs.TxsWriter.open(dir, writer.first_block) catch null
+        else
+            null;
+    defer if (txs_writer) |*w| w.deinit();
+    var tx_tables: ?TxTables = if (config.tx_fields)
+        .{ .http = &txs_http, .writer = if (txs_writer) |*w| w else null }
+    else
+        null;
+    const txs: ?*TxTables = if (tx_tables) |*t| t else null;
+
     // Refuse follow against a stale baseline. Baseline is the highest known
     // block (pending tip if any, else last finalized), compared to chain tip.
     // Skipped when the dir is fresh (baseline = 0) or the operator opts into
@@ -115,7 +143,7 @@ pub fn run(config: FollowConfig) !void {
             // Bound sub.next() so a half-open stream (TCP up, no frames) surfaces
             // a read error and reconnects, instead of blocking forever.
             setReadTimeout(ws.stream.handle, WS_READ_TIMEOUT_S);
-            followWs(&ws, &provider, &writer, &ring, alloc, if (ts_writer) |*w| w else null) catch |err| {
+            followWs(&ws, &provider, &writer, &ring, alloc, if (ts_writer) |*w| w else null, txs) catch |err| {
                 core.log.info("WS error ({s}), polling then reconnecting\n", .{@errorName(err)});
             };
         }
@@ -123,7 +151,7 @@ pub fn run(config: FollowConfig) !void {
         // One poll cycle. The only mode when --ws is absent, a stopgap between
         // WS reconnects otherwise. A healthy WS never returns, so this is skipped.
         var poll_ok = true;
-        followPoll(&provider, &writer, &ring, alloc, if (ts_writer) |*w| w else null) catch |err| {
+        followPoll(&provider, &writer, &ring, alloc, if (ts_writer) |*w| w else null, txs) catch |err| {
             poll_ok = false;
             poll_fails += 1;
             // Visible at the default level on the first failure and periodically
@@ -148,6 +176,7 @@ fn followWs(
     ring: *PendingRing,
     alloc: std.mem.Allocator,
     ts_writer: ?*core.timestamps.TimestampWriter,
+    txs: ?*TxTables,
 ) !void {
     var sub = try eth.subscription.Subscription.subscribe(alloc, ws, .{ .new_heads = {} });
     defer sub.deinit();
@@ -177,8 +206,8 @@ fn followWs(
         // stop. The next notification retries from the new tip, ring stays dense.
         var bn = tip + 1;
         while (bn <= block_number) : (bn += 1) {
-            finalizeReady(ring, writer, bn, alloc, ts_writer);
-            ingestBlock(bn, provider, ring, alloc) catch |err| {
+            finalizeReady(ring, writer, bn, alloc, ts_writer, txs);
+            ingestBlock(bn, provider, ring, alloc, txs) catch |err| {
                 core.log.info("Block {d}: {s}\n", .{ bn, @errorName(err) });
                 break;
             };
@@ -194,6 +223,7 @@ fn followPoll(
     ring: *PendingRing,
     alloc: std.mem.Allocator,
     ts_writer: ?*core.timestamps.TimestampWriter,
+    txs: ?*TxTables,
 ) !void {
     const latest = try provider.getBlockNumber();
     const tip = ring.latestBlock() orelse
@@ -203,8 +233,8 @@ fn followPoll(
     // Finalize before each insert so the ring stays within FINALITY_DEPTH on
     // disk even across a large catch-up. See followWs for the full rationale.
     for (tip + 1..latest + 1) |bn| {
-        finalizeReady(ring, writer, @intCast(bn), alloc, ts_writer);
-        ingestBlock(@intCast(bn), provider, ring, alloc) catch |err| {
+        finalizeReady(ring, writer, @intCast(bn), alloc, ts_writer, txs);
+        ingestBlock(@intCast(bn), provider, ring, alloc, txs) catch |err| {
             core.log.info("Block {d}: {s}\n", .{ bn, @errorName(err) });
             break;
         };
@@ -222,6 +252,7 @@ fn ingestBlock(
     provider: *eth.provider.Provider,
     ring: *PendingRing,
     parent_alloc: std.mem.Allocator,
+    txs: ?*TxTables,
 ) !void {
     var arena = std.heap.ArenaAllocator.init(parent_alloc);
     defer arena.deinit();
@@ -236,13 +267,13 @@ fn ingestBlock(
             const fork = try resolveReorg(ring, block_number, provider);
             var bn = fork;
             while (bn <= block_number) : (bn += 1) {
-                try ingestBlockNoReorgCheck(bn, provider, ring, parent_alloc);
+                try ingestBlockNoReorgCheck(bn, provider, ring, parent_alloc, txs);
             }
             return;
         }
     }
 
-    try ingestBlockCore(block_number, header, provider, ring, alloc);
+    try ingestBlockCore(block_number, header, provider, ring, alloc, txs);
 }
 
 /// Recovery-path ingest: skips the reorg check. Restoring canonical state, so
@@ -252,13 +283,14 @@ fn ingestBlockNoReorgCheck(
     provider: *eth.provider.Provider,
     ring: *PendingRing,
     parent_alloc: std.mem.Allocator,
+    txs: ?*TxTables,
 ) !void {
     var arena = std.heap.ArenaAllocator.init(parent_alloc);
     defer arena.deinit();
     const alloc = arena.allocator();
 
     const header = try provider.getBlock(block_number) orelse return error.BlockNotFound;
-    try ingestBlockCore(block_number, header, provider, ring, alloc);
+    try ingestBlockCore(block_number, header, provider, ring, alloc, txs);
 }
 
 /// Fetch logs for `block_number`, build blooms, compress, insert.
@@ -268,6 +300,7 @@ fn ingestBlockCore(
     provider: *eth.provider.Provider,
     ring: *PendingRing,
     alloc: std.mem.Allocator,
+    txs: ?*TxTables,
 ) !void {
     // Pin the query to the header's hash, not the number. A reorg between
     // `getBlock` and `getLogs` would otherwise store the new chain's logs
@@ -295,9 +328,57 @@ fn ingestBlockCore(
     const compress_buf = try alloc.alloc(u8, types.BLOCK_BUF_SIZE);
     const pack = try log_serial.packBlock(raw_logs, serialize_buf, compress_buf);
 
+    // Tx table for the block's log-producing txs. Strict like getLogs: a
+    // fetch failure fails the ingest and the next notification retries.
+    var tx_table: []const u8 = &.{};
+    if (txs) |t| {
+        const mask_buf = try alloc.alloc(u16, raw_logs.len);
+        const mask = tx_json.logMask(raw_logs, mask_buf);
+        tx_table = try fetchTxTable(t.http, block_number, mask, alloc);
+    }
+
     const ts: u32 = std.math.cast(u32, header.timestamp) orelse 0; // exact block time, valid until 2106
-    try ring.insert(block_number, ts, header.hash, &pack.topic_bloom.bits, &pack.addr_bloom.bits, compress_buf[0..pack.entry_len]);
+    try ring.insert(block_number, ts, header.hash, &pack.topic_bloom.bits, &pack.addr_bloom.bits, compress_buf[0..pack.entry_len], tx_table);
     core.log.debug("Block {d}: {d} logs\n", .{ block_number, raw_logs.len });
+}
+
+/// Fetch the block's full tx objects and serialize the log-producing
+/// records (the node's senders are pre-recovered, no crypto). Returns the
+/// table payload (count ‖ records), arena-owned. An empty mask serializes a
+/// count=0 table without touching the network, keeping "built" (len ≥ 4)
+/// distinguishable from "disabled" (len 0) at the txs.dat mirror.
+fn fetchTxTable(http: *eth.http_transport.HttpTransport, bn: u64, mask: []const u16, alloc: std.mem.Allocator) ![]const u8 {
+    if (mask.len == 0) {
+        const buf = try alloc.alloc(u8, 4);
+        return buf[0..core.txs.serializeRecords(&.{}, buf)];
+    }
+
+    var body_buf: [128]u8 = undefined;
+    const body = try std.fmt.bufPrint(&body_buf, "{{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"eth_getBlockByNumber\",\"params\":[\"0x{x}\",true]}}", .{bn});
+    const raw = try rpc_import.httpPost(http, body, alloc);
+
+    const Resp = struct { result: ?struct { transactions: []tx_json.JsonTx } = null };
+    const parsed = try std.json.parseFromSlice(Resp, alloc, raw, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const result = parsed.value.result orelse return error.BlockUnavailable;
+
+    const records = try alloc.alloc(core.txs.TxRecord, mask.len);
+    const filled = try tx_json.buildRecords(result.transactions, mask, records);
+    const buf = try alloc.alloc(u8, 4 + filled.len * core.txs.RECORD_SIZE);
+    return buf[0..core.txs.serializeRecords(filled, buf)];
+}
+
+/// Mirror a finalized block's table into txs.dat. Dense-append only: a
+/// cursor gap means the import owns the backfill (advisory artifact), and an
+/// unbuilt table (len 0, pre-enable history) must not write a false empty.
+fn mirrorTxTable(tw: *core.txs.TxsWriter, block: u64, table: []const u8, alloc: std.mem.Allocator) void {
+    if (table.len == 0) return;
+    if (block != tw.first_block + tw.count) return;
+    const cbuf = alloc.alloc(u8, table.len + table.len / 128 + 64) catch return;
+    defer alloc.free(cbuf);
+    tw.appendSerialized(block, table, cbuf) catch |e| {
+        core.log.debug("txs.dat mirror skipped at block {d}: {s}\n", .{ block, @errorName(e) });
+    };
 }
 
 /// Truncate divergent pending entries down to the fork point and return it,
@@ -337,6 +418,7 @@ fn finalizeReady(
     head: u64,
     alloc: std.mem.Allocator,
     ts_writer: ?*core.timestamps.TimestampWriter,
+    txs: ?*TxTables,
 ) void {
     var popped_count: u32 = 0;
     var finalized: u32 = 0;
@@ -356,7 +438,9 @@ fn finalizeReady(
             if (oldest.timestamp != 0) w.set(oldest.block_number, oldest.timestamp) catch {};
         }
         const popped = ring.popOldest().?;
+        if (txs) |t| if (t.writer) |tw| mirrorTxTable(tw, popped.block_number, popped.tx_table, alloc);
         alloc.free(popped.lz4_entry);
+        alloc.free(popped.tx_table);
         popped_count += 1;
         if (writer.meta.last_finalized_block > pre) finalized += 1;
     }
@@ -443,15 +527,15 @@ test "finalizeReady mirrors finalized timestamps into timestamps.bin" {
     const hash = [_]u8{0xAB} ** 32;
 
     // Two pending blocks carrying exact header timestamps.
-    try ring.insert(100, 1_700_000_000, hash, &topic, &addr, &entry);
-    try ring.insert(101, 1_700_000_012, hash, &topic, &addr, &entry);
+    try ring.insert(100, 1_700_000_000, hash, &topic, &addr, &entry, &.{});
+    try ring.insert(101, 1_700_000_012, hash, &topic, &addr, &entry, &.{});
 
     // Opened at the known first block, as run() does post-import.
     var ts_writer = try core.timestamps.TimestampWriter.open(tmp.dir, 100);
     defer ts_writer.deinit();
 
     // head = 100 + FINALITY_DEPTH finalizes only block 100. 101 stays pending.
-    finalizeReady(&ring, &writer, 100 + pending_ring.FINALITY_DEPTH, alloc, &ts_writer);
+    finalizeReady(&ring, &writer, 100 + pending_ring.FINALITY_DEPTH, alloc, &ts_writer, null);
 
     var reader = (try core.timestamps.TimestampReader.open(tmp.dir)).?;
     defer reader.deinit();
@@ -486,8 +570,8 @@ test "catch-up finalizes as it ingests so the ring stays within FINALITY_DEPTH" 
 
         var bn: u64 = 1;
         while (bn <= last) : (bn += 1) {
-            finalizeReady(&ring, &writer, bn, alloc, null);
-            try ring.insert(bn, 0, hash, &topic, &addr, &entry);
+            finalizeReady(&ring, &writer, bn, alloc, null, null);
+            try ring.insert(bn, 0, hash, &topic, &addr, &entry, &.{});
             try std.testing.expect(ring.count() <= pending_ring.FINALITY_DEPTH);
         }
     }
@@ -522,7 +606,7 @@ const reorg_test = struct {
     fn ringOf(dir: std.fs.Dir, alloc: std.mem.Allocator) !PendingRing {
         var ring = try PendingRing.open(dir, alloc);
         errdefer ring.deinit();
-        for (100..110) |bn| try ring.insert(bn, 0, old_hash, &topic, &addr, &entry);
+        for (100..110) |bn| try ring.insert(bn, 0, old_hash, &topic, &addr, &entry, &.{});
         return ring;
     }
 };
