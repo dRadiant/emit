@@ -19,6 +19,7 @@ pub const pending_format = @import("pending_format.zig");
 pub const atomic_file = @import("atomic_file.zig");
 pub const flat_format = @import("flat_format.zig");
 pub const timestamps = @import("timestamps.zig");
+pub const txs = @import("txs.zig");
 pub const tcp_frame = @import("tcp_frame.zig");
 
 // Top-level re-exports of commonly used types.
@@ -45,5 +46,6 @@ test {
     _ = atomic_file;
     _ = flat_format;
     _ = timestamps;
+    _ = txs;
     _ = tcp_frame;
 }
