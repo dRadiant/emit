@@ -1,6 +1,6 @@
 # ADR-005: Variable-Length Entity Fields — Out-of-Line Blobs
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-06-05 (proposed)
 **Context**: ADR-003 established the SDK's pure-Zig storage: fixed-stride sorted slabs in `state.snap` for `MutableStore`, append-only `<entity>.events.dat` for `ImmutableStore`, both serialized by the comptime `entity_serial.zig`. That serializer accepts only integers and fixed-size `[N]u8` arrays — every record has a comptime-constant width, which is what makes the slab binary-searchable (`base + i·stride`) and the records stack-copyable. This ADR decides how to add **variable-length fields** (Solidity `string`, dynamic `bytes`, flat dynamic arrays) without giving up any of those properties.
 
