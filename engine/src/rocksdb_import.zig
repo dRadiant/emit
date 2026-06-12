@@ -383,10 +383,9 @@ fn runHeaderTimestamps(
 /// `decodeSenders` still fails loud at the boundary rather than dropping.
 const MAX_TXS_PER_BLOCK = 65_536;
 
-/// Scratch for the tx pass, heap-allocated once (~17 MB).
+/// Main-thread scratch for the tx pass, heap-allocated once.
 const TxPassBufs = struct {
     senders: []receipt_decoder.TxSenderInfo,
-    records: []core.txs.TxRecord,
     serialize_buf: []u8,
     compress_buf: []u8,
     // Dup-group resolution: candidate receipt logs vs our store's logs.
@@ -395,14 +394,11 @@ const TxPassBufs = struct {
     store_entry: []u8,
     store_decomp: []u8,
     store_logs: []core.RawLog,
-    /// Unsigned-payload rebuild for the splice sighash, 8-aligned for keccak.
-    sighash_scratch: []u8,
 
     fn init(a: std.mem.Allocator) !TxPassBufs {
         const table_max = 4 + MAX_TXS_PER_BLOCK * core.txs.RECORD_SIZE;
         return .{
             .senders = try a.alloc(receipt_decoder.TxSenderInfo, MAX_TXS_PER_BLOCK),
-            .records = try a.alloc(core.txs.TxRecord, MAX_TXS_PER_BLOCK),
             .serialize_buf = try a.alloc(u8, table_max),
             .compress_buf = try a.alloc(u8, table_max + table_max / 128 + 64),
             .cand_logs = try a.alloc(core.RawLog, core.types.MAX_LOGS_PER_BLOCK),
@@ -410,10 +406,165 @@ const TxPassBufs = struct {
             .store_entry = try a.alloc(u8, core.types.BLOCK_BUF_SIZE),
             .store_decomp = try a.alloc(u8, core.types.BLOCK_BUF_SIZE),
             .store_logs = try a.alloc(core.RawLog, core.types.MAX_LOGS_PER_BLOCK),
-            .sighash_scratch = try a.alignedAlloc(u8, .@"8", core.types.BLOCK_BUF_SIZE),
         };
     }
 };
+
+/// Per-block alloc/free at pipeline rate (slot senders + records).
+const tx_alloc = std.heap.smp_allocator;
+
+/// Recovery worker count. Wider than the I/O-tuned `parallel.MAX_WORKERS`:
+/// the pass is ecrecover-bound pure compute, so use the logical cores minus
+/// the reader/drain thread.
+const TX_WORKERS = 10;
+
+/// Recovery pipeline slot. EMPTY → FILLED (main: receipts walk + bodies get)
+/// → DONE (owner worker: decode + recover) → EMPTY (main: ordered drain into
+/// TxsWriter). Worker `slot_index % TX_WORKERS` owns the FILLED→DONE edge,
+/// so slots are single-writer at every transition. Ring bound: ≤ 128 bodies
+/// (~25 MB typical) in flight.
+const TX_SLOT_COUNT = 128;
+
+const TxSlot = struct {
+    state: std.atomic.Value(u8) = .init(EMPTY),
+    block_number: u64 = 0,
+    /// RocksDB-owned body bytes, freed at drain. Empty for no-log blocks
+    /// (those skip the workers entirely).
+    body: []const u8 = &.{},
+    senders: []receipt_decoder.TxSenderInfo = &.{},
+    records: []core.txs.TxRecord = &.{},
+    rec_count: usize = 0,
+    unrecovered: u32 = 0,
+    err: ?anyerror = null,
+
+    const EMPTY: u8 = 0;
+    const FILLED: u8 = 1;
+    const DONE: u8 = 2;
+};
+
+const TxWorkerArgs = struct {
+    slots: []TxSlot,
+    worker_id: usize,
+    shutdown: *const std.atomic.Value(bool),
+};
+
+fn txWorker(args: *TxWorkerArgs) void {
+    // 4 MB stack scratch, safe under the core.parallel worker-stack rule.
+    // 8-aligned for the XKCP keccak's u64 lane loads.
+    var scratch: [core.types.BLOCK_BUF_SIZE]u8 align(8) = undefined;
+    while (true) {
+        var idle = true;
+        var i: usize = args.worker_id;
+        while (i < args.slots.len) : (i += TX_WORKERS) {
+            const slot = &args.slots[i];
+            if (slot.state.load(.acquire) != TxSlot.FILLED) continue;
+            processTxSlot(slot, &scratch) catch |e| {
+                slot.err = e;
+            };
+            slot.state.store(TxSlot.DONE, .release);
+            idle = false;
+        }
+        if (idle) {
+            if (args.shutdown.load(.acquire)) return;
+            std.atomic.spinLoopHint();
+        }
+    }
+}
+
+/// Decode + recover every log-producing tx in the slot's body. Walks every
+/// body tx so a count mismatch in either direction fails loud (the
+/// no-silent-caps rule).
+fn processTxSlot(slot: *TxSlot, scratch: []align(8) u8) !void {
+    var it = try tx_decode.BodyTxs.init(slot.body);
+    var tx_index: usize = 0;
+    var rec_count: usize = 0;
+    while (try it.next()) |raw| : (tx_index += 1) {
+        if (tx_index >= slot.senders.len) continue; // counted, checked below
+        const info = slot.senders[tx_index];
+        if (!info.has_logs) continue;
+
+        var rec = core.txs.TxRecord{
+            .tx_index = @intCast(tx_index),
+            .tx_type = undefined,
+            .flags = 0,
+            .from = info.sender,
+            .to = undefined,
+            .value = undefined,
+        };
+        var f: tx_decode.TxFields = undefined;
+        if (info.has_sender) {
+            // Stored sender (non-compact receipt formats). Fields only.
+            f = try tx_decode.decode(raw);
+        } else {
+            // Compact rows leave the sender slot empty: splice + recover.
+            const st = try tx_decode.decodeSigned(raw, scratch);
+            f = st.fields;
+            if (tx_decode.recoverSender(st.sig, st.sighash)) |sender| {
+                rec.from = sender;
+            } else |_| {
+                // On-chain txs always recover. Flag rather than abort so one
+                // anomalous row cannot stall the backfill.
+                rec.flags |= core.txs.FLAG_FROM_UNRECOVERED;
+                slot.unrecovered += 1;
+            }
+        }
+        rec.tx_type = f.tx_type;
+        rec.to = f.to orelse std.mem.zeroes([20]u8);
+        if (f.to == null) rec.flags |= core.txs.FLAG_TO_ABSENT;
+        std.mem.writeInt(u256, &rec.value, f.value, .little);
+        slot.records[rec_count] = rec;
+        rec_count += 1;
+    }
+    if (tx_index != slot.senders.len) return error.TxCountMismatch;
+    slot.rec_count = rec_count;
+}
+
+/// In-order drain cursor + counters for the tx pipeline.
+const TxDrain = struct {
+    next: u64,
+    start: u64,
+    total: u64,
+    t_start: i128,
+    unrecovered: u64 = 0,
+};
+
+/// Append every consecutively-DONE slot from the drain cursor into the
+/// writer, releasing slots back to EMPTY. Returns without blocking when the
+/// next block is still in flight.
+fn drainTxSlots(d: *TxDrain, slots: []TxSlot, txw: *core.txs.TxsWriter, bufs: *const TxPassBufs) !void {
+    while (true) {
+        const slot = &slots[@intCast((d.next - d.start) % TX_SLOT_COUNT)];
+        if (slot.state.load(.acquire) != TxSlot.DONE or slot.block_number != d.next) return;
+        if (slot.err) |e| {
+            core.log.err("Tx fields: block {d}: {s}\n", .{ slot.block_number, @errorName(e) });
+            return e;
+        }
+        try txw.append(slot.block_number, slot.records[0..slot.rec_count], bufs.serialize_buf, bufs.compress_buf);
+        d.unrecovered += slot.unrecovered;
+        releaseTxSlot(slot);
+        d.next += 1;
+
+        const done = d.next - d.start;
+        if ((done % 10_000) == 0) try txw.sync();
+        if ((done % 100_000) == 0) {
+            const elapsed_s = @as(f64, @floatFromInt(std.time.nanoTimestamp() - d.t_start)) / 1e9;
+            core.log.info("  tx fields {d}/{d} blocks | {d:.0} blk/s\n", .{ done, d.total, @as(f64, @floatFromInt(done)) / elapsed_s });
+        }
+    }
+}
+
+fn releaseTxSlot(slot: *TxSlot) void {
+    if (slot.body.len > 0) c.rocksdb_free(@constCast(@ptrCast(slot.body.ptr)));
+    if (slot.senders.len > 0) tx_alloc.free(slot.senders);
+    if (slot.records.len > 0) tx_alloc.free(slot.records);
+    slot.body = &.{};
+    slot.senders = &.{};
+    slot.records = &.{};
+    slot.rec_count = 0;
+    slot.unrecovered = 0;
+    slot.err = null;
+    slot.state.store(TxSlot.EMPTY, .release);
+}
 
 /// Best-effort wrapper, the timestamps-pass contract: the artifact is
 /// advisory, a failed pass logs loud and leaves the resume cursor where it
@@ -460,15 +611,40 @@ fn runTxFields(receipts_path: [*:0]const u8, blocks_path: [*:0]const u8, output_
 
     const bufs = try TxPassBufs.init(std.heap.page_allocator);
 
+    const slots = try std.heap.page_allocator.alloc(TxSlot, TX_SLOT_COUNT);
+    defer std.heap.page_allocator.free(slots);
+    for (slots) |*s| s.* = .{};
+
+    var shutdown = std.atomic.Value(bool).init(false);
+    var worker_args: [TX_WORKERS]TxWorkerArgs = undefined;
+    var workers: [TX_WORKERS]std.Thread = undefined;
+    var spawned: usize = 0;
+    // Any error below must stop + join before the defers free slot memory
+    // under spinning workers. LIFO order: this runs before the slot free.
+    var joined = false;
+    defer if (!joined) {
+        shutdown.store(true, .release);
+        for (workers[0..spawned]) |w| w.join();
+    };
+    for (0..TX_WORKERS) |w| {
+        worker_args[w] = .{ .slots = slots, .worker_id = w, .shutdown = &shutdown };
+        workers[w] = try std.Thread.spawn(.{ .stack_size = parallel.WORKER_STACK_SIZE }, txWorker, .{&worker_args[w]});
+        spawned += 1;
+    }
+
     var seek_key: [8]u8 = undefined;
     std.mem.writeInt(u64, &seek_key, start_block, .big);
     c.rocksdb_iter_seek(iter, @ptrCast(&seek_key), seek_key.len);
 
     core.log.info("Tx fields: covering blocks {d} → {d}\n", .{ start_block, store_end });
-    const t_start = std.time.nanoTimestamp();
+    var d = TxDrain{
+        .next = start_block,
+        .start = start_block,
+        .total = store_end - start_block + 1,
+        .t_start = std.time.nanoTimestamp(),
+    };
     var expected = start_block;
     var dup_groups: u64 = 0;
-    var unrecovered: u64 = 0;
 
     while (iterValid(iter)) {
         const bn = iterKeyBlock(iter) orelse {
@@ -501,82 +677,43 @@ fn runTxFields(receipts_path: [*:0]const u8, blocks_path: [*:0]const u8, output_
             hash = canon.hash;
         }
 
-        var any_logs = false;
+        var n_logtx: usize = 0;
         for (bufs.senders[0..n_tx]) |s| {
-            if (s.has_logs) any_logs = true;
+            if (s.has_logs) n_logtx += 1;
         }
 
-        var rec_count: usize = 0;
-        if (any_logs) {
-            const body = try getBody(bodies.db, bodies.read_opts, bodies_cf, bn, hash);
-            defer c.rocksdb_free(@constCast(@ptrCast(body.ptr)));
-
-            var it = try tx_decode.BodyTxs.init(body);
-            var tx_index: usize = 0;
-            while (try it.next()) |raw| : (tx_index += 1) {
-                // Never break early: walk every body tx so a count mismatch in
-                // EITHER direction fails loud below instead of dropping.
-                if (tx_index >= n_tx) continue;
-                const info = bufs.senders[tx_index];
-                if (!info.has_logs) continue;
-                var rec = core.txs.TxRecord{
-                    .tx_index = @intCast(tx_index),
-                    .tx_type = undefined,
-                    .flags = 0,
-                    .from = info.sender,
-                    .to = undefined,
-                    .value = undefined,
-                };
-                var f: tx_decode.TxFields = undefined;
-                if (info.has_sender) {
-                    // Stored sender (non-compact receipt formats). Fields only.
-                    f = tx_decode.decode(raw) catch |e| {
-                        core.log.err("Tx fields: block {d} tx {d}: {s}\n", .{ bn, tx_index, @errorName(e) });
-                        return e;
-                    };
-                } else {
-                    // Compact rows leave the sender slot empty: splice the
-                    // signing hash and recover (ADR-006 option C path).
-                    const st = tx_decode.decodeSigned(raw, bufs.sighash_scratch) catch |e| {
-                        core.log.err("Tx fields: block {d} tx {d}: {s}\n", .{ bn, tx_index, @errorName(e) });
-                        return e;
-                    };
-                    f = st.fields;
-                    if (tx_decode.recoverSender(st.sig, st.sighash)) |sender| {
-                        rec.from = sender;
-                    } else |_| {
-                        // On-chain txs always recover. Flag rather than abort
-                        // so one anomalous row cannot stall the backfill.
-                        rec.flags |= core.txs.FLAG_FROM_UNRECOVERED;
-                        unrecovered += 1;
-                    }
-                }
-                rec.tx_type = f.tx_type;
-                rec.to = f.to orelse std.mem.zeroes([20]u8);
-                if (f.to == null) rec.flags |= core.txs.FLAG_TO_ABSENT;
-                std.mem.writeInt(u256, &rec.value, f.value, .little);
-                bufs.records[rec_count] = rec;
-                rec_count += 1;
-            }
-            if (tx_index != n_tx) {
-                core.log.err("Tx fields: block {d} has {d} receipts but {d} body txs\n", .{ bn, n_tx, tx_index });
-                return error.TxCountMismatch;
-            }
+        // Claim the block's ring slot, draining completed blocks while the
+        // ring is full.
+        const slot = &slots[@intCast((expected - start_block) % TX_SLOT_COUNT)];
+        while (slot.state.load(.acquire) != TxSlot.EMPTY) {
+            try drainTxSlots(&d, slots, &txw, &bufs);
         }
-
-        try txw.append(bn, bufs.records[0..rec_count], bufs.serialize_buf, bufs.compress_buf);
+        slot.block_number = expected;
+        if (n_logtx == 0) {
+            // Nothing to decode or recover: skip the bodies get and the
+            // workers, the drain writes the empty table.
+            slot.state.store(TxSlot.DONE, .release);
+        } else {
+            slot.body = try getBody(bodies.db, bodies.read_opts, bodies_cf, bn, hash);
+            slot.senders = try tx_alloc.dupe(receipt_decoder.TxSenderInfo, bufs.senders[0..n_tx]);
+            slot.records = try tx_alloc.alloc(core.txs.TxRecord, n_logtx);
+            slot.state.store(TxSlot.FILLED, .release);
+        }
         expected += 1;
-
-        if ((expected % 10_000) == 0) try txw.sync();
-        if ((expected % 100_000) == 0) {
-            const elapsed_s = @as(f64, @floatFromInt(std.time.nanoTimestamp() - t_start)) / 1e9;
-            const done = expected - start_block;
-            core.log.info("  tx fields {d}/{d} blocks | {d:.0} blk/s\n", .{ done, store_end - start_block + 1, @as(f64, @floatFromInt(done)) / elapsed_s });
-        }
+        try drainTxSlots(&d, slots, &txw, &bufs);
     }
 
+    // Drain the in-flight tail, then stop the workers.
+    while (d.next < expected) {
+        try drainTxSlots(&d, slots, &txw, &bufs);
+        std.atomic.spinLoopHint();
+    }
+    shutdown.store(true, .release);
+    for (workers[0..spawned]) |w| w.join();
+    joined = true;
+
     if (dup_groups > 0) core.log.info("Tx fields: {d} duplicate receipt groups resolved against the store\n", .{dup_groups});
-    if (unrecovered > 0) core.log.err("Tx fields: {d} senders failed recovery (flagged FROM_UNRECOVERED)\n", .{unrecovered});
+    if (d.unrecovered > 0) core.log.err("Tx fields: {d} senders failed recovery (flagged FROM_UNRECOVERED)\n", .{d.unrecovered});
     if (expected <= store_end)
         core.log.info("Tx fields: receipts ended at block {d}, store covers {d}. Re-run after the next import.\n", .{ expected - 1, store_end });
     try txw.sync();
