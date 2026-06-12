@@ -863,6 +863,8 @@ fn followLoop(
 
     if (options.node_rpc) |rpc_url| {
         var http = eth.http_transport.HttpTransport.init(ctx._allocator, rpc_url);
+        // Frees the std.http.Client connection pool (kept-alive sockets).
+        defer http.deinit();
         var provider = eth.provider.Provider.init(ctx._allocator, &http);
         var mc = eth.multicall.Multicall.init(ctx._allocator, &provider, options.multicall_address);
         defer mc.deinit();
@@ -942,6 +944,8 @@ fn runPhase4(
     const rpc_url = options.node_rpc orelse return;
 
     var http = eth.http_transport.HttpTransport.init(allocator, rpc_url);
+    // Frees the std.http.Client connection pool (kept-alive sockets).
+    defer http.deinit();
     var provider = eth.provider.Provider.init(allocator, &http);
     var mc = eth.multicall.Multicall.init(allocator, &provider, options.multicall_address);
     defer mc.deinit();
