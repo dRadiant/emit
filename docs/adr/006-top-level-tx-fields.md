@@ -78,9 +78,9 @@ Blocks with no log-producing txs write a `count = 0` entry, keeping the index de
 
 ### Field extraction
 
-`from`: read the 20-byte sender from the compact receipt row (today `receipt_decoder.zig` skips it). `to`/`value`: a per-type index map over the raw signed tx RLP — both sit at fixed list positions in every envelope (legacy through EIP-7702), so the extractor is ~70 LOC of `rlp.zig` walking with no allocation and no library dependency. A row whose sender field is absent or malformed (a hypothetical non-compact store) sets `from_unrecovered`, fail-soft per record, loud in the pass summary.
+`to`/`value`: a per-type index map over the raw signed tx RLP — both sit at fixed list positions in every envelope (legacy through EIP-7702), so the extractor is `rlp.zig` walking with no allocation and no library dependency (`tx_decode.decode`).
 
-Fallback, documented not implemented: if a store's receipts ever lack senders, `from` is recoverable from the signed bytes via the *splice sighash* — for typed envelopes the signing payload is the signed RLP with the trailing `(y_parity, r, s)` dropped and the list header re-lengthened, so `keccak(type ‖ new_header ‖ fields[0..sig_offset])` feeds `secp256k1.recoverAddress` without materializing the tx (shape-generic, EIP-7702 included). ~120 LOC + ~1.5–3 h of compute that option D makes unnecessary.
+`from`: when the receipt row carries a 20-byte sender, read it; when the slot is empty (compact format, the default), recover via the *splice sighash* (`tx_decode.decodeSigned` + `recoverSender`) — for typed envelopes the signing payload is the signed RLP with the trailing `(y_parity, r, s)` dropped and the list header re-lengthened, so `keccak(type ‖ new_header ‖ fields[0..sig_offset])` feeds ecrecover without materializing the tx, shape-generic through EIP-7702. Legacy derives `chain_id` from `v` and appends `(chain_id, 0, 0)` per EIP-155. A recovery failure (should not occur on-chain) sets `from_unrecovered`, fail-soft per record, loud in the pass summary.
 
 ### The tx pass
 
