@@ -39,8 +39,11 @@ pub fn levelFromFlags(silent: bool, verbose: bool) Level {
     return .normal;
 }
 
-/// Always printed, even under `--silent`: failures and usage.
+/// Always printed, even under `--silent`: failures and usage. Suppressed in
+/// test binaries: the suite asserts on returned errors, and tests exercising
+/// fail-loud paths would otherwise leak expected messages into build output.
 pub fn err(comptime fmt: []const u8, args: anytype) void {
+    if (builtin.is_test) return;
     std.debug.print(fmt, args);
 }
 
