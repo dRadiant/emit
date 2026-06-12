@@ -196,7 +196,7 @@ pub const PendingRing = struct {
     // ── Persistence ──────────────────────────────────────────────────────
 
     /// Load pending.bin on startup via `core.pending_format.parse`.
-    /// Dupes each `lz4_entry` into ring-owned memory.
+    /// Dupes each `lz4_entry` and `tx_table` into ring-owned memory.
     fn load(self: *PendingRing) !void {
         const file = try self.dir.openFile("pending.bin", .{});
         defer file.close();
@@ -213,6 +213,8 @@ pub const PendingRing = struct {
         try self.entries.ensureUnusedCapacity(self.alloc, parsed.len);
         for (parsed) |p| {
             const owned = try self.alloc.dupe(u8, p.lz4_entry);
+            errdefer self.alloc.free(owned);
+            const owned_txs = try self.alloc.dupe(u8, p.tx_table);
             self.entries.appendAssumeCapacity(.{
                 .block_number = p.block_number,
                 .timestamp = p.timestamp,
@@ -220,6 +222,7 @@ pub const PendingRing = struct {
                 .topic_bloom = p.topic_bloom,
                 .addr_bloom = p.addr_bloom,
                 .lz4_entry = owned,
+                .tx_table = owned_txs,
             });
         }
     }
@@ -320,13 +323,15 @@ test "persists across reopen" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Write
+    // Write. Block 42 carries a tx table, the field a reload must not drop
+    // (the txs.dat mirror reads it from popped entries after a restart).
+    const table = [_]u8{ 1, 0, 0, 0 } ++ [_]u8{0x7E} ** 76;
     {
         var ring = try PendingRing.open(tmp.dir, testing.allocator);
         defer ring.deinit();
         const hash = [_]u8{0xBB} ** 32;
         const entry = [_]u8{ 3, 0, 0, 0, 0xDE, 0xAD, 0xBE };
-        try ring.insert(42, 1_700_000_042, hash, &dummy_topic, &dummy_addr, &entry, &.{});
+        try ring.insert(42, 1_700_000_042, hash, &dummy_topic, &dummy_addr, &entry, &table);
         try ring.insert(43, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry, &.{});
     }
 
@@ -339,6 +344,8 @@ test "persists across reopen" {
         const hash = ring.getHash(42).?;
         try testing.expectEqual(@as(u8, 0xBB), hash[0]);
         try testing.expectEqual(@as(u32, 1_700_000_042), ring.entries.items[0].timestamp);
+        try testing.expectEqualSlices(u8, &table, ring.entries.items[0].tx_table);
+        try testing.expectEqual(@as(usize, 0), ring.entries.items[1].tx_table.len);
     }
 }
 

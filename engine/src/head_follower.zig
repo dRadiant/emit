@@ -378,6 +378,13 @@ fn mirrorTxTable(tw: *core.txs.TxsWriter, block: u64, table: []const u8, alloc: 
     defer alloc.free(cbuf);
     tw.appendSerialized(block, table, cbuf) catch |e| {
         core.log.debug("txs.dat mirror skipped at block {d}: {s}\n", .{ block, @errorName(e) });
+        return;
+    };
+    // Publish per mirror. Finalization runs about once per block (~12 s), so
+    // the sync is cheap, and a killed follower must not strand a session of
+    // appends behind an unpublished count.
+    tw.sync() catch |e| {
+        core.log.debug("txs.idx sync failed at block {d}: {s}\n", .{ block, @errorName(e) });
     };
 }
 
