@@ -2,6 +2,8 @@
 
 Tracks Uniswap V2 `Pair` reserves and `Swap` events across every pair the canonical factory ever spawned. Demonstrates the factory pre-pass pattern: a one-pass scan discovers child addresses from `PairCreated` events, then feeds them into the main scan as the dynamic address set.
 
+Also demonstrates transaction fields: `Swap` declares `pub const tx_fields = true;`, so its handler reads `log.tx.from`. This is the tx-sender, and usually the trader. Requires the engine store's `txs.{dat,idx}` (written by default on import and follow); init fails loud if missing.
+
 ## Run
 
 ```sh
@@ -20,7 +22,7 @@ zig build run -Doptimize=ReleaseFast -- \
 | Entity | Storage | Key | Updated on |
 |---|---|---|---|
 | `Pair` | mutable | `[20]u8` (pair contract address) | every `Sync` (latest reserves) |
-| `SwapEvent` | immutable | `[16]u8` (block ++ tx ++ log index) | every `Swap` log |
+| `SwapEvent` | immutable | `[16]u8` (block ++ tx ++ log index) | every `Swap` log, with `trader = log.tx.from` |
 
 Intentionally minimal — `PairCreated` is used only for factory discovery (registers child addresses, no entity row), and `Mint` / `Burn` handlers are no-op stubs present for SDK completeness. Adapt the example to materialize additional events by adding the corresponding entity types and filling in the stub handlers.
 

@@ -13,11 +13,13 @@ pub const Pair = struct {
 };
 
 /// Immutable. One row per Swap log. Amounts in/out suffice for OHLC
-/// reconstruction without tx_hash or sender/to.
+/// reconstruction. `trader` is the transaction sender (`log.tx.from`), the
+/// EOA behind the swap. The log's own `sender` param is just the router.
 pub const SwapEvent = struct {
     pub const storage: sdk.StorageMode = .immutable;
     id: [16]u8,
     pair: [20]u8,
+    trader: [20]u8,
     amount0_in: u256,
     amount1_in: u256,
     amount0_out: u256,

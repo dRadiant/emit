@@ -55,6 +55,7 @@ pub fn handleSwap(log: sdk.Log(m.Swap), ctx: *Ctx) !void {
     try ctx.stores.swapEvents.save(.{
         .id = log.eventId(),
         .pair = log.address,
+        .trader = log.tx.from,
         .amount0_in = log.params.amount0In,
         .amount1_in = log.params.amount1In,
         .amount0_out = log.params.amount0Out,
