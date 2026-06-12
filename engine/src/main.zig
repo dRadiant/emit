@@ -59,6 +59,8 @@ pub fn main() !void {
             if (getFlag(args, "--rpc")) |v| try argv_list.appendSlice(alloc, &.{ "--rpc", v });
             if (getFlag(args, "--start")) |v| try argv_list.appendSlice(alloc, &.{ "--start", v });
             if (getFlag(args, "--end")) |v| try argv_list.appendSlice(alloc, &.{ "--end", v });
+            if (getFlag(args, "--txs-db")) |v| try argv_list.appendSlice(alloc, &.{ "--txs-db", v });
+            if (hasFlag(args, "--no-tx-fields")) try argv_list.append(alloc, "--no-tx-fields");
             if (hasFlag(args, "--silent")) try argv_list.append(alloc, "--silent");
             if (hasFlag(args, "--verbose")) try argv_list.append(alloc, "--verbose");
             const argv = argv_list.items;
@@ -142,6 +144,15 @@ fn status(data_dir: []const u8) void {
         log.info("Timestamps:          {d} blocks covered\n", .{st.size / 4})
     else |_|
         log.info("Timestamps:          absent (formula fallback)\n", .{});
+
+    // Tx-fields coverage (per-block tables, dense from first_block).
+    if (core.txs.TxsReader.open(dir)) |maybe| {
+        if (maybe) |reader| {
+            var r = reader;
+            defer r.deinit();
+            log.info("Tx fields:           blocks {d}..{d} ({d} covered)\n", .{ r.first_block, r.first_block + r.count -| 1, r.count });
+        } else log.info("Tx fields:           absent (run import without --no-tx-fields)\n", .{});
+    } else |err| log.err("Tx fields:           unreadable ({s})\n", .{@errorName(err)});
 }
 
 fn getFlag(args: []const [:0]u8, flag: []const u8) ?[]const u8 {

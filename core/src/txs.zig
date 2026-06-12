@@ -9,7 +9,7 @@
 //! txs.dat layout:
 //!   0  8        magic "EMITTXSD"
 //!   [LZ4 entries, append-only: lz4_len(u32 LE) ‖ lz4_data]
-//!   entry payload: count(u16 LE) ‖ [count × TxRecord], sorted by tx_index
+//!   entry payload: count(u32 LE) ‖ [count × TxRecord], sorted by tx_index
 //!
 //! txs.idx layout:
 //!   0   8       magic "EMITTXSI"
@@ -62,10 +62,12 @@ pub fn find(records: []const TxRecord, tx_index: u16) ?*const TxRecord {
     return null;
 }
 
-/// Serialize a block's table into `buf`. Returns bytes written.
+/// Serialize a block's table into `buf`. Returns bytes written. The count is
+/// u32 so even a full u16 tx_index domain (65,536 records) fits, leaving no
+/// assumed per-block ceiling anywhere in the format.
 pub fn serializeRecords(records: []const TxRecord, buf: []u8) usize {
-    std.mem.writeInt(u16, buf[0..2], @intCast(records.len), .little);
-    var pos: usize = 2;
+    std.mem.writeInt(u32, buf[0..4], @intCast(records.len), .little);
+    var pos: usize = 4;
     for (records) |r| {
         std.mem.writeInt(u16, buf[pos..][0..2], r.tx_index, .little);
         buf[pos + 2] = r.tx_type;
@@ -80,11 +82,11 @@ pub fn serializeRecords(records: []const TxRecord, buf: []u8) usize {
 
 /// Parse a decompressed entry payload into `out`. Returns the filled slice.
 pub fn deserializeRecords(payload: []const u8, out: []TxRecord) ![]TxRecord {
-    if (payload.len < 2) return error.Truncated;
-    const count: usize = std.mem.readInt(u16, payload[0..2], .little);
+    if (payload.len < 4) return error.Truncated;
+    const count: usize = std.mem.readInt(u32, payload[0..4], .little);
     if (count > out.len) return error.TooManyRecords;
-    if (payload.len < 2 + count * RECORD_SIZE) return error.Truncated;
-    var pos: usize = 2;
+    if (payload.len < 4 + count * RECORD_SIZE) return error.Truncated;
+    var pos: usize = 4;
     for (out[0..count]) |*r| {
         r.tx_index = std.mem.readInt(u16, payload[pos..][0..2], .little);
         r.tx_type = payload[pos + 2];

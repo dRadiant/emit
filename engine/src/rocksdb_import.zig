@@ -24,6 +24,7 @@ const eth = @import("eth");
 const flat_writer = @import("flat_writer.zig");
 const receipt_decoder = @import("receipt_decoder.zig");
 const rlp = @import("rlp.zig");
+const tx_decode = @import("tx_decode.zig");
 
 const types = core.types;
 const log_serial = core.log_serial;
@@ -374,14 +375,321 @@ fn runHeaderTimestamps(
     return written;
 }
 
+// ── Transaction-fields pass (receipts senders + sibling blocks DB) ───────
+
+/// Structural ceiling, not an assumption: tx_index is u16 in every format
+/// (RawLog, TxRecord), so 65,536 is the domain itself. Buffers size to it
+/// (~21 MB once, import binary only) so no plausible block can overflow.
+/// `decodeSenders` still fails loud at the boundary rather than dropping.
+const MAX_TXS_PER_BLOCK = 65_536;
+
+/// Scratch for the tx pass, heap-allocated once (~17 MB).
+const TxPassBufs = struct {
+    senders: []receipt_decoder.TxSenderInfo,
+    records: []core.txs.TxRecord,
+    serialize_buf: []u8,
+    compress_buf: []u8,
+    // Dup-group resolution: candidate receipt logs vs our store's logs.
+    cand_logs: []core.RawLog,
+    cand_data: []u8,
+    store_entry: []u8,
+    store_decomp: []u8,
+    store_logs: []core.RawLog,
+    /// Unsigned-payload rebuild for the splice sighash, 8-aligned for keccak.
+    sighash_scratch: []u8,
+
+    fn init(a: std.mem.Allocator) !TxPassBufs {
+        const table_max = 4 + MAX_TXS_PER_BLOCK * core.txs.RECORD_SIZE;
+        return .{
+            .senders = try a.alloc(receipt_decoder.TxSenderInfo, MAX_TXS_PER_BLOCK),
+            .records = try a.alloc(core.txs.TxRecord, MAX_TXS_PER_BLOCK),
+            .serialize_buf = try a.alloc(u8, table_max),
+            .compress_buf = try a.alloc(u8, table_max + table_max / 128 + 64),
+            .cand_logs = try a.alloc(core.RawLog, core.types.MAX_LOGS_PER_BLOCK),
+            .cand_data = try a.alloc(u8, core.types.BLOCK_BUF_SIZE),
+            .store_entry = try a.alloc(u8, core.types.BLOCK_BUF_SIZE),
+            .store_decomp = try a.alloc(u8, core.types.BLOCK_BUF_SIZE),
+            .store_logs = try a.alloc(core.RawLog, core.types.MAX_LOGS_PER_BLOCK),
+            .sighash_scratch = try a.alignedAlloc(u8, .@"8", core.types.BLOCK_BUF_SIZE),
+        };
+    }
+};
+
+/// Best-effort wrapper, the timestamps-pass contract: the artifact is
+/// advisory, a failed pass logs loud and leaves the resume cursor where it
+/// stopped. A re-run picks up the gap. Manifests requiring tx fields fail
+/// loud SDK-side on incomplete coverage.
+fn importTxFields(receipts_path: [*:0]const u8, blocks_path: [*:0]const u8, output_path: []const u8) void {
+    const n = runTxFields(receipts_path, blocks_path, output_path) catch |err| {
+        core.log.err("Tx-fields pass failed: {s}. Re-run import to resume (tx fields unavailable until covered).\n", .{@errorName(err)});
+        return;
+    };
+    if (n > 0) core.log.info("Tx fields: {d} blocks covered\n", .{n});
+}
+
+/// Walk the receipts CF over the store's range, pairing each canonical row
+/// with a bodies point-get (same 40-byte `bn ‖ hash` key), and emit per-block
+/// `TxRecord` tables into txs.{dat,idx}. Senders come from the receipt rows,
+/// `to`/`value` from the body RLP. Resumes from the txs.idx cursor. Single
+/// threaded, I/O-bound on the bodies blob reads.
+fn runTxFields(receipts_path: [*:0]const u8, blocks_path: [*:0]const u8, output_path: []const u8) !u64 {
+    var store = try core.FlatStoreReader.open(output_path);
+    defer store.deinit();
+    if (store.index_count == 0) return 0;
+    const store_end = store.first_block + store.index_count - 1;
+
+    var dir = try std.fs.cwd().openDir(output_path, .{});
+    defer dir.close();
+    var txw = try core.txs.TxsWriter.open(dir, store.first_block);
+    defer txw.deinit();
+
+    const start_block = store.first_block + txw.count;
+    if (start_block > store_end) return 0;
+
+    var receipts = try ReadOnlyCf(3).open(
+        receipts_path,
+        .{ @ptrCast("default"), @ptrCast("Transactions"), @ptrCast("Blocks") },
+        2,
+    );
+    defer receipts.deinit();
+    const iter = receipts.iter;
+
+    var bodies = try ReadOnlyCf(1).open(blocks_path, .{@ptrCast("default")}, 0);
+    defer bodies.deinit();
+    const bodies_cf = bodies.cf_handles[0];
+
+    const bufs = try TxPassBufs.init(std.heap.page_allocator);
+
+    var seek_key: [8]u8 = undefined;
+    std.mem.writeInt(u64, &seek_key, start_block, .big);
+    c.rocksdb_iter_seek(iter, @ptrCast(&seek_key), seek_key.len);
+
+    core.log.info("Tx fields: covering blocks {d} → {d}\n", .{ start_block, store_end });
+    const t_start = std.time.nanoTimestamp();
+    var expected = start_block;
+    var dup_groups: u64 = 0;
+    var unrecovered: u64 = 0;
+
+    while (iterValid(iter)) {
+        const bn = iterKeyBlock(iter) orelse {
+            c.rocksdb_iter_next(iter);
+            continue;
+        };
+        if (bn > store_end) break;
+        if (bn < expected) {
+            // Trailing duplicate rows of an already-written block.
+            c.rocksdb_iter_next(iter);
+            continue;
+        }
+        if (bn > expected) {
+            core.log.err("Tx fields: receipts gap at block {d} (next row {d})\n", .{ expected, bn });
+            return error.NonDenseReceipts;
+        }
+
+        var hash = iterKeyHash(iter) orelse return error.ReceiptKeyMissingHash;
+        var vlen: usize = 0;
+        const vp: [*]const u8 = @ptrCast(c.rocksdb_iter_value(iter, &vlen) orelse return error.RocksDBError);
+        var n_tx = try receipt_decoder.decodeSenders(vp[0..vlen], bufs.senders);
+        c.rocksdb_iter_next(iter);
+
+        // Reorg-history duplicate rows: pick the row whose logs match our
+        // store (resolved canonical at import), no RPC needed.
+        if (iterValid(iter) and (iterKeyBlock(iter) orelse 0) == bn) {
+            dup_groups += 1;
+            const canon = try resolveDupGroup(iter, bn, &store, &bufs, bufs.senders);
+            n_tx = canon.n_tx;
+            hash = canon.hash;
+        }
+
+        var any_logs = false;
+        for (bufs.senders[0..n_tx]) |s| {
+            if (s.has_logs) any_logs = true;
+        }
+
+        var rec_count: usize = 0;
+        if (any_logs) {
+            const body = try getBody(bodies.db, bodies.read_opts, bodies_cf, bn, hash);
+            defer c.rocksdb_free(@constCast(@ptrCast(body.ptr)));
+
+            var it = try tx_decode.BodyTxs.init(body);
+            var tx_index: usize = 0;
+            while (try it.next()) |raw| : (tx_index += 1) {
+                // Never break early: walk every body tx so a count mismatch in
+                // EITHER direction fails loud below instead of dropping.
+                if (tx_index >= n_tx) continue;
+                const info = bufs.senders[tx_index];
+                if (!info.has_logs) continue;
+                var rec = core.txs.TxRecord{
+                    .tx_index = @intCast(tx_index),
+                    .tx_type = undefined,
+                    .flags = 0,
+                    .from = info.sender,
+                    .to = undefined,
+                    .value = undefined,
+                };
+                var f: tx_decode.TxFields = undefined;
+                if (info.has_sender) {
+                    // Stored sender (non-compact receipt formats). Fields only.
+                    f = tx_decode.decode(raw) catch |e| {
+                        core.log.err("Tx fields: block {d} tx {d}: {s}\n", .{ bn, tx_index, @errorName(e) });
+                        return e;
+                    };
+                } else {
+                    // Compact rows leave the sender slot empty: splice the
+                    // signing hash and recover (ADR-006 option C path).
+                    const st = tx_decode.decodeSigned(raw, bufs.sighash_scratch) catch |e| {
+                        core.log.err("Tx fields: block {d} tx {d}: {s}\n", .{ bn, tx_index, @errorName(e) });
+                        return e;
+                    };
+                    f = st.fields;
+                    if (tx_decode.recoverSender(st.sig, st.sighash)) |sender| {
+                        rec.from = sender;
+                    } else |_| {
+                        // On-chain txs always recover. Flag rather than abort
+                        // so one anomalous row cannot stall the backfill.
+                        rec.flags |= core.txs.FLAG_FROM_UNRECOVERED;
+                        unrecovered += 1;
+                    }
+                }
+                rec.tx_type = f.tx_type;
+                rec.to = f.to orelse std.mem.zeroes([20]u8);
+                if (f.to == null) rec.flags |= core.txs.FLAG_TO_ABSENT;
+                std.mem.writeInt(u256, &rec.value, f.value, .little);
+                bufs.records[rec_count] = rec;
+                rec_count += 1;
+            }
+            if (tx_index != n_tx) {
+                core.log.err("Tx fields: block {d} has {d} receipts but {d} body txs\n", .{ bn, n_tx, tx_index });
+                return error.TxCountMismatch;
+            }
+        }
+
+        try txw.append(bn, bufs.records[0..rec_count], bufs.serialize_buf, bufs.compress_buf);
+        expected += 1;
+
+        if ((expected % 10_000) == 0) try txw.sync();
+        if ((expected % 100_000) == 0) {
+            const elapsed_s = @as(f64, @floatFromInt(std.time.nanoTimestamp() - t_start)) / 1e9;
+            const done = expected - start_block;
+            core.log.info("  tx fields {d}/{d} blocks | {d:.0} blk/s\n", .{ done, store_end - start_block + 1, @as(f64, @floatFromInt(done)) / elapsed_s });
+        }
+    }
+
+    if (dup_groups > 0) core.log.info("Tx fields: {d} duplicate receipt groups resolved against the store\n", .{dup_groups});
+    if (unrecovered > 0) core.log.err("Tx fields: {d} senders failed recovery (flagged FROM_UNRECOVERED)\n", .{unrecovered});
+    if (expected <= store_end)
+        core.log.info("Tx fields: receipts ended at block {d}, store covers {d}. Re-run after the next import.\n", .{ expected - 1, store_end });
+    try txw.sync();
+    return expected - start_block;
+}
+
+const CanonicalRow = struct { n_tx: usize, hash: [32]u8 };
+
+/// Iter positioned at the second row of `bn`'s duplicate group. Re-seek to
+/// the group start, pick the row whose decoded logs match our store's block
+/// entry, and leave the iter on the first row past the group.
+fn resolveDupGroup(
+    iter: Iterator,
+    bn: u64,
+    store: *const core.FlatStoreReader,
+    bufs: *const TxPassBufs,
+    senders_out: []receipt_decoder.TxSenderInfo,
+) !CanonicalRow {
+    var seek_key: [8]u8 = undefined;
+    std.mem.writeInt(u64, &seek_key, bn, .big);
+    c.rocksdb_iter_seek(iter, @ptrCast(&seek_key), seek_key.len);
+
+    var result: ?CanonicalRow = null;
+    while (iterValid(iter)) : (c.rocksdb_iter_next(iter)) {
+        if ((iterKeyBlock(iter) orelse 0) != bn) break;
+        if (result != null) continue; // drain the rest of the group
+        const hash = iterKeyHash(iter) orelse continue;
+        var vlen: usize = 0;
+        const vp: [*]const u8 = @ptrCast(c.rocksdb_iter_value(iter, &vlen) orelse continue);
+        const row = vp[0..vlen];
+        if (try rowMatchesStore(bn, row, store, bufs)) {
+            result = .{ .n_tx = try receipt_decoder.decodeSenders(row, senders_out), .hash = hash };
+        }
+    }
+    if (result) |r| return r;
+    core.log.err("Tx fields: block {d}: no duplicate receipt row matches the store\n", .{bn});
+    return error.CanonicalRowMissing;
+}
+
+/// A candidate receipt row matches when its log shape equals our store's
+/// entry for the block: same count, same (tx_index, log_index, address) per
+/// log. The store was canonical-resolved at import, so a match is canonical.
+fn rowMatchesStore(
+    bn: u64,
+    row: []const u8,
+    store: *const core.FlatStoreReader,
+    bufs: *const TxPassBufs,
+) !bool {
+    const cand_n = receipt_decoder.decodeReceipts(bn, row, bufs.cand_logs, bufs.cand_data) catch return false;
+    const entry = store.readBlock(bn, bufs.store_entry) catch return false;
+    const decoded = core.log_serial.decompressEntry(entry, bufs.store_decomp) catch return false;
+    const store_n = core.log_serial.deserializeLogs(decoded, bufs.store_logs);
+    if (cand_n != store_n) return false;
+    for (bufs.cand_logs[0..cand_n], bufs.store_logs[0..store_n]) |a, b| {
+        if (a.tx_index != b.tx_index or a.log_index != b.log_index) return false;
+        if (!std.mem.eql(u8, &a.address, &b.address)) return false;
+    }
+    return true;
+}
+
+/// Point-get one block body by the shared `bn(8 BE) ‖ hash(32)` key. Caller
+/// frees via `rocksdb_free`.
+fn getBody(
+    db: ?*c.rocksdb_t,
+    read_opts: ?*c.rocksdb_readoptions_t,
+    cf: ?*c.rocksdb_column_family_handle_t,
+    bn: u64,
+    hash: [32]u8,
+) ![]const u8 {
+    var key: [40]u8 = undefined;
+    std.mem.writeInt(u64, key[0..8], bn, .big);
+    @memcpy(key[8..40], &hash);
+    var err: ?[*:0]u8 = null;
+    var vlen: usize = 0;
+    const vp = c.rocksdb_get_cf(db, read_opts, cf, @ptrCast(&key), key.len, &vlen, @ptrCast(&err));
+    try rocksErr(&err);
+    if (vp == null) {
+        core.log.err("Tx fields: block {d} body missing from the blocks DB\n", .{bn});
+        return error.BodyMissing;
+    }
+    return @as([*]const u8, @ptrCast(vp))[0..vlen];
+}
+
+/// Current iter key's block hash (bytes 8..40 of the 40-byte key).
+fn iterKeyHash(iter: Iterator) ?[32]u8 {
+    var klen: usize = 0;
+    const kp: [*]const u8 = @ptrCast(c.rocksdb_iter_key(iter, &klen) orelse return null);
+    if (klen < 40) return null;
+    return kp[8..40].*;
+}
+
+/// Best-effort RLIMIT_NOFILE raise to the hard cap. The BlobDB open touches
+/// every blob file. A failure leaves the prior limit, surfacing later as a
+/// loud open error.
+fn raiseFdLimit() void {
+    const lim = std.posix.getrlimit(.NOFILE) catch return;
+    if (lim.cur >= lim.max) return;
+    std.posix.setrlimit(.NOFILE, .{ .cur = lim.max, .max = lim.max }) catch {};
+}
+
 // ── Entry points ─────────────────────────────────────────────────────────
 
 pub fn main() !void {
+    // Every Nethermind DB this binary opens (receipts, headers, the BlobDB
+    // blocks dir at ~4,600 files) counts against NOFILE. Non-interactive
+    // shells default to 1024, far too low.
+    raiseFdLimit();
+
     const alloc = std.heap.page_allocator;
     const args = try std.process.argsAlloc(alloc);
     if (args.len < 3) {
         core.log.err(
-            "Usage: rocksdb-import <receipts_db_path> <data_dir> [--start N] [--end N] [--rpc URL]\n",
+            "Usage: rocksdb-import <receipts_db_path> <data_dir> [--start N] [--end N] [--rpc URL] [--txs-db PATH] [--no-tx-fields]\n",
             .{},
         );
         std.process.exit(1);
@@ -392,6 +700,8 @@ pub fn main() !void {
     var start_override: ?u64 = null;
     var end_override: ?u64 = null;
     var rpc_url: ?[:0]const u8 = null;
+    var txs_db: ?[:0]const u8 = null;
+    var no_tx_fields = false;
     var silent = false;
     var verbose = false;
     var i: usize = 3;
@@ -405,6 +715,11 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, args[i], "--rpc") and i + 1 < args.len) {
             rpc_url = args[i + 1];
             i += 1;
+        } else if (std.mem.eql(u8, args[i], "--txs-db") and i + 1 < args.len) {
+            txs_db = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--no-tx-fields")) {
+            no_tx_fields = true;
         } else if (std.mem.eql(u8, args[i], "--silent")) {
             silent = true;
         } else if (std.mem.eql(u8, args[i], "--verbose")) {
@@ -413,6 +728,21 @@ pub fn main() !void {
     }
     core.log.setLevel(core.log.levelFromFlags(silent, verbose));
     try run(args[1], args[2], start_override, end_override, rpc_url);
+
+    // Tx-fields pass after the logs import so dup resolution can match
+    // candidate receipt rows against the freshly-written canonical store.
+    if (!no_tx_fields) {
+        const blocks_path = txs_db orelse blk: {
+            // Default: the receipts DB's sibling `blocks` dir.
+            const parent = std.fs.path.dirname(args[1]) orelse break :blk null;
+            break :blk try std.fmt.allocPrintSentinel(alloc, "{s}/blocks", .{parent}, 0);
+        };
+        if (blocks_path) |bp| {
+            importTxFields(args[1], bp, args[2]);
+        } else {
+            core.log.err("Tx fields skipped: cannot derive the blocks DB path, pass --txs-db\n", .{});
+        }
+    }
 }
 
 /// Wire up an optional RPC provider (kept alive for the whole import) and run.

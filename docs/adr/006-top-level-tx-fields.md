@@ -36,11 +36,15 @@ Store the resolved fields directly. `from` costs ecrecover once at import on the
 
 Superseded by D before any implementation: the compute turns out to be unnecessary.
 
-### D: Senders read from Nethermind's receipt rows, `to`/`value` from a crypto-free bodies pass — **chosen**
+### D: Senders read from Nethermind's receipt rows, `to`/`value` from a crypto-free bodies pass — **disproven during implementation**
 
-Nethermind **persists the recovered sender in every compact receipt row** (recovery is expensive, so it does it once at execution and stores the result — this is how `eth_getTransactionReceipt` serves `from` without re-recovering). Verified in our own code: `engine/src/receipt_decoder.zig` walks `status, sender, gas_used_total` and *skips the sender* on every transaction the 13-minute import already decodes. The field layout is proven against real mainnet data — the decoder positions logs correctly only because that 20-byte field is where it is.
+The premise was that Nethermind persists the recovered sender in every compact receipt row (the `receipt_decoder.zig` walk skips a slot the prototype labeled "sender"). Ground truth said otherwise: a raw row dump of block 15,537,394 decodes as `[status=0x01, 0x80, gas_used_total, logs]` — the sender *slot* exists but the **compact format stores it empty** on a default-config Nethermind (`eth_getTransactionReceipt` recovers on demand instead). The `Transactions` CF is only a txhash → block-number map. No on-disk sender anywhere.
 
-So `from` is a one-line read in rows we already parse. No ecrecover, no signing hash. `to`/`value` still come from the bodies CF (receipts carry status/sender/gas/logs, not value), but extracting two fields from raw tx RLP is pure parsing, ~1–2 µs/tx, no crypto: the tx pass is **I/O-bound on the bodies scan** (~400–500 GB at NVMe speed ≈ 10–20 min), comparable to the logs import, not hours. The receipts row also tells the pass which `tx_index`es produced logs, so the receipts + bodies reads pair up in one walk and emit complete `TxRecord`s.
+### E: Hybrid — stored sender when a row carries one, splice-sighash recovery when it doesn't — **chosen**
+
+Option C's compute returns, implemented as D's fallback already specified below: per log-producing tx with an empty sender slot, rebuild the signing payload via the **splice** (no per-type re-encoder, shape-generic through EIP-7702) and `ecrecover`. Rows that do carry a 20-byte sender (non-compact receipt configs) skip recovery for free. Correctness is pinned two ways: closed-loop tests where eth.zig signs and our splice must reproduce its `hashForSigning` and recover the signer across legacy-155/pre-155/2930/1559 plus a hand-built 7702, and a live-chain probe (block 15,537,394: 25/25 senders match RPC).
+
+Measured single-threaded: **~420 blk/s** (recovery-bound, ~25–40 recovers/block × ~50 µs) → ~6.5 h mainnet, so the pass parallelizes per-block across the import's existing 7-worker slot pipeline → **~1–1.5 h projected**, inside option C's original envelope. `to`/`value` extraction and the bodies point-get remain as designed.
 
 The pass stays separate from the logs import with its own resume cursor — the `timestamps.bin` pattern, shipped and proven twice — so tx fields backfill into any *existing* imported store, no re-import, and `--no-tx-fields` skips it.
 
@@ -50,7 +54,7 @@ The pass stays separate from the logs import with its own resume cursor — the 
 
 ```
 txs.dat   per-block LZ4 entry, dense by block number, append-only:
-  count      u16 LE
+  count      u32 LE     (covers the full u16 tx_index domain, no assumed cap)
   [count × TxRecord], sorted by tx_index
 
 TxRecord (76 bytes raw):
@@ -96,7 +100,7 @@ Carrying records through the FilteredStore preserves **wire = disk**: remote ind
 ## Trade-offs accepted
 
 - **~45–55 GB store growth** for operators who enable the pass. The data itself; no encoding buys it back.
-- **One-time ~10–20 min tx pass** on the RocksDB path (I/O-bound bodies scan). Isolated behind its own cursor; the logs import headline is untouched.
+- **One-time recovery-bound tx pass** on the RocksDB path (~420 blk/s single-threaded measured, ~1–1.5 h projected on the 7-worker pipeline). Isolated behind its own cursor; the logs import headline is untouched.
 - **`gas`/`nonce`/`input` not stored.** Additive later via a `txs.dat` version bump; not worth 16+ B/record on speculation.
 - **Filtered-entry format change + PUSH version bump** when (and only when) a manifest opts in. Filter dirs are cheap rebuilds; the fingerprint mechanism already owns invalidation.
 - **Trusting Nethermind's stored sender.** Same trust domain as the logs we already import from the same rows; it is the value the node itself serves over RPC.
