@@ -241,7 +241,10 @@ fn ReadOnlyCf(comptime N: usize) type {
         cf_handles: [N]?*c.rocksdb_column_family_handle_t,
         iter: Iterator,
 
-        fn open(path: [*:0]const u8, cf_names: [N][*c]const u8, target: usize) !@This() {
+        /// `verify_checksums`: off for the sequential bulk imports (speed,
+        /// downstream parity-validated), on for the tx pass's point reads
+        /// where corruption would decode silently wrong.
+        fn open(path: [*:0]const u8, cf_names: [N][*c]const u8, target: usize, verify_checksums: bool) !@This() {
             var err: ?[*:0]u8 = null;
             const opts = c.rocksdb_options_create();
             errdefer c.rocksdb_options_destroy(opts);
@@ -269,7 +272,7 @@ fn ReadOnlyCf(comptime N: usize) type {
             errdefer c.rocksdb_readoptions_destroy(read_opts);
             c.rocksdb_readoptions_set_readahead_size(read_opts, 4 * 1024 * 1024);
             c.rocksdb_readoptions_set_fill_cache(read_opts, 0);
-            c.rocksdb_readoptions_set_verify_checksums(read_opts, 0);
+            c.rocksdb_readoptions_set_verify_checksums(read_opts, @intFromBool(verify_checksums));
 
             const iter = c.rocksdb_create_iterator_cf(db, read_opts, cf);
             if (iter == null) return error.RocksDBError;
@@ -340,7 +343,7 @@ fn runHeaderTimestamps(
     cutoff: u64,
 ) !u64 {
     // headers has a single "default" CF, open read-only like the receipts DB.
-    var rdb = try ReadOnlyCf(1).open(headers_path, .{@ptrCast("default")}, 0);
+    var rdb = try ReadOnlyCf(1).open(headers_path, .{@ptrCast("default")}, 0, false);
     defer rdb.deinit();
     const iter = rdb.iter;
 
@@ -601,11 +604,12 @@ fn runTxFields(receipts_path: [*:0]const u8, blocks_path: [*:0]const u8, output_
         receipts_path,
         .{ @ptrCast("default"), @ptrCast("Transactions"), @ptrCast("Blocks") },
         2,
+        true,
     );
     defer receipts.deinit();
     const iter = receipts.iter;
 
-    var bodies = try ReadOnlyCf(1).open(blocks_path, .{@ptrCast("default")}, 0);
+    var bodies = try ReadOnlyCf(1).open(blocks_path, .{@ptrCast("default")}, 0, true);
     defer bodies.deinit();
     const bodies_cf = bodies.cf_handles[0];
 
@@ -915,6 +919,7 @@ fn runInner(
         receipts_path,
         .{ @ptrCast("default"), @ptrCast("Transactions"), @ptrCast("Blocks") },
         2,
+        false,
     );
     defer rdb.deinit();
     const iter = rdb.iter;

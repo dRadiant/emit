@@ -125,3 +125,19 @@ Carrying records through the FilteredStore preserves **wire = disk**: remote ind
 | SDK: filtered carry-through, `tx_fields` gate, `Log(E).tx`, coverage check | ~160 |
 | Tests (per-type RLP fixtures, sender-capture fixture, fake_engine tx tables, e2e `tx.from`, RPC parity sample) | ~190 |
 | **Total** | **~900 (≈710 non-test)** |
+
+## Operator caveats (Nethermind coupling)
+
+- **Ancient barriers**: a node synced with `Sync.AncientBodiesBarrier` /
+  `AncientReceiptsBarrier` lacks bodies below the barrier. The pass fails
+  loud (`BodyMissing`) there, it cannot fabricate records. Backfilling below
+  a barrier needs a node that kept full history.
+- **Compact-format versioning**: receipt rows are recognized by the `0x7F`
+  marker. A future Nethermind format change degrades unrecognized rows to
+  "empty" in both the logs import and this pass (pre-existing import
+  behavior), which the Envio parity gates would catch as mass-missing data.
+  Hardening candidate: fail loud on unknown markers.
+- **Read integrity**: the tx pass verifies RocksDB block checksums on its
+  reads (the bulk logs import leaves them off for speed and is
+  parity-validated downstream). Corruption in a body would otherwise decode
+  silently wrong rather than erroring.
