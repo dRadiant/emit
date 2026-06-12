@@ -114,6 +114,30 @@ pub fn eventName(comptime E: type) []const u8 {
     };
 }
 
+/// True when the event declares `pub const tx_fields = true;`, opting its
+/// handler into `log.tx` (the owning transaction's from/to/value, ADR-006).
+/// Declared per event, like an entity's `storage`, so the field exists only
+/// where a handler reads it and the compiler rejects the read elsewhere.
+pub fn eventWantsTx(comptime E: type) bool {
+    return @hasDecl(E, "tx_fields") and E.tx_fields;
+}
+
+/// True when any declared event wants tx fields. Turns on the whole carry:
+/// the filtered index's tx subtables, the fail-loud `txs.{dat,idx}` coverage
+/// check at init, and the remote REGISTER flag.
+pub fn wantsTxFields(comptime m: Manifest) bool {
+    comptime {
+        for (m.contracts) |c| for (c.events) |E| {
+            if (eventWantsTx(E)) return true;
+        };
+        for (m.factories) |f| {
+            if (eventWantsTx(f.create_event)) return true;
+            for (f.child_events) |E| if (eventWantsTx(E)) return true;
+        }
+        return false;
+    }
+}
+
 pub fn validateEvent(comptime E: type) void {
     if (!@hasDecl(E, "signature")) @compileError(
         "manifest: event type '" ++ @typeName(E) ++ "' must declare `pub const signature = \"Name(types,...)\";`. The SDK derives topic0 and name from it.",
@@ -388,6 +412,10 @@ pub fn fingerprint(comptime m: Manifest) [32]u8 {
         hasher.update(std.mem.asBytes(&m.start_block));
         const end: u64 = m.end_block orelse std.math.maxInt(u64);
         hasher.update(std.mem.asBytes(&end));
+        // Flipping the tx carry changes the filtered-entry layout (tx subtable
+        // after the lz4 payload), so it must force a rebuild.
+        const wants_tx = wantsTxFields(m);
+        hasher.update(std.mem.asBytes(&wants_tx));
         for (m.contracts) |c| {
             hasher.update(c.name);
             hasher.update(&c.address);

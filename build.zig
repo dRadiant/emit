@@ -131,6 +131,7 @@ pub fn build(b: *std.Build) void {
         .{ .path = "test/compile_fail/static_prefetch_method_empty.zig", .expected = "static_prefetch entry has an empty method string" },
         .{ .path = "test/compile_fail/event_nested_dynamic.zig", .expected = "is a tuple with a dynamic component; nested dynamics are not yet supported" },
         .{ .path = "test/compile_fail/factory_disjoint_child_events.zig", .expected = "factories must declare identical child_events. Split distinct protocols into separate manifests." },
+        .{ .path = "test/compile_fail/log_tx_undeclared.zig", .expected = "type 'void' does not support field access" },
     };
     for (compile_fail) |s| {
         const obj = b.addObject(.{

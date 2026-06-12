@@ -46,6 +46,12 @@ pub const DecodedLog = struct {
     topics: [4][32]u8,
     topic_count: u8,
     data: []const u8,
+    /// Dispatch plumbing: the owning transaction's storage record, resolved
+    /// by the replay/live loop. Non-null for every log when the manifest's
+    /// events want tx fields (resolution fails loud otherwise), always null
+    /// for tx-blind manifests. `Log(E)` decodes it into `Tx` for events
+    /// declaring `tx_fields`. Borrowed for the dispatch only.
+    tx: ?*const core.txs.TxRecord = null,
 
     pub fn fromRawLog(raw: core.RawLog) DecodedLog {
         return .{
@@ -336,10 +342,37 @@ fn parseBits(comptime s: []const u8) comptime_int {
     return n;
 }
 
+/// The owning transaction's fields (ADR-006), decoded for handler reads.
+/// Behind `log.tx` on events declaring `pub const tx_fields = true;`.
+pub const Tx = struct {
+    /// Sender. The zero address marks the rare source-store anomaly where no
+    /// sender was stored or recoverable (zero observed on full mainnet). A
+    /// real zero-address sender cannot exist, it has no key.
+    from: [20]u8,
+    /// Null for contract creations.
+    to: ?[20]u8,
+    value: u256,
+    tx_type: u8,
+
+    fn fromRecord(r: *const core.txs.TxRecord) Tx {
+        return .{
+            .from = r.from,
+            .to = if (r.flags & core.txs.FLAG_TO_ABSENT != 0) null else r.to,
+            .value = r.valueU256(),
+            .tx_type = r.tx_type,
+        };
+    }
+};
+
 /// Typed log handed to handlers by the dispatcher. Same meta shape as
 /// `DecodedLog`, plus a comptime-decoded `params: ParamsOf(E)` so handlers read
 /// named fields directly (`log.params.from`) instead of routing every access
 /// through `log.param(E, "from")`.
+///
+/// `tx` exists only for events declaring `pub const tx_fields = true;`. The
+/// declaration is what turns on the manifest's tx carry, so the field is
+/// never null where it compiles. Reading it elsewhere is a compile error
+/// (`tx` is `void` there).
 pub fn Log(comptime E: type) type {
     return struct {
         block_number: u64,
@@ -350,6 +383,7 @@ pub fn Log(comptime E: type) type {
         topics: [4][32]u8,
         topic_count: u8,
         data: []const u8,
+        tx: if (manifest.eventWantsTx(E)) Tx else void,
         params: ParamsOf(E),
 
         pub fn fromDecoded(d: DecodedLog) @This() {
@@ -362,6 +396,10 @@ pub fn Log(comptime E: type) type {
                 .topics = d.topics,
                 .topic_count = d.topic_count,
                 .data = d.data,
+                // The unwrap is guarded by the carry chain: the declaration
+                // implies `wantsTxFields`, so the dispatching loop resolved
+                // the record or failed loud before reaching here.
+                .tx = if (comptime manifest.eventWantsTx(E)) Tx.fromRecord(d.tx.?) else {},
                 .params = d.decode(E),
             };
         }
@@ -392,8 +430,11 @@ pub fn dispatchLog(
     comptime Handler: type,
     ctx: anytype,
     raw_log: core.RawLog,
+    tx: ?*const core.txs.TxRecord,
 ) !void {
-    return dispatcherFor(m).dispatch(Handler, DecodedLog.fromRawLog(raw_log), ctx);
+    var decoded = DecodedLog.fromRawLog(raw_log);
+    decoded.tx = tx;
+    return dispatcherFor(m).dispatch(Handler, decoded, ctx);
 }
 
 /// Build the comptime dispatch table for a manifest. Returns a type that
@@ -492,6 +533,36 @@ fn makeLogFrom(topic0: [32]u8, address: [20]u8) DecodedLog {
     var d = makeLog(topic0);
     d.address = address;
     return d;
+}
+
+test "Tx.fromRecord decodes value and maps a creation to null `to`" {
+    const plain = core.txs.TxRecord{
+        .tx_index = 1,
+        .tx_type = 2,
+        .flags = 0,
+        .from = [_]u8{0x10} ** 20,
+        .to = [_]u8{0x20} ** 20,
+        .value = [_]u8{ 0xFF, 0x01 } ++ [_]u8{0} ** 30,
+    };
+    const tx = Tx.fromRecord(&plain);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0x10} ** 20), &tx.from);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0x20} ** 20), &tx.to.?);
+    try std.testing.expectEqual(@as(u256, 0x01FF), tx.value);
+    try std.testing.expectEqual(@as(u8, 2), tx.tx_type);
+
+    var creation = plain;
+    creation.flags = core.txs.FLAG_TO_ABSENT;
+    creation.to = [_]u8{0} ** 20;
+    try std.testing.expectEqual(@as(?[20]u8, null), Tx.fromRecord(&creation).to);
+}
+
+test "Log(E).tx exists only for events declaring tx_fields" {
+    const Declared = struct {
+        pub const signature = "Transfer(address,address,uint256)";
+        pub const tx_fields = true;
+    };
+    try std.testing.expectEqual(Tx, @FieldType(Log(Declared), "tx"));
+    try std.testing.expectEqual(void, @FieldType(Log(Transfer), "tx"));
 }
 
 test "dispatch gates a cross-emitted event to its declaring contract" {

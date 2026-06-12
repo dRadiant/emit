@@ -51,6 +51,9 @@ pub fn sortAddresses(addrs: [][20]u8) void {
 pub const Filtered = struct {
     entry: []const u8,
     log_count: u32,
+    /// Ascending-deduped tx indexes of the kept logs, a slice into the
+    /// caller's `tx_mask_buf`. Empty unless the caller passed one.
+    tx_mask: []const u16 = &.{},
 };
 
 inline fn contains(comptime N: usize, haystack: []const [N]u8, needle: *const [N]u8) bool {
@@ -99,11 +102,16 @@ inline fn addrMatch(haystack: []const [20]u8, needle: *const [20]u8, sorted: boo
 /// materialization entirely. Both buffers must be at least `BLOCK_BUF_SIZE`.
 /// Propagates the compress error (`error.BufferTooSmall` on an oversize block).
 /// Caller decides whether that is a recoverable drop or fatal.
+///
+/// `tx_mask_buf`, when non-null, receives the kept logs' tx indexes
+/// (ascending-deduped, returned via `Filtered.tx_mask`). Sized to the u16
+/// domain (65,536) it can never overflow. Feeds the tx-fields carry-through.
 pub fn filterBlockEntry(
     decompressed: []const u8,
     filter: Filter,
     serialize_buf: []u8,
     compress_buf: []u8,
+    tx_mask_buf: ?[]u16,
 ) !?Filtered {
     // Opt-in binary search requires the precondition the flag asserts. Check it
     // once per block in safe builds. Compiled out in ReleaseFast.
@@ -120,6 +128,7 @@ pub fn filterBlockEntry(
 
     var out_pos: usize = 4;
     var kept: u32 = 0;
+    var mask_len: usize = 0;
 
     for (0..log_count) |_| {
         const log_start = pos;
@@ -145,13 +154,26 @@ pub fn filterBlockEntry(
         @memcpy(serialize_buf[out_pos..][0..len], decompressed[log_start..log_end]);
         out_pos += len;
         kept += 1;
+
+        // Logs are tx-ordered within a block, adjacent dedup suffices.
+        if (tx_mask_buf) |mb| {
+            const tx_index = std.mem.readInt(u16, decompressed[log_start..][0..2], .little);
+            if (mask_len == 0 or mb[mask_len - 1] != tx_index) {
+                mb[mask_len] = tx_index;
+                mask_len += 1;
+            }
+        }
     }
 
     if (kept == 0) return null;
 
     std.mem.writeInt(u32, serialize_buf[0..4], kept, .little);
     const entry_len = try log_serial.compressEntry(serialize_buf[0..out_pos], compress_buf);
-    return .{ .entry = compress_buf[0..entry_len], .log_count = kept };
+    return .{
+        .entry = compress_buf[0..entry_len],
+        .log_count = kept,
+        .tx_mask = if (tx_mask_buf) |mb| mb[0..mask_len] else &.{},
+    };
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -212,7 +234,7 @@ test "filterBlockEntry keeps only address+topic matches, drops the rest" {
         .match_topics = &.{ TOPIC_X, TOPIC_Y },
         .exclude_addrs = &.{},
     };
-    const filtered = (try filterBlockEntry(packed_logs, filter, &serialize_buf, &compress_buf)).?;
+    const filtered = (try filterBlockEntry(packed_logs, filter, &serialize_buf, &compress_buf, null)).?;
     try testing.expectEqual(@as(u32, 2), filtered.log_count);
 
     const kept = try unpack(filtered.entry, &decompress_buf, &log_buf);
@@ -222,6 +244,34 @@ test "filterBlockEntry keeps only address+topic matches, drops the rest" {
     try testing.expectEqual(@as(u16, 0), kept[0].log_index);
     try testing.expectEqualSlices(u8, &TOPIC_Y, &kept[1].topics[0]);
     try testing.expectEqual(@as(u16, 3), kept[1].log_index);
+}
+
+test "filterBlockEntry captures kept tx indexes, ascending-deduped" {
+    var pack_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
+    var serialize_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
+    var compress_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
+    var mask_buf: [8]u16 = undefined;
+
+    var logs = [_]RawLog{
+        rawLog(ADDR_A, TOPIC_X, 1, 0), // keep, tx 2
+        rawLog(ADDR_A, TOPIC_X, 1, 1), // keep, tx 2 (dedups)
+        rawLog(ADDR_B, TOPIC_X, 1, 2), // drop, tx 5 must not appear
+        rawLog(ADDR_A, TOPIC_X, 1, 3), // keep, tx 7
+    };
+    logs[0].tx_index = 2;
+    logs[1].tx_index = 2;
+    logs[2].tx_index = 5;
+    logs[3].tx_index = 7;
+    const packed_logs = packLogs(&logs, &pack_buf);
+
+    const filter: Filter = .{
+        .match_addrs = &.{ADDR_A},
+        .match_topics = &.{TOPIC_X},
+        .exclude_addrs = &.{},
+    };
+    const filtered = (try filterBlockEntry(packed_logs, filter, &serialize_buf, &compress_buf, &mask_buf)).?;
+    try testing.expectEqual(@as(u32, 3), filtered.log_count);
+    try testing.expectEqualSlices(u16, &.{ 2, 7 }, filtered.tx_mask);
 }
 
 test "filterBlockEntry applies exclude_addrs after the positive match" {
@@ -242,7 +292,7 @@ test "filterBlockEntry applies exclude_addrs after the positive match" {
         .match_topics = &.{TOPIC_X},
         .exclude_addrs = &.{ADDR_A},
     };
-    const filtered = (try filterBlockEntry(packed_logs, filter, &serialize_buf, &compress_buf)).?;
+    const filtered = (try filterBlockEntry(packed_logs, filter, &serialize_buf, &compress_buf, null)).?;
     try testing.expectEqual(@as(u32, 1), filtered.log_count);
 
     const kept = try unpack(filtered.entry, &decompress_buf, &log_buf);
@@ -277,7 +327,7 @@ test "filterBlockEntry binary-searches a large sorted address set" {
         .exclude_addrs = &.{},
         .addrs_sorted = true,
     };
-    const filtered = (try filterBlockEntry(packed_logs, filter, &serialize_buf, &compress_buf)).?;
+    const filtered = (try filterBlockEntry(packed_logs, filter, &serialize_buf, &compress_buf, null)).?;
     try testing.expectEqual(@as(u32, 1), filtered.log_count);
 
     const kept = try unpack(filtered.entry, &decompress_buf, &log_buf);
@@ -298,7 +348,7 @@ test "filterBlockEntry returns null when nothing matches" {
         .match_topics = &.{TOPIC_X},
         .exclude_addrs = &.{},
     };
-    try testing.expectEqual(@as(?Filtered, null), try filterBlockEntry(packed_logs, filter, &serialize_buf, &compress_buf));
+    try testing.expectEqual(@as(?Filtered, null), try filterBlockEntry(packed_logs, filter, &serialize_buf, &compress_buf, null));
 }
 
 test "filterBlockEntry skips logs with zero topics" {
@@ -316,7 +366,7 @@ test "filterBlockEntry skips logs with zero topics" {
         .match_topics = &.{TOPIC_X},
         .exclude_addrs = &.{},
     };
-    try testing.expectEqual(@as(?Filtered, null), try filterBlockEntry(packed_logs, filter, &serialize_buf, &compress_buf));
+    try testing.expectEqual(@as(?Filtered, null), try filterBlockEntry(packed_logs, filter, &serialize_buf, &compress_buf, null));
 }
 
 test "filterBlockEntry treats an empty positive set as a wildcard on that axis" {
@@ -335,7 +385,7 @@ test "filterBlockEntry treats an empty positive set as a wildcard on that axis" 
 
     // Topics-only: any address with topic X. Keeps the two TOPIC_X logs.
     const topics_only: Filter = .{ .match_addrs = &.{}, .match_topics = &.{TOPIC_X}, .exclude_addrs = &.{} };
-    const f1 = (try filterBlockEntry(packed_logs, topics_only, &serialize_buf, &compress_buf)).?;
+    const f1 = (try filterBlockEntry(packed_logs, topics_only, &serialize_buf, &compress_buf, null)).?;
     try testing.expectEqual(@as(u32, 2), f1.log_count);
     const k1 = try unpack(f1.entry, &decompress_buf, &log_buf);
     try testing.expectEqualSlices(u8, &ADDR_A, &k1[0].address);
@@ -343,7 +393,7 @@ test "filterBlockEntry treats an empty positive set as a wildcard on that axis" 
 
     // Address-only: address A with any topic. Keeps the single ADDR_A log.
     const addr_only: Filter = .{ .match_addrs = &.{ADDR_A}, .match_topics = &.{}, .exclude_addrs = &.{} };
-    const f2 = (try filterBlockEntry(packed_logs, addr_only, &serialize_buf, &compress_buf)).?;
+    const f2 = (try filterBlockEntry(packed_logs, addr_only, &serialize_buf, &compress_buf, null)).?;
     try testing.expectEqual(@as(u32, 1), f2.log_count);
     const k2 = try unpack(f2.entry, &decompress_buf, &log_buf);
     try testing.expectEqualSlices(u8, &ADDR_A, &k2[0].address);

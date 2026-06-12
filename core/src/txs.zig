@@ -37,6 +37,13 @@ pub const RECORD_SIZE: usize = 76;
 pub const FLAG_TO_ABSENT: u8 = 1; // contract creation, `to` is zero
 pub const FLAG_FROM_UNRECOVERED: u8 = 2; // sender missing in source, `from` is zero
 
+/// Structural ceiling, not an assumption: tx_index is u16, so one block's
+/// table holds at most the full u16 domain.
+pub const MAX_RECORDS: usize = 65_536;
+/// Largest serialized table: count u32 + MAX_RECORDS strides. Sizes reader
+/// scratch so no legitimate block can overflow.
+pub const MAX_TABLE_SIZE: usize = 4 + MAX_RECORDS * RECORD_SIZE;
+
 /// One log-producing transaction's fields. `value` is u256 LE bytes so the
 /// record serializes with plain copies. Fixed 76-byte stride.
 pub const TxRecord = struct {
@@ -60,6 +67,24 @@ pub fn find(records: []const TxRecord, tx_index: u16) ?*const TxRecord {
         if (r.tx_index > tx_index) return null;
     }
     return null;
+}
+
+/// Filter `records` to those whose tx_index appears in `mask`. Both inputs
+/// are ascending-sorted, so a single merge walk suffices. Writes survivors
+/// into `out` and returns the filled slice. A mask index absent from
+/// `records` is skipped, the caller compares lengths to detect the hole.
+pub fn selectByMask(records: []const TxRecord, mask: []const u16, out: []TxRecord) []TxRecord {
+    var n: usize = 0;
+    var ri: usize = 0;
+    for (mask) |idx| {
+        while (ri < records.len and records[ri].tx_index < idx) ri += 1;
+        if (ri == records.len) break;
+        if (records[ri].tx_index == idx) {
+            out[n] = records[ri];
+            n += 1;
+        }
+    }
+    return out[0..n];
 }
 
 /// Serialize a block's table into `buf`. Returns bytes written. The count is
@@ -350,6 +375,24 @@ test "writer/reader round-trip across blocks, including an empty one" {
     try testing.expectEqual(@as(usize, 1), (try r.readBlock(102, &pbuf, &dbuf, &out)).?.len);
     try testing.expectEqual(@as(?[]TxRecord, null), try r.readBlock(99, &pbuf, &dbuf, &out));
     try testing.expectEqual(@as(?[]TxRecord, null), try r.readBlock(103, &pbuf, &dbuf, &out));
+}
+
+test "selectByMask keeps exactly the masked records, reports holes by length" {
+    const records = [_]TxRecord{ rec(0, 0x10), rec(3, 0x20), rec(7, 0x30), rec(9, 0x40) };
+    var out: [4]TxRecord = undefined;
+
+    const sel = selectByMask(&records, &.{ 3, 9 }, &out);
+    try testing.expectEqual(@as(usize, 2), sel.len);
+    try testing.expectEqual(@as(u16, 3), sel[0].tx_index);
+    try testing.expectEqual(@as(u16, 9), sel[1].tx_index);
+
+    // A masked index with no record is skipped, the caller detects the hole
+    // by comparing lengths.
+    const holey = selectByMask(&records, &.{ 3, 5, 9 }, &out);
+    try testing.expectEqual(@as(usize, 2), holey.len);
+
+    try testing.expectEqual(@as(usize, 0), selectByMask(&records, &.{}, &out).len);
+    try testing.expectEqual(@as(usize, 0), selectByMask(&.{}, &.{ 1, 2 }, &out).len);
 }
 
 test "find locates records in a sorted table" {

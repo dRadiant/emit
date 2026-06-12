@@ -170,10 +170,26 @@ const TestBuf = struct {
         self.len += 1;
     }
     fn rlpStr(self: *TestBuf, d: []const u8) void {
-        if (d.len == 0) { self.putByte(0x80); } else if (d.len == 1 and d[0] < 0x80) { self.putByte(d[0]); } else if (d.len <= 55) { self.putByte(@intCast(0x80 + d.len)); self.put(d); } else { self.putByte(0xB8); self.putByte(@intCast(d.len)); self.put(d); }
+        if (d.len == 0) {
+            self.putByte(0x80);
+        } else if (d.len == 1 and d[0] < 0x80) {
+            self.putByte(d[0]);
+        } else if (d.len <= 55) {
+            self.putByte(@intCast(0x80 + d.len));
+            self.put(d);
+        } else {
+            self.putByte(0xB8);
+            self.putByte(@intCast(d.len));
+            self.put(d);
+        }
     }
     fn listHdr(self: *TestBuf, content_len: usize) void {
-        if (content_len <= 55) { self.putByte(@intCast(0xC0 + content_len)); } else { self.putByte(0xF8); self.putByte(@intCast(content_len)); }
+        if (content_len <= 55) {
+            self.putByte(@intCast(0xC0 + content_len));
+        } else {
+            self.putByte(0xF8);
+            self.putByte(@intCast(content_len));
+        }
     }
     fn rlpStrLen(d: []const u8) usize {
         if (d.len == 0) return 1;

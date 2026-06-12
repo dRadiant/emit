@@ -149,7 +149,26 @@ pub fn serveConnection(
         return sendGoaway(stream, .shutdown, "empty filter", allocator);
     }
 
-    try streamBackfill(stream, reader, ts_reader, reg, allocator);
+    // Tx-fields carry. Refuse up front when the store cannot serve the whole
+    // backfill range, never stream a client a half-covered index.
+    var txs_storage: ?core.txs.TxsReader = null;
+    defer if (txs_storage) |*t| t.deinit();
+    if (reg.tx_fields) {
+        var dir = try std.fs.cwd().openDir(cfg.data_dir, .{});
+        defer dir.close();
+        txs_storage = core.txs.TxsReader.open(dir) catch null;
+        if (txs_storage == null)
+            return sendGoaway(stream, .shutdown, "tx fields unavailable: store has no txs.{dat,idx}", allocator);
+        const tip = tipOf(reader);
+        // Clamp to the store's first block: a fresh client registers cursor 0
+        // regardless of where the flat store begins.
+        const start = @max(reg.cursor +| 1, reader.first_block);
+        if (start <= tip and !txs_storage.?.covers(start, tip))
+            return sendGoaway(stream, .shutdown, "tx fields unavailable: txs.dat does not cover the backfill range", allocator);
+    }
+    const txs_reader: ?*const core.txs.TxsReader = if (txs_storage) |*t| t else null;
+
+    try streamBackfill(stream, reader, ts_reader, txs_reader, reg, allocator);
     if (!reg.follow) return sendGoaway(stream, .shutdown, "backfill complete", allocator);
     try streamLive(stream, reg, tipOf(reader), cfg, allocator);
 }
@@ -163,6 +182,7 @@ fn streamBackfill(
     stream: std.net.Stream,
     reader: *const FlatStoreReader,
     ts_reader: ?*const TimestampReader,
+    txs_reader: ?*const core.txs.TxsReader,
     reg: tcp_frame.Register,
     allocator: std.mem.Allocator,
 ) !void {
@@ -180,7 +200,7 @@ fn streamBackfill(
     // Shared with the SDK builder: a parallel io_uring read + filter pipeline,
     // chunked so each chunk's survivors PUSH before the next reads.
     var sink = PushSink{ .stream = stream, .ts = ts_reader };
-    const r = try core.parallel_filter.run(reader, reg.addresses, filter, start, tip, PushSink, &sink, allocator);
+    const r = try core.parallel_filter.run(reader, reg.addresses, filter, txs_reader, start, tip, PushSink, &sink, allocator);
     // A dropped block (read/decompress failure) means a hole. Refuse to hand the
     // client an incomplete index.
     if (r.dropped_blocks > 0) return error.BloomScanDropped;
@@ -237,13 +257,20 @@ fn streamLive(
     const compress_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
     defer allocator.free(compress_buf);
 
+    // Tx carry scratch for the pending push path, allocated only when the
+    // client registered tx_fields. The pending entry carries the block's full
+    // table, the push appends the kept subset after the lz4 payload.
+    var tx_scratch: ?LiveTxScratch = if (reg.tx_fields) try LiveTxScratch.init(allocator) else null;
+    defer if (tx_scratch) |*ts| ts.deinit(allocator);
+    const tx: ?*LiveTxScratch = if (tx_scratch) |*ts| ts else null;
+
     // Pending blocks above the backfill coverage (and the client's cursor)
     // bridge the gap between the finalized tip and the live head. They may
     // already be in the ring before the first wake, so stream them up front.
     const live_start = @max(reg.cursor, flat_tip);
     for (prev.entries) |e| {
         if (e.block_number <= live_start) continue;
-        try filterAndPush(stream, e, filterFor(match_addrs.items, reg), decompress_buf, serialize_buf, compress_buf);
+        try filterAndPush(stream, e, filterFor(match_addrs.items, reg), decompress_buf, serialize_buf, compress_buf, tx);
     }
 
     while (true) {
@@ -289,8 +316,17 @@ fn streamLive(
                     defer dir.close();
                     var ts = try TimestampReader.open(dir);
                     defer if (ts) |*t| t.deinit();
+                    // Fresh txs reader for the same reason as the fresh flat
+                    // reader: coverage grows with each finalize. A hole now is
+                    // fatal, the client was promised tx fields at REGISTER.
+                    var fresh_txs: ?core.txs.TxsReader = null;
+                    defer if (fresh_txs) |*t| t.deinit();
+                    if (reg.tx_fields) {
+                        fresh_txs = (core.txs.TxsReader.open(dir) catch null) orelse return error.TxFieldsUnavailable;
+                        if (!fresh_txs.?.covers(fork, fresh_tip)) return error.TxFieldsUnavailable;
+                    }
                     var sink = PushSink{ .stream = stream, .ts = if (ts) |*t| t else null };
-                    const r = try core.parallel_filter.run(&fresh, match_addrs.items, filter, fork, fresh_tip, PushSink, &sink, allocator);
+                    const r = try core.parallel_filter.run(&fresh, match_addrs.items, filter, if (fresh_txs) |*t| t else null, fork, fresh_tip, PushSink, &sink, allocator);
                     if (r.dropped_blocks > 0) return error.BloomScanDropped;
                     flat_covered = fresh_tip;
                 }
@@ -299,11 +335,11 @@ fn streamLive(
                 // Skip blocks below the fork (client kept them) and blocks the
                 // flat re-stream already pushed (client store key is monotonic).
                 if (e.block_number < fork or e.block_number <= flat_covered) continue;
-                try filterAndPush(stream, e, filter, decompress_buf, serialize_buf, compress_buf);
+                try filterAndPush(stream, e, filter, decompress_buf, serialize_buf, compress_buf, tx);
             }
         } else {
             for (classification.new_blocks) |e| {
-                try filterAndPush(stream, e, filter, decompress_buf, serialize_buf, compress_buf);
+                try filterAndPush(stream, e, filter, decompress_buf, serialize_buf, compress_buf, tx);
             }
         }
 
@@ -316,8 +352,36 @@ fn streamLive(
     }
 }
 
+/// Tx carry scratch for the live push path, sized to the structural u16
+/// ceiling. Allocated per connection, only for tx_fields registrations.
+const LiveTxScratch = struct {
+    mask: []u16,
+    records: []core.txs.TxRecord,
+    selected: []core.txs.TxRecord,
+    /// Concat target: filtered entry + serialized subtable.
+    push_buf: []u8,
+
+    fn init(a: std.mem.Allocator) !LiveTxScratch {
+        return .{
+            .mask = try a.alloc(u16, core.txs.MAX_RECORDS),
+            .records = try a.alloc(core.txs.TxRecord, core.txs.MAX_RECORDS),
+            .selected = try a.alloc(core.txs.TxRecord, core.txs.MAX_RECORDS),
+            .push_buf = try a.alloc(u8, types.BLOCK_BUF_SIZE + core.txs.MAX_TABLE_SIZE),
+        };
+    }
+
+    fn deinit(self: *LiveTxScratch, a: std.mem.Allocator) void {
+        a.free(self.push_buf);
+        a.free(self.selected);
+        a.free(self.records);
+        a.free(self.mask);
+    }
+};
+
 /// Decompress a pending block, filter to matching logs, PUSH when non-empty.
-/// A block with no matching log produces no frame.
+/// A block with no matching log produces no frame. With `tx` set, the kept
+/// logs' TxRecords (selected from the entry's full table) trail the lz4
+/// payload. A table the ring lacks fails loud, the client registered for it.
 fn filterAndPush(
     stream: std.net.Stream,
     entry: Entry,
@@ -325,10 +389,21 @@ fn filterAndPush(
     decompress_buf: []u8,
     serialize_buf: []u8,
     compress_buf: []u8,
+    tx: ?*LiveTxScratch,
 ) !void {
     const decompressed = try log_serial.decompressEntry(entry.lz4_entry, decompress_buf);
-    const maybe = try core.filter.filterBlockEntry(decompressed, filter, serialize_buf, compress_buf);
+    const mask_buf: ?[]u16 = if (tx) |t| t.mask else null;
+    const maybe = try core.filter.filterBlockEntry(decompressed, filter, serialize_buf, compress_buf, mask_buf);
     const filtered = maybe orelse return;
+
+    if (tx) |t| {
+        const full = try core.txs.deserializeRecords(entry.tx_table, t.records);
+        const selected = core.txs.selectByMask(full, filtered.tx_mask, t.selected);
+        if (selected.len != filtered.tx_mask.len) return error.MissingTxRecord;
+        @memcpy(t.push_buf[0..filtered.entry.len], filtered.entry);
+        const sub_len = core.txs.serializeRecords(selected, t.push_buf[filtered.entry.len..]);
+        return sendPush(stream, entry.block_number, entry.timestamp, t.push_buf[0 .. filtered.entry.len + sub_len]);
+    }
     try sendPush(stream, entry.block_number, entry.timestamp, filtered.entry);
 }
 

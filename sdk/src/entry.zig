@@ -628,7 +628,25 @@ pub fn init(
         // otherwise make build() try to append blocks <= the existing tail,
         // raising error.OutOfOrder. Clear first so the rebuild starts clean.
         try clearFilterFiles(filter_dh);
-        const primary_result = try filter_builder.build(&reader.?, m, filter_dh, allocator);
+
+        // Tx-fields carry. The whole build range must be covered up front,
+        // a hole would surface as a dropped block mid-build.
+        var txs_storage: core.txs.TxsReader = undefined;
+        var txs_reader: ?*const core.txs.TxsReader = null;
+        if (comptime sdk_manifest.wantsTxFields(m)) {
+            // Clamp to what the flat store actually holds: the build scans no
+            // block below first_block or above the tip regardless of manifest.
+            const build_from = @max(m.start_block, reader.?.first_block);
+            const build_end = @min(
+                m.end_block orelse std.math.maxInt(u64),
+                reader.?.first_block + reader.?.index_count - 1,
+            );
+            txs_storage = try openTxsRequired(options.engine_data_dir, build_from, build_end);
+            txs_reader = &txs_storage;
+        }
+        defer if (comptime sdk_manifest.wantsTxFields(m)) txs_storage.deinit();
+
+        const primary_result = try filter_builder.build(&reader.?, m, txs_reader, filter_dh, allocator);
         try requireCompleteFilter("phase 1 (build)", primary_result);
         ctx.stats.filter_blocks_scanned = primary_result.blocks_scanned;
         ctx.stats.filter_blocks_matched = primary_result.blocks_matched;
@@ -650,6 +668,7 @@ pub fn init(
                 const child_result = try filter_builder.appendChildren(
                     &reader.?,
                     m,
+                    txs_reader,
                     child_addrs,
                     filter_dh,
                     allocator,
@@ -774,7 +793,18 @@ fn followGapFill(
     defer gap_reader.deinit();
 
     const gap_from = ctx._last_dispatched_block + 1;
-    const gap_result = try filter_builder.appendBlocks(&gap_reader, m, gap_from, engine_last, filter_dh, allocator);
+
+    // Fresh open per gap fill. The engine extends txs.dat with each finalize,
+    // an init-scoped reader would not see the new coverage.
+    var txs_storage: core.txs.TxsReader = undefined;
+    var txs_reader: ?*const core.txs.TxsReader = null;
+    if (comptime sdk_manifest.wantsTxFields(m)) {
+        txs_storage = try openTxsRequired(options.engine_data_dir, gap_from, engine_last);
+        txs_reader = &txs_storage;
+    }
+    defer if (comptime sdk_manifest.wantsTxFields(m)) txs_storage.deinit();
+
+    const gap_result = try filter_builder.appendBlocks(&gap_reader, m, txs_reader, gap_from, engine_last, filter_dh, allocator);
     try requireCompleteFilter("follow gap-fill", gap_result);
 
     // The gap may hold create-events for children unknown to the backfill pass
@@ -791,7 +821,7 @@ fn followGapFill(
             if (set.count() > 0) {
                 const addrs = try keysToSlice(set, allocator);
                 defer allocator.free(addrs);
-                const cres = try filter_builder.appendChildrenBlocks(&gap_reader, m, addrs, gap_from, engine_last, filter_dh, allocator);
+                const cres = try filter_builder.appendChildrenBlocks(&gap_reader, m, txs_reader, addrs, gap_from, engine_last, filter_dh, allocator);
                 try requireCompleteFilter("follow gap-fill children", cres);
             }
         }
@@ -951,6 +981,7 @@ fn streamInto(
     addresses: []const [20]u8,
     topics: []const [32]u8,
     exclude: []const [20]u8,
+    tx_fields: bool,
     allocator: std.mem.Allocator,
 ) !u64 {
     var store = try filtered_store_mod.FilteredStore.open(allocator, filter_dh, base);
@@ -964,6 +995,7 @@ fn streamInto(
         .addresses = addresses,
         .topics = topics,
         .exclude_addresses = exclude,
+        .tx_fields = tx_fields,
     }, &store, allocator);
     return result.blocks_received;
 }
@@ -988,6 +1020,7 @@ fn remoteBackfill(
         comptime filter_builder.collectKnownAddresses(m),
         comptime filter_builder.collectAllTopics(m),
         &.{},
+        comptime sdk_manifest.wantsTxFields(m),
         allocator,
     );
 
@@ -1023,6 +1056,7 @@ fn remoteBackfill(
                 child_addrs,
                 child_topics,
                 comptime filter_builder.collectKnownAddresses(m),
+                comptime sdk_manifest.wantsTxFields(m),
                 allocator,
             );
         }
@@ -1083,6 +1117,35 @@ fn requireCompleteFilter(phase: []const u8, r: filter_builder.BuildResult) !void
         .{ phase, r.dropped_blocks, r.blocks_matched + r.dropped_blocks },
     );
     return error.FilterBuildIncomplete;
+}
+
+/// Open the engine's txs.{dat,idx} pair and require coverage of `[from, to]`.
+/// Called only for manifests setting `tx_fields`. Absence or a coverage hole
+/// is fatal at init, never a silent null `log.tx` at dispatch.
+fn openTxsRequired(engine_data_dir: []const u8, from: u64, to: u64) !core.txs.TxsReader {
+    var dh = try std.fs.cwd().openDir(engine_data_dir, .{});
+    defer dh.close();
+    var tr = (core.txs.TxsReader.open(dh) catch null) orelse {
+        core.log.err(
+            \\
+            \\ERROR: manifest sets tx_fields but the engine store has no txs.{{dat,idx}}.
+            \\Re-run the import without --no-tx-fields (or run `emit-engine import`
+            \\against a store that already has logs to backfill the tx pass).
+            \\
+        , .{});
+        return error.TxFieldsUnavailable;
+    };
+    if (!tr.covers(from, to)) {
+        core.log.err(
+            \\
+            \\ERROR: manifest sets tx_fields but txs.dat covers [{d}, {d}], the
+            \\indexed range needs [{d}, {d}]. Extend the import's tx pass first.
+            \\
+        , .{ tr.first_block, tr.first_block + tr.count -| 1, from, to });
+        tr.deinit();
+        return error.TxFieldsUnavailable;
+    }
+    return tr;
 }
 
 /// Comptime-build the inner struct that holds one entity store per tuple

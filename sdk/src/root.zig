@@ -52,6 +52,9 @@ pub const spawn = entry.spawn;
 pub const RunStats = entry.RunStats;
 pub const printStats = entry.printStats;
 pub const StaticCall = manifest.StaticCall;
+/// The owning transaction's fields behind `log.tx` (ADR-006), on events
+/// declaring `pub const tx_fields = true;`.
+pub const Tx = handler.Tx;
 /// Leveled CLI output, shared with the engine. Set via `log.setLevel` from the
 /// indexer's `--silent` / `--verbose` flags.
 pub const log = @import("core").log;

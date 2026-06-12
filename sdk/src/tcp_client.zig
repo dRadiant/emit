@@ -31,6 +31,9 @@ pub const Filter = struct {
     /// Negative filter. The children pass excludes static∪factory so an address
     /// that is both a discovered child and a declared contract is not streamed twice.
     exclude_addresses: []const [20]u8 = &.{},
+    /// Ask the engine to trail each PUSH entry with its tx subtable. The
+    /// engine refuses (GOAWAY) when its store cannot cover the range.
+    tx_fields: bool = false,
 };
 
 pub const BackfillResult = struct {
@@ -60,6 +63,7 @@ pub fn backfill(
         .addresses = filter.addresses,
         .topics = filter.topics,
         .exclude_addresses = filter.exclude_addresses,
+        .tx_fields = filter.tx_fields,
     }).encode(allocator);
     defer allocator.free(reg_payload);
     try writeFrame(stream, .register, reg_payload);
@@ -135,6 +139,9 @@ pub fn follow(
     defer allocator.free(log_buf);
     var payload_buf = try allocator.alloc(u8, 64 * 1024);
     defer allocator.free(payload_buf);
+    // Tx subtable scratch, sized to the structural u16 ceiling.
+    const tx_buf = if (comptime sdk_manifest.wantsTxFields(m)) try allocator.alloc(core.txs.TxRecord, core.txs.MAX_RECORDS) else &[_]core.txs.TxRecord{};
+    defer if (comptime sdk_manifest.wantsTxFields(m)) allocator.free(tx_buf);
 
     // Blocks dispatched into the overlay but not yet finalized. Ascending by
     // arrival, so a HEARTBEAT finalizes a prefix.
@@ -142,7 +149,7 @@ pub fn follow(
     defer live_blocks.deinit(allocator);
 
     while (!live.stopRequested(ctx)) {
-        followOnce(m, Handler, ctx, host, port, addresses, topics, decompress_buf, log_buf, &payload_buf, &live_blocks, allocator) catch |e| {
+        followOnce(m, Handler, ctx, host, port, addresses, topics, decompress_buf, log_buf, tx_buf, &payload_buf, &live_blocks, allocator) catch |e| {
             // A fork below finality can't be recovered by reconnecting. Surface
             // it. Everything else is a dropped connection: back off and retry,
             // visibly. A silent retry loop reads as a healthy indexer while the
@@ -168,6 +175,7 @@ fn followOnce(
     topics: []const [32]u8,
     decompress_buf: []u8,
     log_buf: []core.RawLog,
+    tx_buf: []core.txs.TxRecord,
     payload_buf: *[]u8,
     live_blocks: *std.ArrayListUnmanaged(u64),
     allocator: std.mem.Allocator,
@@ -195,6 +203,7 @@ fn followOnce(
         .addresses = reg_addrs.items,
         .topics = topics,
         .follow = true,
+        .tx_fields = comptime sdk_manifest.wantsTxFields(m),
     }).encode(allocator);
     defer allocator.free(reg_payload);
     try writeFrame(stream, .register, reg_payload);
@@ -219,7 +228,7 @@ fn followOnce(
                 live.lockCtx(ctx);
                 defer live.unlockCtx(ctx);
                 new_children.clearRetainingCapacity();
-                try dispatchPush(m, Handler, ctx, p, decompress_buf, log_buf, &new_children, allocator);
+                try dispatchPush(m, Handler, ctx, p, decompress_buf, log_buf, tx_buf, &new_children, allocator);
                 try live_blocks.append(allocator, p.block_number);
                 // Register children spawned this block. The engine mini-backfills
                 // [block, tip] for each, catching their same-block events.
@@ -267,6 +276,7 @@ fn dispatchPush(
     p: tcp_frame.Push,
     decompress_buf: []u8,
     log_buf: []core.RawLog,
+    tx_buf: []core.txs.TxRecord,
     new_children: *std.ArrayListUnmanaged([20]u8),
     allocator: std.mem.Allocator,
 ) !void {
@@ -275,6 +285,14 @@ fn dispatchPush(
     // (error propagates to follow's reconnect) instead of an OOB in ReleaseFast.
     const log_count = try core.log_serial.deserializeLogsChecked(decoded, log_buf);
     for (log_buf[0..log_count]) |*log| log.block_number = p.block_number;
+
+    // The registered tx_fields entitles every PUSH to a trailing subtable.
+    // An absent tail parses as Truncated, fail loud over a silent null tx.
+    var tx_records: []const core.txs.TxRecord = &.{};
+    if (comptime sdk_manifest.wantsTxFields(m)) {
+        const lz4_len = std.mem.readInt(u32, p.lz4_entry[0..4], .little);
+        tx_records = try core.txs.deserializeRecords(p.lz4_entry[4 + lz4_len ..], tx_buf);
+    }
 
     // Factory children spawned in this block. Their same-block events were
     // filtered out (the child wasn't registered yet), so the caller mini-
@@ -285,7 +303,13 @@ fn dispatchPush(
     ctx.block_number = p.block_number;
     ctx.timestamp = if (p.timestamp != 0) @as(u64, p.timestamp) else humanize.timestampOf(ctx, p.block_number);
 
-    for (log_buf[0..log_count]) |log| try handler_mod.dispatchLog(m, Handler, ctx, log);
+    for (log_buf[0..log_count]) |log| {
+        const tx: ?*const core.txs.TxRecord = if (comptime sdk_manifest.wantsTxFields(m))
+            core.txs.find(tx_records, log.tx_index) orelse return error.MissingTxRecord
+        else
+            null;
+        try handler_mod.dispatchLog(m, Handler, ctx, log, tx);
+    }
 }
 
 /// Append every runtime-discovered child address to `out`. No-op for a ctx
@@ -573,7 +597,7 @@ test "follow dispatches streamed live blocks and finalizes a heartbeat prefix" {
     var live_blocks: std.ArrayListUnmanaged(u64) = .{};
     defer live_blocks.deinit(allocator);
 
-    try followOnce(FollowManifest, FollowRunner, &runner, "127.0.0.1", port, &addrs, &topics, decompress_buf, log_buf, &payload_buf, &live_blocks, allocator);
+    try followOnce(FollowManifest, FollowRunner, &runner, "127.0.0.1", port, &addrs, &topics, decompress_buf, log_buf, &.{}, &payload_buf, &live_blocks, allocator);
     th.join();
 
     // The client registered to follow from its committed cursor.
@@ -614,7 +638,7 @@ test "follow treats a reorg below the committed cursor as fatal" {
     var live_blocks: std.ArrayListUnmanaged(u64) = .{};
     defer live_blocks.deinit(allocator);
 
-    const r = followOnce(FollowManifest, FollowRunner, &runner, "127.0.0.1", port, &addrs, &topics, decompress_buf, log_buf, &payload_buf, &live_blocks, allocator);
+    const r = followOnce(FollowManifest, FollowRunner, &runner, "127.0.0.1", port, &addrs, &topics, decompress_buf, log_buf, &.{}, &payload_buf, &live_blocks, allocator);
     th.join();
     try testing.expectError(error.ReorgExceedsFinalityDepth, r);
 }

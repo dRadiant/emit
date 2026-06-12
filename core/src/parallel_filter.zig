@@ -19,6 +19,7 @@ const io_pipeline = @import("io_pipeline.zig");
 const parallel = @import("parallel.zig");
 const log_serial = @import("log_serial.zig");
 const log = @import("log.zig");
+const txs_mod = @import("txs.zig");
 
 const FlatStoreReader = flat_reader.FlatStoreReader;
 const Filter = filter_mod.Filter;
@@ -49,10 +50,17 @@ pub const Result = struct {
 /// where `entry` is the recompressed filtered block (`lz4_len + lz4_data`),
 /// valid only for the call. `bloom_addresses` feeds the block-level bloom scan;
 /// `filter` is the per-log keep predicate applied after decompression.
+///
+/// `txs_reader`, when non-null, appends each survivor's tx subtable (the
+/// kept logs' TxRecords, `core.txs` serialized form) after the lz4 payload.
+/// `decompressEntry` tolerates the trailing bytes, so tx-blind readers parse
+/// the entry unchanged. A block whose table is missing or incomplete counts
+/// as dropped, fail loud, never a silent null `log.tx`.
 pub fn run(
     reader: *const FlatStoreReader,
     bloom_addresses: []const [20]u8,
     filter: Filter,
+    txs_reader: ?*const txs_mod.TxsReader,
     start_block: u64,
     end_block: u64,
     comptime Sink: type,
@@ -107,7 +115,7 @@ pub fn run(
     var off: usize = 0;
     while (off < matching.items.len) {
         const end = @min(off + CHUNK_BLOCKS, matching.items.len);
-        try filterChunk(reader, filt, matching.items[off..end], Sink, sink, &result, allocator);
+        try filterChunk(reader, filt, txs_reader, matching.items[off..end], Sink, sink, &result, allocator);
         off = end;
         // Live progress at the default level: a `\r` line that ticks per
         // chunk. The gate is a single int compare under --silent, so the
@@ -132,6 +140,7 @@ pub fn run(
 fn filterChunk(
     reader: *const FlatStoreReader,
     filter: Filter,
+    txs_reader: ?*const txs_mod.TxsReader,
     chunk: []const u64,
     comptime Sink: type,
     sink: *Sink,
@@ -152,6 +161,7 @@ fn filterChunk(
             .reader = reader,
             .matching_blocks = chunk[ranges[i][0]..ranges[i][1]],
             .filter = filter,
+            .txs_reader = txs_reader,
             .results = &worker_results[i],
             .allocator = worker_arenas[i].allocator(),
         };
@@ -197,12 +207,39 @@ const WorkerArgs = struct {
     reader: *const FlatStoreReader,
     matching_blocks: []const u64,
     filter: Filter,
+    txs_reader: ?*const txs_mod.TxsReader = null,
     results: *std.ArrayListUnmanaged(FilteredBlock),
     allocator: std.mem.Allocator,
+    /// Tx carry scratch, arena-allocated by the worker when txs_reader is set.
+    tx_scratch: ?TxScratch = null,
     /// Per-block recoverable failures (alloc, lz4, etc.), surfaced via Result.
     dropped_blocks: u64 = 0,
     /// First fatal pipeline-level error (init/wait/oversize). Aborts the run.
     err: ?anyerror = null,
+};
+
+/// Per-worker tx carry buffers, sized to the structural u16 ceiling
+/// (`txs.MAX_RECORDS`) so no legitimate block can overflow. ~20 MB per
+/// worker, paid only when the tx carry is on.
+const TxScratch = struct {
+    mask: []u16,
+    payload: []u8,
+    decomp: []u8,
+    records: []txs_mod.TxRecord,
+    selected: []txs_mod.TxRecord,
+
+    fn init(a: std.mem.Allocator) !TxScratch {
+        // Compressed entries of incompressible tables exceed the raw size by
+        // the LZ4 bound, mirror the writer's compress_buf slack.
+        const payload_max = txs_mod.MAX_TABLE_SIZE + txs_mod.MAX_TABLE_SIZE / 128 + 64;
+        return .{
+            .mask = try a.alloc(u16, txs_mod.MAX_RECORDS),
+            .payload = try a.alloc(u8, payload_max),
+            .decomp = try a.alloc(u8, txs_mod.MAX_TABLE_SIZE),
+            .records = try a.alloc(txs_mod.TxRecord, txs_mod.MAX_RECORDS),
+            .selected = try a.alloc(txs_mod.TxRecord, txs_mod.MAX_RECORDS),
+        };
+    }
 };
 
 fn worker(args: *WorkerArgs) void {
@@ -210,6 +247,13 @@ fn worker(args: *WorkerArgs) void {
     var decompress_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
     var serialize_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
     var compress_buf: [types.BLOCK_BUF_SIZE]u8 = undefined;
+
+    if (args.txs_reader != null) {
+        args.tx_scratch = TxScratch.init(args.allocator) catch |e| {
+            args.err = e;
+            return;
+        };
+    }
 
     const reader = args.reader;
 
@@ -303,17 +347,39 @@ fn processBlockEntry(
         return;
     };
 
-    const maybe = filter_mod.filterBlockEntry(decompressed, args.filter, serialize_buf, compress_buf) catch {
+    const mask_buf: ?[]u16 = if (args.tx_scratch) |ts| ts.mask else null;
+    const maybe = filter_mod.filterBlockEntry(decompressed, args.filter, serialize_buf, compress_buf, mask_buf) catch {
         args.dropped_blocks += 1;
         return;
     };
     const filtered = maybe orelse return;
 
-    const owned = args.allocator.alloc(u8, filtered.entry.len) catch {
+    // Tx carry: select the kept logs' records from txs.dat and size the tail.
+    // A missing or incomplete table is a hole in an advisory artifact the
+    // manifest declared required, drop the block so the build fails loud.
+    var selected: []const txs_mod.TxRecord = &.{};
+    if (args.tx_scratch) |ts| {
+        const full = args.txs_reader.?.readBlock(block_number, ts.payload, ts.decomp, ts.records) catch {
+            args.dropped_blocks += 1;
+            return;
+        } orelse {
+            args.dropped_blocks += 1;
+            return;
+        };
+        selected = txs_mod.selectByMask(full, filtered.tx_mask, ts.selected);
+        if (selected.len != filtered.tx_mask.len) {
+            args.dropped_blocks += 1;
+            return;
+        }
+    }
+
+    const tail_len: usize = if (args.tx_scratch != null) 4 + selected.len * txs_mod.RECORD_SIZE else 0;
+    const owned = args.allocator.alloc(u8, filtered.entry.len + tail_len) catch {
         args.dropped_blocks += 1;
         return;
     };
-    @memcpy(owned, filtered.entry);
+    @memcpy(owned[0..filtered.entry.len], filtered.entry);
+    if (tail_len > 0) _ = txs_mod.serializeRecords(selected, owned[filtered.entry.len..]);
 
     args.results.append(args.allocator, .{
         .block_number = block_number,
@@ -404,7 +470,7 @@ test "run crosses a chunk boundary with a globally ascending sink" {
     const addrs = [_][20]u8{ADDR};
     const topics = [_][32]u8{TOPIC};
     const filter: Filter = .{ .match_addrs = &addrs, .match_topics = &topics, .exclude_addrs = &.{} };
-    const r = try run(&reader, &addrs, filter, 1, total, Sink, &sink, alloc);
+    const r = try run(&reader, &addrs, filter, null, 1, total, Sink, &sink, alloc);
 
     try testing.expectEqual(@as(u64, 0), r.dropped_blocks);
     try testing.expectEqual(@as(usize, total), sink.seen.items.len);

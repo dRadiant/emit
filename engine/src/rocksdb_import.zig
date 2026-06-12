@@ -557,7 +557,7 @@ fn drainTxSlots(d: *TxDrain, slots: []TxSlot, txw: *core.txs.TxsWriter, bufs: *c
 }
 
 fn releaseTxSlot(slot: *TxSlot) void {
-    if (slot.body.len > 0) c.rocksdb_free(@constCast(@ptrCast(slot.body.ptr)));
+    if (slot.body.len > 0) c.rocksdb_free(@ptrCast(@constCast(slot.body.ptr)));
     if (slot.senders.len > 0) tx_alloc.free(slot.senders);
     if (slot.records.len > 0) tx_alloc.free(slot.records);
     slot.body = &.{};

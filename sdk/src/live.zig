@@ -53,6 +53,10 @@ const LiveSession = struct {
     prev: head_watch.PendingSnapshot,
     decompress_buf: []u8,
     log_buf: []core.RawLog,
+    /// TxRecord scratch for tx-enabled manifests, lazily allocated on the
+    /// first dispatch (init does not see the manifest). Empty stays empty
+    /// for tx-blind manifests.
+    tx_buf: []core.txs.TxRecord = &.{},
     /// Optional Multicall3 for per-block prefetch of factory children.
     /// Null leaves uncached calls to surface as `error.NotPrefetched`.
     multicall: ?*eth.multicall.Multicall = null,
@@ -88,6 +92,7 @@ const LiveSession = struct {
     }
 
     pub fn deinit(self: *LiveSession) void {
+        if (self.tx_buf.len > 0) self.allocator.free(self.tx_buf);
         self.allocator.free(self.log_buf);
         self.allocator.free(self.decompress_buf);
         self.prev.deinit(self.allocator);
@@ -170,6 +175,16 @@ const LiveSession = struct {
             log.block_number = entry.block_number;
         }
 
+        // Tx-fields carry. The pending entry holds the block's full table
+        // (the follower fetches it per block). An absent table means the
+        // engine follows with --no-tx-fields, fail loud via Truncated.
+        var tx_records: []const core.txs.TxRecord = &.{};
+        if (comptime sdk_manifest.wantsTxFields(m)) {
+            if (self.tx_buf.len == 0)
+                self.tx_buf = try self.allocator.alloc(core.txs.TxRecord, core.txs.MAX_RECORDS);
+            tx_records = try core.txs.deserializeRecords(entry.tx_table, self.tx_buf);
+        }
+
         // Pending blocks are raw. Unlike the backfill path, nothing filtered
         // them by address. Discover factory children spawned in this block
         // first (a create-event is emitted by the factory, which always
@@ -198,7 +213,11 @@ const LiveSession = struct {
             humanize.timestampOf(ctx, entry.block_number);
 
         for (self.log_buf[0..keep]) |log| {
-            try handler_mod.dispatchLog(m, Handler, ctx, log);
+            const tx: ?*const core.txs.TxRecord = if (comptime sdk_manifest.wantsTxFields(m))
+                core.txs.find(tx_records, log.tx_index) orelse return error.MissingTxRecord
+            else
+                null;
+            try handler_mod.dispatchLog(m, Handler, ctx, log, tx);
         }
     }
 
@@ -481,6 +500,59 @@ test "tick dispatches a pending block ingested by FakeEngine" {
 
     try testing.expectEqual(@as(u32, 1), runner.transfers);
     try testing.expectEqual(@as(u64, 100), runner.block_number);
+}
+
+test "tick with tx_fields resolves the dispatched log's TxRecord from the pending table" {
+    var engine_tmp = testing.tmpDir(.{});
+    defer engine_tmp.cleanup();
+    var fake = fake_engine.FakeEngine.init(engine_tmp.dir, testing.allocator);
+    defer fake.deinit();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const engine_path = try engine_tmp.dir.realpath(".", &path_buf);
+
+    var session = try LiveSession.init(testing.allocator, engine_path, 0);
+    defer session.deinit();
+
+    const TxTestTransfer = struct {
+        pub const signature = "Transfer(address,address,uint256)";
+        pub const tx_fields = true;
+    };
+    const TxManifest: sdk_manifest.Manifest = .{
+        .name = "live-tx",
+        .chain_id = 1,
+        .start_block = 0,
+        .contracts = &.{.{ .name = "T", .address = TEST_CONTRACT, .events = &.{TxTestTransfer} }},
+    };
+    const TxRunner = struct {
+        _allocator: std.mem.Allocator,
+        block_number: u64 = 0,
+        timestamp: u64 = 0,
+        seen_tx: ?handler_mod.Tx = null,
+        _last_dispatched_block: u64 = 0,
+
+        pub fn handleTransfer(log: handler_mod.Log(TxTestTransfer), self: *@This()) !void {
+            self.seen_tx = log.tx;
+        }
+    };
+
+    var data_buf: [32]u8 = undefined;
+    var log = makeTransferLog([_]u8{0} ** 20, [_]u8{0xA1} ** 20, 100, &data_buf);
+    log.tx_index = 3;
+    // Table holds tx 1 and tx 3, dispatch must resolve 3.
+    const records = [_]core.txs.TxRecord{
+        .{ .tx_index = 1, .tx_type = 2, .flags = 0, .from = [_]u8{0xAA} ** 20, .to = [_]u8{0xAB} ** 20, .value = [_]u8{0} ** 32 },
+        .{ .tx_index = 3, .tx_type = 2, .flags = 0, .from = [_]u8{0x33} ** 20, .to = [_]u8{0x34} ** 20, .value = [_]u8{7} ++ [_]u8{0} ** 31 },
+    };
+    try fake.ingestWithTxs(100, [_]u8{0xAA} ** 32, &.{log}, &records);
+
+    var runner = TxRunner{ ._allocator = testing.allocator };
+    try session.tick(TxManifest, TxRunner, &runner, 200);
+
+    try testing.expect(runner.seen_tx != null);
+    try testing.expectEqualSlices(u8, &([_]u8{0x33} ** 20), &runner.seen_tx.?.from);
+    try testing.expectEqualSlices(u8, &([_]u8{0x34} ** 20), &runner.seen_tx.?.to.?);
+    try testing.expectEqual(@as(u256, 7), runner.seen_tx.?.value);
 }
 
 test "tick dispatches a pending backlog already in the ring at session init" {
