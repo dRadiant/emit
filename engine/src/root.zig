@@ -8,6 +8,7 @@ pub const flat_writer = @import("flat_writer.zig");
 pub const rlp = @import("rlp.zig");
 pub const pending_ring = @import("pending_ring.zig");
 pub const receipt_decoder = @import("receipt_decoder.zig");
+pub const tx_decode = @import("tx_decode.zig");
 pub const head_follower = @import("head_follower.zig");
 pub const rpc_import = @import("rpc_import.zig");
 pub const tcp_server = @import("tcp_server.zig");
@@ -21,6 +22,7 @@ test {
     _ = rlp;
     _ = pending_ring;
     _ = receipt_decoder;
+    _ = tx_decode;
     _ = head_follower;
     _ = rpc_import;
     _ = tcp_server;
