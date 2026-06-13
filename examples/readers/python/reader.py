@@ -3,12 +3,12 @@
 Decodes a MutableStore's records without any emit-sdk dependency. Usage
 against the ERC20 example:
 
-    python3 reader.py /path/to/erc20/data/state.snap
+    python3 reader.py /path/to/erc20/data/entity/state.snap
 
 The schema (number of mutables, number of immutables, per-slot record size,
 field layout) is comptime-known in the indexer. Readers consume that as
 external knowledge — there is no per-slot descriptor on disk. See
-docs/entity-format.md for the byte layout.
+examples/readers/entity-format.md for the byte layout.
 """
 
 import struct

@@ -14,18 +14,24 @@ Endianness convention:
 
 ```
 <data_dir>/
-├── state.snap                  cursor + every MutableStore slab + every ImmutableStore count
-├── <entity>.events.dat         append-only records, one file per ImmutableStore entity type
-├── primary.dat                 filtered-index payloads (internal; rebuildable)
-├── primary.idx                 filtered-index offsets (internal; rebuildable)
-├── children.dat                filtered-index payloads for factory children (internal; rebuildable)
-├── children.idx                filtered-index offsets for factory children (internal; rebuildable)
-└── ethcall.dat                 eth_call result cache (advisory; deletable)
+├── entity/
+│   ├── state.snap              cursor + every MutableStore slab + every ImmutableStore count
+│   └── <entity>.events.dat     append-only records, one file per ImmutableStore entity type
+├── filter/
+│   ├── primary.dat             filtered-index payloads (internal; rebuildable)
+│   ├── primary.idx             filtered-index offsets (internal; rebuildable)
+│   ├── children.dat            filtered-index payloads for factory children (internal; rebuildable)
+│   ├── children.idx            filtered-index offsets for factory children (internal; rebuildable)
+│   └── manifest.fingerprint    32-byte manifest hash; a mismatch triggers a rebuild
+└── ethcall/
+    └── ethcall.dat             eth_call result cache (advisory; deletable)
 ```
 
-The `<entity>` filename component is the entity type's basename lowercased
-with `s` appended (e.g. `Transfer` → `transfer.events.dat`). An entity may
-override this via `pub const store_name = "events";` on the entity struct.
+The `<entity>` filename component is the entity type's basename with its
+first letter lowercased and `s` appended (e.g. `Transfer` →
+`transfers.events.dat`, `SwapEvent` → `swapEvents.events.dat`). An entity
+may override this via `pub const store_name = "events";` on the entity
+struct.
 
 ## state.snap
 
@@ -95,24 +101,50 @@ discovery, when block numbers from the primary pair may already be present.
 ```
 offset                   size              field
 0                        8                 magic "EMITFDAT"
-8                        variable          LZ4-compressed log entries, concatenated
+8                        variable          per-block entries, concatenated
+
+Each entry:
+  offset 0         4          lz4_len (u32 LE)
+  offset 4         lz4_len    LZ4-compressed packed-log payload
+  offset 4+lz4_len variable   tx subtable (present only for manifests whose
+                              events declare `tx_fields`; absent otherwise)
 ```
 
-Each LZ4 entry decodes to a packed-log block payload — same format as the
+Each LZ4 payload decodes to a packed-log block payload — same format as the
 engine's `blocks.dat`, but filtered to only the logs matching the manifest.
 Block-payload format is documented in `core/src/log_serial.zig`.
+
+The tx subtable holds the kept logs' transaction fields (ADR-006), bounded
+by the index entry's `length`. Readers that don't want it can ignore every
+byte past `4 + lz4_len`:
+
+```
+offset  size         field
+0       4            record_count (u32 LE)
+4       count × 76   TxRecords, sorted ascending by tx_index
+
+Each TxRecord (76 bytes):
+  offset 0   2    tx_index (u16 LE)
+  offset 2   1    tx_type (u8; 0x00 legacy … 0x04 EIP-7702)
+  offset 3   1    flags (u8; bit0 = to absent / contract creation,
+                  bit1 = sender unrecovered in source)
+  offset 4   20   from
+  offset 24  20   to (zero when bit0 set)
+  offset 44  32   value (u256 LE)
+```
 
 ### primary.idx / children.idx
 
 ```
 offset                   size              field
 0                        8                 magic "EMITFIDX"
-8                        count × 20        index entries (count is implicit from idx file size)
+8                        count × 24        index entries (count is implicit from idx file size)
 
-Each index entry (20 bytes):
+Each index entry (24 bytes):
   offset 0   8   block_number (u64 BE)
-  offset 8   8   dat_offset (u64 LE, byte offset into the matching .dat)
-  offset 16  4   length (u32 LE, compressed payload length)
+  offset 8   4   timestamp (u32 LE, exact block time; 0 = unknown)
+  offset 12  8   dat_offset (u64 LE, byte offset into the matching .dat)
+  offset 20  4   length (u32 LE, full entry length incl. any tx subtable)
 ```
 
 Block numbers are strictly increasing.
@@ -161,6 +193,7 @@ Working examples that decode entity files in other languages:
   of tuples.
 - `examples/readers/c/reader.c` — mmaps `state.snap` and prints cursor +
   per-store record counts.
+- `examples/readers/zig/reader.zig` — sdk-free Zig decode of the same.
 
-Both readers consume the format documented above and stay in sync with
+The readers consume the format documented above and stay in sync with
 the schema as long as `version == 1` is unchanged.

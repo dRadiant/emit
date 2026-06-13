@@ -1,12 +1,12 @@
 /// Reference Zig reader for emit's state.snap files. No dependency on emit-sdk.
 ///
 /// Decodes a MutableStore's records straight from
-/// the binary format documented in docs/entity-format.md.
+/// the binary format documented in examples/readers/entity-format.md.
 ///
 /// Usage against the ERC20 example:
 ///
 ///     zig build-exe reader.zig -O ReleaseFast
-///     ./reader /path/to/erc20/data/state.snap
+///     ./reader /path/to/erc20/data/entity/state.snap
 ///
 /// The schema (mutable count, immutable count, per-slot record size, field
 /// layout) is comptime-known in the indexer. Readers supply it as external

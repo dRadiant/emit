@@ -1,11 +1,11 @@
 /* Reference C reader for emit's state.snap files. Compiles with any C99:
  *
  *   cc -O2 -o reader reader.c
- *   ./reader /path/to/data/state.snap
+ *   ./reader /path/to/data/entity/state.snap
  *
  * Prints the cursor and the per-slot mutable slab sizes / immutable record
  * counts. Decoding entity records requires knowledge of the per-slot
- * schema, which the indexer holds at comptime; see docs/entity-format.md.
+ * schema, which the indexer holds at comptime; see examples/readers/entity-format.md.
  *
  * This reader assumes the ERC20 schema: 2 mutables (Account, Allowance)
  * and 2 immutables (Transfer, Approval). Other indexers: adjust the
