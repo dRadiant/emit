@@ -22,15 +22,22 @@
 const std = @import("std");
 
 const entity_serial = @import("entity_serial.zig");
+const blob_log_mod = @import("blob_log.zig");
+
+const BlobLog = blob_log_mod.BlobLog;
+const BlobRef = entity_serial.BlobRef;
 
 pub fn MutableStore(comptime T: type) type {
     const fields = @typeInfo(T).@"struct".fields;
     if (fields.len == 0) @compileError("MutableStore: entity '" ++ @typeName(T) ++ "' has no fields. The first field must be the primary key.");
+    comptime entity_serial.validate(T);
 
     const KeyField = fields[0].type;
     const key_field_name = fields[0].name;
     const KEY_SIZE = entity_serial.fixedSize(KeyField, @typeName(T) ++ "." ++ fields[0].name);
     const VALUE_SIZE = entity_serial.entitySize(T);
+    const HAS_BLOBS = entity_serial.hasBlobs(T);
+    const BLOB_COUNT = entity_serial.blobCount(T);
 
     return struct {
         const Self = @This();
@@ -38,6 +45,7 @@ pub fn MutableStore(comptime T: type) type {
         pub const Key = KeyField;
         pub const key_size = KEY_SIZE;
         pub const value_size = VALUE_SIZE;
+        pub const has_blobs = HAS_BLOBS;
 
         const CacheEntry = struct { entity: T, dirty: bool };
         const BlockMap = std.AutoHashMapUnmanaged(KeyField, T);
@@ -56,13 +64,47 @@ pub fn MutableStore(comptime T: type) type {
         /// Per-block overlay submaps. Bounded by FINALITY_DEPTH (~64).
         pending: std.AutoHashMapUnmanaged(u64, BlockMap) = .{},
 
+        /// `<entity>.blobs.dat` for variable-length fields (ADR-005). Holds the
+        /// payloads the fixed records address by `BlobRef`. `void` for a
+        /// numeric entity, which compiles to the exact pre-blob layout.
+        blob_log: if (HAS_BLOBS) BlobLog else void = if (HAS_BLOBS) undefined else {},
+        /// Backs the blob bytes of saved-but-uncommitted entities. `save`
+        /// copies each blob field here so the cached slice outlives the
+        /// transient `log.data` it came from. Reset after each commit.
+        blob_arena: if (HAS_BLOBS) std.heap.ArenaAllocator else void = if (HAS_BLOBS) undefined else {},
+
         /// `slab` is borrowed from the owning `StateSnap`. Caller must call
         /// `refreshSlab` after every `state_snap.commit` to avoid dangling.
+        /// Numeric entities only. Blob entities use `openWithBlobs`.
         pub fn open(allocator: std.mem.Allocator, slab: []const u8) Self {
+            if (comptime HAS_BLOBS) @compileError(
+                "MutableStore(" ++ @typeName(T) ++ "): entity has blob fields; use openWithBlobs",
+            );
             return .{
                 .allocator = allocator,
                 .cache = std.AutoHashMap(KeyField, CacheEntry).init(allocator),
                 .slab = slab,
+            };
+        }
+
+        /// Open a blob-bearing store, also opening `<name>` in `dir` at
+        /// `committed_blob_len` (from `state.snap.blob_bytes[slot]`).
+        pub fn openWithBlobs(
+            allocator: std.mem.Allocator,
+            slab: []const u8,
+            dir: std.fs.Dir,
+            name: []const u8,
+            committed_blob_len: u64,
+        ) !Self {
+            if (comptime !HAS_BLOBS) @compileError(
+                "MutableStore(" ++ @typeName(T) ++ "): entity has no blob fields; use open",
+            );
+            return .{
+                .allocator = allocator,
+                .cache = std.AutoHashMap(KeyField, CacheEntry).init(allocator),
+                .slab = slab,
+                .blob_log = try BlobLog.open(allocator, dir, name, committed_blob_len),
+                .blob_arena = std.heap.ArenaAllocator.init(allocator),
             };
         }
 
@@ -71,6 +113,10 @@ pub fn MutableStore(comptime T: type) type {
             while (it.next()) |bm| bm.deinit(self.allocator);
             self.pending.deinit(self.allocator);
             self.cache.deinit();
+            if (comptime HAS_BLOBS) {
+                self.blob_arena.deinit();
+                self.blob_log.deinit();
+            }
         }
 
         pub fn load(self: *Self, key: KeyField) !?T {
@@ -92,20 +138,26 @@ pub fn MutableStore(comptime T: type) type {
             if (self.cache.get(key)) |entry| return entry.entity;
 
             const idx = self.slabIndexOf(key) orelse return null;
-            const record = self.slab[idx * VALUE_SIZE ..][0..VALUE_SIZE];
-            const entity = entity_serial.deserialize(T, record);
+            // Blob entities re-resolve from the slab + mmap each cold read: a
+            // cached slice would dangle when the next commit remaps blobs.dat.
+            // The cache holds only this cycle's dirty saves. Numeric entities
+            // keep the clean-read cache (the HashMap-front speedup).
+            if (comptime HAS_BLOBS) return self.slabEntity(idx);
+            const entity = self.slabEntity(idx);
             try self.cache.put(key, .{ .entity = entity, .dirty = false });
             return entity;
         }
 
         /// Load `key`, or initialize a fresh zeroed entity with the primary-key
         /// field set to `key`. Fresh entity inserted dirty to persist at next
-        /// commit.
+        /// commit. A fresh blob entity's slices are empty (`std.mem.zeroes`
+        /// yields zero-length slices), so no arena copy is needed yet.
         pub fn loadOrInit(self: *Self, key: KeyField) !T {
             if (try self.load(key)) |existing| return existing;
             var entity = std.mem.zeroes(T);
             @field(entity, key_field_name) = key;
             if (self.live) {
+                if (comptime HAS_BLOBS) return error.LiveBlobUnsupported;
                 try self.putPending(key, entity);
             } else {
                 try self.cache.put(key, .{ .entity = entity, .dirty = true });
@@ -114,19 +166,45 @@ pub fn MutableStore(comptime T: type) type {
         }
 
         /// Single-arg save derives the primary key from `entity`'s first field.
+        /// Blob payloads are copied into `blob_arena` so the cached entity owns
+        /// bytes that outlive the handler's transient `log.data` slice.
         pub fn save(self: *Self, entity: T) !void {
             const key = @field(entity, key_field_name);
             if (self.live) {
+                if (comptime HAS_BLOBS) return error.LiveBlobUnsupported;
                 try self.putPending(key, entity);
                 return;
             }
-            try self.cache.put(key, .{ .entity = entity, .dirty = true });
+            const owned = if (comptime HAS_BLOBS) try self.ownBlobs(entity) else entity;
+            try self.cache.put(key, .{ .entity = owned, .dirty = true });
         }
 
         fn putPending(self: *Self, key: KeyField, value: T) !void {
             const gop = try self.pending.getOrPut(self.allocator, self.live_block);
             if (!gop.found_existing) gop.value_ptr.* = .{};
             try gop.value_ptr.put(self.allocator, key, value);
+        }
+
+        /// Deserialize the slab record at `idx`, resolving blob refs against
+        /// the committed `blobs.dat` mmap for blob entities.
+        fn slabEntity(self: *const Self, idx: usize) T {
+            const record = self.slab[idx * VALUE_SIZE ..][0..VALUE_SIZE];
+            if (comptime HAS_BLOBS) return entity_serial.deserializeWithBlobs(T, record, self.blob_log.map_bytes());
+            return entity_serial.deserialize(T, record);
+        }
+
+        /// Copy `entity`'s blob payloads into `blob_arena`, repointing each
+        /// slice at the stable copy. Blob entities only.
+        fn ownBlobs(self: *Self, entity: T) !T {
+            var out = entity;
+            const a = self.blob_arena.allocator();
+            inline for (fields) |f| {
+                if (comptime entity_serial.fieldKind(f.type, @typeName(T) ++ "." ++ f.name) == .blob) {
+                    const src = @field(entity, f.name);
+                    if (src.len > 0) @field(out, f.name) = try a.dupe(@typeInfo(f.type).pointer.child, src);
+                }
+            }
+            return out;
         }
 
         /// Drain block `N`'s overlay submap into the dirty cache. Disk write
@@ -226,7 +304,7 @@ pub fn MutableStore(comptime T: type) type {
                     oi += n;
                 }
                 if (si < num_in_slab and std.mem.order(u8, self.slab[si * VALUE_SIZE ..][0..KEY_SIZE], &d.key) == .eq) si += 1;
-                entity_serial.serialize(T, d.entity.*, out[oi..][0..VALUE_SIZE]);
+                try self.serializeRow(d.entity.*, out[oi..][0..VALUE_SIZE]);
                 oi += VALUE_SIZE;
             }
             if (si < num_in_slab) {
@@ -237,10 +315,54 @@ pub fn MutableStore(comptime T: type) type {
             return out;
         }
 
+        /// Serialize one row, staging its blob payloads to `blob_log` first
+        /// (so the record's `BlobRef`s carry the assigned offsets). Clean rows
+        /// in `materialize` are bulk-copied instead, keeping their committed
+        /// refs. Numeric rows take the plain fixed serialize.
+        fn serializeRow(self: *Self, entity: T, out: []u8) !void {
+            if (comptime !HAS_BLOBS) {
+                entity_serial.serialize(T, entity, out);
+                return;
+            }
+            var refs: [BLOB_COUNT]BlobRef = undefined;
+            comptime var bi: usize = 0;
+            inline for (fields) |f| {
+                if (comptime entity_serial.fieldKind(f.type, @typeName(T) ++ "." ++ f.name) == .blob) {
+                    const slice = @field(entity, f.name);
+                    const elem_align = @alignOf(@typeInfo(f.type).pointer.child);
+                    refs[bi] = try self.blob_log.stage(std.mem.sliceAsBytes(slice), elem_align);
+                    bi += 1;
+                }
+            }
+            entity_serial.serializeWithBlobs(T, entity, &refs, out);
+        }
+
+        /// Flush this cycle's staged blob payloads to `blobs.dat` (write +
+        /// fsync + remap). MUST run after `materialize` and before the
+        /// `state.snap` rename. No-op for numeric entities.
+        pub fn flushBlobs(self: *Self) !void {
+            if (comptime HAS_BLOBS) try self.blob_log.flush();
+        }
+
+        /// Committed `blobs.dat` payload length, written to
+        /// `state.snap.blob_bytes[slot]` after `flushBlobs`.
+        pub fn committedBlobLen(self: *const Self) u64 {
+            if (comptime HAS_BLOBS) return self.blob_log.committed_len;
+            return 0;
+        }
+
         /// Rebind the borrowed slab pointer after `state_snap.commit` succeeds.
-        /// Clears dirty flags on cache entries.
+        /// Numeric stores clear dirty flags. Blob stores drop the whole cache
+        /// and reset the arena: cached blob slices pointed into the arena or
+        /// the pre-remap mmap, both now stale, and the durable rows reload from
+        /// the new slab + remapped `blobs.dat`.
         pub fn refreshSlab(self: *Self, new_slab: []const u8) void {
             self.slab = new_slab;
+            if (comptime HAS_BLOBS) {
+                self.cache.clearRetainingCapacity();
+                _ = self.blob_arena.reset(.retain_capacity);
+                return;
+            }
             var it = self.cache.valueIterator();
             while (it.next()) |v| v.dirty = false;
         }
@@ -533,4 +655,96 @@ test "materialize produces records sorted by primary key" {
     const k2 = slab[2 * S.value_size .. 2 * S.value_size + S.key_size];
     try testing.expect(std.mem.order(u8, k0, k1) == .lt);
     try testing.expect(std.mem.order(u8, k1, k2) == .lt);
+}
+
+// ── Blob fields (ADR-005) ──────────────────────────────────────────────────
+
+const Named = struct { id: [8]u8, label: []const u8 };
+
+fn id8(n: u8) [8]u8 {
+    return [_]u8{ 0, 0, 0, 0, 0, 0, 0, n };
+}
+
+/// One commit cycle against a blob store: materialize → flush → refresh.
+/// Returns the slab buffer (caller frees once the store no longer borrows it).
+fn cycleNamed(store: *MutableStore(Named), alloc: std.mem.Allocator) ![]u8 {
+    const slab = try store.materialize(alloc);
+    try store.flushBlobs();
+    store.refreshSlab(slab);
+    return slab;
+}
+
+test "mutable blob entity: save, commit, reload from slab + blobs.dat" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try MutableStore(Named).openWithBlobs(alloc, &.{}, tmp.dir, "named.blobs.dat", 0);
+
+    try store.save(.{ .id = id8(1), .label = "vitalik.eth" });
+    try store.save(.{ .id = id8(2), .label = "" });
+
+    // Read-your-writes before the commit (served from the cache + arena).
+    try testing.expectEqualSlices(u8, "vitalik.eth", (try store.load(id8(1))).?.label);
+
+    const slab = try cycleNamed(&store, alloc);
+
+    // Cache was cleared by refresh, so these reload from the slab + mmap.
+    try testing.expectEqualSlices(u8, "vitalik.eth", (try store.load(id8(1))).?.label);
+    try testing.expectEqual(@as(usize, 0), (try store.load(id8(2))).?.label.len);
+
+    const blob_len = store.committedBlobLen();
+    store.deinit();
+
+    // Reopen at the committed blob length: payloads persist across restart.
+    var store2 = try MutableStore(Named).openWithBlobs(alloc, slab, tmp.dir, "named.blobs.dat", blob_len);
+    try testing.expectEqualSlices(u8, "vitalik.eth", (try store2.load(id8(1))).?.label);
+    store2.deinit();
+    alloc.free(slab);
+}
+
+test "mutable blob overwrite across commits: later value wins" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try MutableStore(Named).openWithBlobs(alloc, &.{}, tmp.dir, "named.blobs.dat", 0);
+    defer store.deinit();
+
+    try store.save(.{ .id = id8(1), .label = "first-name-here" });
+    const slab1 = try cycleNamed(&store, alloc);
+    try testing.expectEqualSlices(u8, "first-name-here", (try store.load(id8(1))).?.label);
+
+    // Overwrite the same key with a different-length value. The old blob bytes
+    // orphan in blobs.dat (the accepted mutable-blob garbage), the record now
+    // points at the fresh payload.
+    try store.save(.{ .id = id8(1), .label = "second" });
+    const slab2 = try cycleNamed(&store, alloc);
+    try testing.expectEqualSlices(u8, "second", (try store.load(id8(1))).?.label);
+
+    alloc.free(slab1);
+    alloc.free(slab2);
+}
+
+test "mutable array blob: []const [20]u8 round-trips" {
+    const Members = struct { id: u64, addrs: []const [20]u8 };
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store = try MutableStore(Members).openWithBlobs(alloc, &.{}, tmp.dir, "members.blobs.dat", 0);
+    defer store.deinit();
+
+    const addrs = [_][20]u8{ [_]u8{0x11} ** 20, [_]u8{0x22} ** 20, [_]u8{0x33} ** 20 };
+    try store.save(.{ .id = 7, .addrs = &addrs });
+
+    const slab = try store.materialize(alloc);
+    defer alloc.free(slab);
+    try store.flushBlobs();
+    store.refreshSlab(slab);
+
+    const got = (try store.load(@as(u64, 7))).?;
+    try testing.expectEqual(@as(usize, 3), got.addrs.len);
+    try testing.expectEqualSlices(u8, &addrs[0], &got.addrs[0]);
+    try testing.expectEqualSlices(u8, &addrs[2], &got.addrs[2]);
 }

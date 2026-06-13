@@ -375,14 +375,19 @@ pub fn Context(comptime entities: anytype) type {
                 }
             }
 
-            // Blob payload lengths per blob-bearing store, in slot order.
-            // Wired to the BlobLog flush in ADR-005 step 3b; until then a
-            // blobless schema makes this a zero-length array.
+            // Flush each store's staged blob payloads to its blobs.dat (write
+            // + fsync + remap) BEFORE the state.snap rename, then record the
+            // committed lengths in blob-slot order. The ordering keeps a crash
+            // between the two from leaving the snap referencing undurable
+            // bytes (ADR-005). Blobless schemas make this a zero-length array.
             var blob_bytes: [Snap.blob_count]u64 = undefined;
             comptime var blob_idx_init: usize = 0;
             inline for (entity_list) |T| {
                 if (comptime entity_serial.hasBlobs(T)) {
-                    blob_bytes[blob_idx_init] = 0;
+                    const field_name = comptime entityFieldName(T);
+                    var store = &@field(self.stores, field_name);
+                    try store.flushBlobs();
+                    blob_bytes[blob_idx_init] = store.committedBlobLen();
                     blob_idx_init += 1;
                 }
             }
@@ -738,13 +743,25 @@ pub fn init(
     {
         comptime var mut_slot: usize = 0;
         comptime var imm_slot: usize = 0;
+        comptime var blob_slot: usize = 0;
         inline for (entity_list) |T| {
             const field_name = comptime entityFieldName(T);
             if (comptime T.storage == .mutable) {
-                @field(ctx.stores, field_name) = mutable_store_mod.MutableStore(T).open(
-                    allocator,
-                    ctx._state_snap.mutableSlab(mut_slot),
-                );
+                if (comptime entity_serial.hasBlobs(T)) {
+                    @field(ctx.stores, field_name) = try mutable_store_mod.MutableStore(T).openWithBlobs(
+                        allocator,
+                        ctx._state_snap.mutableSlab(mut_slot),
+                        entity_dh,
+                        comptime field_name ++ ".blobs.dat",
+                        ctx._state_snap.blobBytes(blob_slot),
+                    );
+                    blob_slot += 1;
+                } else {
+                    @field(ctx.stores, field_name) = mutable_store_mod.MutableStore(T).open(
+                        allocator,
+                        ctx._state_snap.mutableSlab(mut_slot),
+                    );
+                }
                 mut_slot += 1;
             } else {
                 const log_ptr = &@field(ctx._event_logs, field_name);
