@@ -30,7 +30,7 @@ EMIT Indexers then read that store and produce whatever entities your applicatio
 - **Multi-chain by composition.** One engine per chain, one indexer binary per chain. Cross-chain joins are application-level.
 - **You own the API.** EMIT fills entity stores. Your choice is to serve them via REST, GraphQL, WebSocket, or raw memory map.
 
-Currently requires the Execution Client, Engine, and Indexer to be collocated on the same machine. This will change with the introduction of remote engine TCP streaming in v1.1.0, allowing indexers to be remote.
+The Execution Client and Engine live on the same machine; Indexers can run anywhere since v1.1.0's remote engine TCP streaming.
 
 ## Quickstart
 

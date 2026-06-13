@@ -1,6 +1,6 @@
 # ADR-006: Top-Level Transaction Fields
 
-**Status**: Accepted
+**Status**: Implemented (2026-06-12)
 **Date**: 2026-06-11
 **Context**: Handlers see only log-level data plus `tx_hash`. The events-first thesis holds for state derivation, but the *identity* of a transaction — who sent it, to which contract, carrying how much ETH — is not in any log. Validated as a real gap against the production Envio Uniswap-V4 indexer (`event.transaction.from`, a swap's origin). This ADR decides how to expose `log.tx.from` / `log.tx.to` / `log.tx.value` to handlers, sourced from the block bodies a full node already stores — no traces, no archive node, no re-execution.
 
@@ -90,12 +90,17 @@ RPC import: the existing strict timestamps pass flips to `eth_getBlockByNumber(n
 
 ### Delivery to handlers
 
-`Manifest` gains `tx_fields: bool = false`, **comptime-gated**:
+The opt-in lives on the **event type**, not the manifest (the design's `Manifest.tx_fields` flag was dropped during implementation: a manifest-level flag puts the declaration far from the consumption and forces a runtime-optional field; the per-event declaration mirrors an entity's `storage` decl and makes misuse a compile error). **Comptime-gated end to end**:
 
-- `false` (default): `Log(E)` has no `tx` field at all. Zero bytes, zero instructions, zero format involvement — existing indexers compile byte-identical.
-- `true`: phase 1 reads `txs.dat` alongside `blocks.dat` and packs the kept logs' `TxRecord`s into the filtered entry (the manifest fingerprint already hashes manifest content, so flipping the flag auto-rebuilds the filter). `Log(E).tx: TxFields { from, to, value, is_create }` is non-optional; the scanner resolves it from the entry's tx subtable by `tx_index`. `init` fails loud when `txs.dat` coverage does not span the indexed range — the `ethCall` strict contract applied to a second artifact.
+- An event declares `pub const tx_fields = true;`. `Log(E).tx: sdk.Tx { from, to: ?[20]u8 (null = creation), value: u256, tx_type }` exists; reading `log.tx` elsewhere is a compile error (the field is `void`). The storage `TxRecord` never crosses the dispatch boundary.
+- `manifest.wantsTxFields(m)` derives the manifest-level need by walking declared events (contracts, factory create + child events). Any declaration turns on the whole carry: phase 1 reads `txs.dat` alongside `blocks.dat` and appends the kept logs' `TxRecord` subtable after each filtered entry's lz4 payload (trailing bytes are read-compatible for tx-blind readers); the manifest fingerprint hashes the derived bool, so a declaration change auto-rebuilds the filter. The scanner resolves each log's record from the subtable by `tx_index`, fail-loud on a hole. `init` fails loud when `txs.{dat,idx}` coverage does not span the indexed range — the `ethCall` strict contract applied to a second artifact. No declaration compiles byte-identical to before.
+- Live paths resolve from the pending entry's full per-block table (`pending.bin` v2).
 
-Carrying records through the FilteredStore preserves **wire = disk**: remote indexers receive tx fields inside the same PUSH bytes, costing one REGISTER protocol version bump and nothing else. The <2 s re-run path never touches `txs.dat`.
+Carrying records through the FilteredStore preserves **wire = disk**: a tx-registered remote client receives the subtable inside the same PUSH bytes (REGISTER gained a trailing `tx_fields` byte, protocol v2; the server GOAWAYs when its store cannot cover the range). The <2 s re-run path never touches `txs.dat`.
+
+## Verification
+
+End-to-end on the reference box against the full-mainnet store: the uniswap-v2 example (`Swap` declares `tx_fields`, stores `trader = log.tx.from`) over blocks 19,000,000–19,010,000 produced 35,039 swap rows across 32,116 distinct transactions; every stored `trader` matched `eth_getTransactionByBlockNumberAndIndex(...).from`. Earlier layer probes: full txs.dat 887/887 era-spread blocks vs RPC, pending.bin v2 tables 297/297 vs RPC, follower-mirrored blocks 236/236.
 
 ## Trade-offs accepted
 
