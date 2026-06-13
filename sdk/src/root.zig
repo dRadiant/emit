@@ -195,6 +195,7 @@ test {
     _ = state_snap;
     _ = tcp_client;
     _ = event_log;
+    _ = @import("blob_log.zig");
     _ = entry;
     // Test-only fixture.
     _ = @import("testing/fake_engine.zig");

@@ -11,6 +11,13 @@
 /// drops every submap on reorg recovery. Per-block isolation preserves each
 /// block's mutation even when later blocks touch the same key.
 ///
+/// Read-your-writes is a contract on both paths. A `load` after a `save`
+/// returns the saved value (cache front on backfill, newest overlay submap
+/// live). Handler correctness depends on it: the canonical sequential
+/// balance update (debit, save, then load the credit side) nets a
+/// self-transfer to zero only because the second load observes the first
+/// save.
+///
 /// Not thread-safe.
 const std = @import("std");
 
