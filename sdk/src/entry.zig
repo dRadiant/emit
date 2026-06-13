@@ -19,6 +19,7 @@ const std = @import("std");
 const core = @import("core");
 
 const eth = @import("eth");
+const entity_serial = @import("entity_serial.zig");
 const ethcall = @import("ethcall.zig");
 const event_log_mod = @import("event_log.zig");
 const filter_builder = @import("filter_builder.zig");
@@ -198,7 +199,7 @@ pub fn Context(comptime entities: anytype) type {
         const Self = @This();
         /// Resolved entity type list, evaluated once for every `inline for`.
         const entity_list = resolveEntities(entities);
-        pub const Snap = state_snap_mod.StateSnap(mutableCount(entities), immutableCount(entities));
+        pub const Snap = state_snap_mod.StateSnap(mutableCount(entities), immutableCount(entities), blobStoreCount(entities));
 
         block_number: u64 = 0,
         timestamp: u64 = 0,
@@ -374,7 +375,19 @@ pub fn Context(comptime entities: anytype) type {
                 }
             }
 
-            try self._state_snap.commit(self._last_dispatched_block, &slabs, &counts);
+            // Blob payload lengths per blob-bearing store, in slot order.
+            // Wired to the BlobLog flush in ADR-005 step 3b; until then a
+            // blobless schema makes this a zero-length array.
+            var blob_bytes: [Snap.blob_count]u64 = undefined;
+            comptime var blob_idx_init: usize = 0;
+            inline for (entity_list) |T| {
+                if (comptime entity_serial.hasBlobs(T)) {
+                    blob_bytes[blob_idx_init] = 0;
+                    blob_idx_init += 1;
+                }
+            }
+
+            try self._state_snap.commit(self._last_dispatched_block, &slabs, &counts, &blob_bytes);
 
             // Rebind each MutableStore's slab to the new state.snap body.
             comptime var refresh_idx: usize = 0;
@@ -430,6 +443,18 @@ fn immutableCount(comptime entities: anytype) usize {
     comptime {
         var n: usize = 0;
         for (resolveEntities(entities)) |T| if (T.storage == .immutable) {
+            n += 1;
+        };
+        return n;
+    }
+}
+
+/// Count of blob-bearing stores (either kind), the `state.snap` blob slot
+/// count. Slot order is entity-declaration order among blob-bearing types.
+fn blobStoreCount(comptime entities: anytype) usize {
+    comptime {
+        var n: usize = 0;
+        for (resolveEntities(entities)) |T| if (entity_serial.hasBlobs(T)) {
             n += 1;
         };
         return n;

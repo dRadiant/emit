@@ -971,7 +971,7 @@ test "finalized blocks commit to state.snap and advance the cursor" {
     };
 
     const state_snap = @import("state_snap.zig");
-    const Snap = state_snap.StateSnap(1, 0);
+    const Snap = state_snap.StateSnap(1, 0, 0);
     const TestStores = struct { accounts: mutable_store.MutableStore(Account) };
     const TestCtx = struct {
         _allocator: std.mem.Allocator,
@@ -984,7 +984,7 @@ test "finalized blocks commit to state.snap and advance the cursor" {
         pub fn commitCycle(self: *@This()) !void {
             const buf = try self.stores.accounts.materialize(self._allocator);
             defer self._allocator.free(buf);
-            try self._state_snap.commit(self._last_dispatched_block, &.{buf}, &.{});
+            try self._state_snap.commit(self._last_dispatched_block, &.{buf}, &.{}, &.{});
             self.stores.accounts.refreshSlab(self._state_snap.mutableSlab(0));
         }
     };
