@@ -67,8 +67,23 @@ fn matchAndAppend(
                         &log.topics,
                         log.data,
                     );
-                    const calldata = try arena.dupe(u8, &sel);
-                    try out.append(arena, .{ .target = addr, .calldata = calldata });
+                    if (comptime pc.args.len == 0) {
+                        const calldata = try arena.dupe(u8, &sel);
+                        try out.append(arena, .{ .target = addr, .calldata = calldata });
+                    } else {
+                        // selector ++ one 32-byte ABI word per arg. A `param`
+                        // resolves to the event's word, a `word` is the literal.
+                        const calldata = try arena.alloc(u8, 4 + pc.args.len * 32);
+                        @memcpy(calldata[0..4], &sel);
+                        inline for (pc.args, 0..) |arg, ai| {
+                            const w: [32]u8 = switch (arg) {
+                                .word => |lit| lit,
+                                .param => |name| sdk_manifest.paramWord(def.on_event, name, &log.topics, log.data),
+                            };
+                            @memcpy(calldata[4 + ai * 32 ..][0..32], &w);
+                        }
+                        try out.append(arena, .{ .target = addr, .calldata = calldata });
+                    }
                 }
             }
         }
@@ -196,6 +211,55 @@ test "gatherStatic emits one Call per static_prefetch entry" {
     try std.testing.expectEqualSlices(u8, calls[0].calldata, calls[2].calldata);
     // Different methods → different selectors
     try std.testing.expect(!std.mem.eql(u8, calls[0].calldata, calls[1].calldata));
+}
+
+test "gatherOneBlock builds parameterized calldata; arg words match encodeArg" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const FACTORY = [_]u8{0xF0} ** 20;
+    const TOKEN0 = [_]u8{0x11} ** 20;
+    const TOKEN1 = [_]u8{0x22} ** 20;
+    var topics: [4][32]u8 = std.mem.zeroes([4][32]u8);
+    topics[0] = sdk_manifest.eventTopic0(PairCreated);
+    @memcpy(topics[1][12..32], &TOKEN0); // token0 indexed
+    @memcpy(topics[2][12..32], &TOKEN1); // token1 indexed
+    const log: RawLog = .{
+        .block_number = 1,
+        .tx_index = 0,
+        .log_index = 0,
+        .address = FACTORY,
+        .topic_count = 3,
+        .topics = topics,
+        .data = &.{},
+        .tx_hash = [_]u8{0} ** 32,
+    };
+
+    const m: sdk_manifest.Manifest = .{
+        .name = "x",
+        .chain_id = 1,
+        .start_block = 0,
+        .prefetch = &.{.{
+            .on_event = PairCreated,
+            .calls = &.{.{
+                .address = .log,
+                .method = "getPair(address,address)",
+                .args = &.{ .{ .param = "token0" }, .{ .param = "token1" } },
+            }},
+        }},
+    };
+    const calls = try gatherOneBlock(arena, &.{log}, m);
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualSlices(u8, &FACTORY, &calls[0].target);
+    try std.testing.expectEqual(@as(usize, 4 + 64), calls[0].calldata.len);
+
+    const sel = ethcall.selectorOf("getPair(address,address)");
+    try std.testing.expectEqualSlices(u8, &sel, calls[0].calldata[0..4]);
+    // Each arg word equals the event's topic word AND encodeArg of the value,
+    // so the handler's ethCallArgs(.{token0, token1}) yields the same calldata.
+    try std.testing.expectEqualSlices(u8, &ethcall.encodeArg(TOKEN0), calls[0].calldata[4..36]);
+    try std.testing.expectEqualSlices(u8, &ethcall.encodeArg(TOKEN1), calls[0].calldata[36..68]);
 }
 
 test "dedupe collapses identical (target, method) entries" {

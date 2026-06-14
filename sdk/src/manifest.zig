@@ -65,12 +65,25 @@ pub const AddressSource = union(enum) {
     param: []const u8,
 };
 
+/// One argument of a parameterized call. `param` names an event parameter
+/// resolved per-log (its ABI word becomes the calldata arg); `word` is a
+/// literal pre-encoded 32-byte ABI word (build one at comptime with
+/// `ethcall.encodeArg`). Fixed-size args only.
+pub const ArgSource = union(enum) {
+    param: []const u8,
+    word: [32]u8,
+};
+
 /// One declared eth_call. Target address resolves per-log via `address`.
-/// `method` is the no-argument Solidity signature whose first four keccak
-/// bytes form the call selector.
+/// `method` is the Solidity signature whose first four keccak bytes form the
+/// call selector. `args` is empty for a no-arg method (`decimals()`), or one
+/// `ArgSource` per parameter for a parameterized one (`tokenURI(uint256)`,
+/// `getPair(address,address)`). The handler reads the result with the same
+/// args via `ctx.ethCallArgs(T, addr, method, .{...})`.
 pub const PrefetchCall = struct {
     address: AddressSource,
     method: []const u8,
+    args: []const ArgSource = &.{},
 };
 
 pub const PrefetchDef = struct {
@@ -251,6 +264,14 @@ pub fn extractAddress(
             break :blk word[12..32].*;
         },
     };
+}
+
+/// Resolve a named event parameter to its full 32-byte ABI word (from the
+/// topic or data region). Used to build the calldata args of a parameterized
+/// prefetch call, so an `address`/`uintN` param flows straight into the call.
+pub fn paramWord(comptime E: type, comptime name: []const u8, topics: []const [32]u8, data: []const u8) [32]u8 {
+    const p = comptime abi_parse.paramByName(parsedEvent(E), name);
+    return abi_parse.wordAt(p, topics, data);
 }
 
 /// Statically known emitter addresses: every contract plus every factory.

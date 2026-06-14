@@ -118,6 +118,35 @@ pub fn decodeAs(comptime T: type, bytes: []const u8) !T {
     };
 }
 
+/// Encode one fixed-size value as a 32-byte ABI word for calldata. `intN`
+/// right-aligns big-endian (sign-extended for signed), `bool` is the LSB,
+/// `[20]u8` (address) right-aligns, other `[N]u8` (`bytesN`) left-aligns.
+/// Mirrors `manifest.paramWord` so a handler's `ethCallArgs` value and the
+/// prefetch's resolved event-param word produce the same calldata.
+pub fn encodeArg(value: anytype) [32]u8 {
+    const V = @TypeOf(value);
+    var word: [32]u8 = std.mem.zeroes([32]u8);
+    switch (@typeInfo(V)) {
+        .int => |int_info| {
+            const u: u256 = if (int_info.signedness == .unsigned)
+                @intCast(value)
+            else
+                @bitCast(@as(i256, value));
+            std.mem.writeInt(u256, &word, u, .big);
+        },
+        .bool => word[31] = @intFromBool(value),
+        .array => |arr| {
+            if (arr.child != u8) @compileError("ethcall.encodeArg: arrays must be `[N]u8`; got `" ++ @typeName(V) ++ "`");
+            if (arr.len > 32) @compileError("ethcall.encodeArg: `" ++ @typeName(V) ++ "` exceeds one ABI word");
+            if (arr.len == 20) @memcpy(word[12..32], &value) else @memcpy(word[0..arr.len], &value);
+        },
+        else => @compileError(
+            "ethcall.encodeArg: type `" ++ @typeName(V) ++ "` is not an encodable fixed-size arg (int, bool, [N]u8)",
+        ),
+    }
+    return word;
+}
+
 pub fn cacheKey(target: [20]u8, calldata: []const u8) [52]u8 {
     return cacheKeyFromHash(target, eth.keccak.hash(calldata));
 }
@@ -299,6 +328,29 @@ pub const Cache = struct {
 // ── Tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "encodeArg right-aligns an address and a uint, LSB for bool" {
+    const A = [_]u8{0xAB} ** 20;
+    const wa = encodeArg(A);
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 12), wa[0..12]);
+    try testing.expectEqualSlices(u8, &A, wa[12..32]);
+
+    try testing.expectEqual(@as(u256, 0xDEADBEEF), std.mem.readInt(u256, &encodeArg(@as(u256, 0xDEADBEEF)), .big));
+    try testing.expectEqual(@as(u256, 42), std.mem.readInt(u256, &encodeArg(@as(u64, 42)), .big));
+    try testing.expectEqual(@as(u8, 1), encodeArg(true)[31]);
+    try testing.expectEqual(@as(u8, 0), encodeArg(false)[31]);
+}
+
+test "encodeArg sign-extends a negative signed integer" {
+    const w = encodeArg(@as(i32, -1));
+    try testing.expectEqualSlices(u8, &([_]u8{0xFF} ** 32), &w);
+}
+
+test "encodeArg left-aligns a bytesN value" {
+    const w = encodeArg([_]u8{ 0xAA, 0xBB, 0xCC, 0xDD });
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xAA, 0xBB, 0xCC, 0xDD }, w[0..4]);
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 28), w[4..32]);
+}
 
 test "cacheKey is deterministic and packs address+hash" {
     const TARGET = [_]u8{0xAB} ** 20;

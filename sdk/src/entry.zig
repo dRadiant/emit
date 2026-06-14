@@ -478,6 +478,31 @@ pub fn Context(comptime entities: anytype) type {
             if (entry.status != 0) return error.CallReverted;
             return ethcall.decodeAs(T, entry.bytes);
         }
+
+        /// Strict cache read for a parameterized method. `args` is a tuple of
+        /// fixed-size values (the same the prefetch resolved), encoded into the
+        /// calldata `selector ++ word*` so the key matches its prefetched entry.
+        /// `ethCall` is the no-arg fast path.
+        pub fn ethCallArgs(
+            self: *Self,
+            comptime T: type,
+            to: [20]u8,
+            comptime method: []const u8,
+            args: anytype,
+        ) !T {
+            const cache = self._cache orelse return error.NotPrefetched;
+            const sel = comptime ethcall.selectorOf(method);
+            const nargs = std.meta.fields(@TypeOf(args)).len;
+            var calldata: [4 + nargs * 32]u8 = undefined;
+            @memcpy(calldata[0..4], &sel);
+            inline for (args, 0..) |a, i| {
+                const w = ethcall.encodeArg(a);
+                @memcpy(calldata[4 + i * 32 ..][0..32], &w);
+            }
+            const entry = cache.get(to, &calldata) orelse return error.NotPrefetched;
+            if (entry.status != 0) return error.CallReverted;
+            return ethcall.decodeAs(T, entry.bytes);
+        }
     };
 }
 
