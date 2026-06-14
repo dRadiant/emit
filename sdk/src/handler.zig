@@ -93,7 +93,8 @@ pub const DecodedLog = struct {
 
     /// Read a named parameter from `E.signature`. Return type derived at
     /// comptime: `address`→`[20]u8`, `uintN`→`uN`, `intN`→`iN`, `bool`→`bool`,
-    /// `bytesN`→`[N]u8`, `T[N]`→`[N]…`, `(t1,…)`→a Zig tuple, `T[]`→a zero-copy
+    /// `bytesN`→`[N]u8`, dynamic `bytes`/`string`→`[]const u8` borrowing
+    /// `log.data`, `T[N]`→`[N]…`, `(t1,…)`→a Zig tuple, `T[]`→a zero-copy
     /// `Array(T)` view borrowing `log.data`. Wrong names list the available
     /// params. An indexed array/tuple/`bytes`/`string` stores `keccak(value)`,
     /// not the value, so those error with a pointer at the raw `log.topics[i]`.
@@ -193,17 +194,19 @@ fn TypeFor(comptime t: []const u8) type {
 }
 
 /// Primitive Solidity type → Zig type. `address`→`[20]u8`, `uintN`→`uN`,
-/// `intN`→`iN`, `bytesN`→`[N]u8`, `bool`→`bool`. Dynamic `bytes`/`string`
-/// values are rejected.
+/// `intN`→`iN`, `bytesN`→`[N]u8`, `bool`→`bool`, dynamic `bytes`/`string`→a
+/// `[]const u8` borrowing `log.data` (ADR-005). The borrow is valid for the
+/// source log's lifetime; copy it (or `save` it into a blob entity) to keep it.
 fn PrimType(comptime t: []const u8) type {
     if (comptime std.mem.eql(u8, t, "address")) return [20]u8;
     if (comptime std.mem.eql(u8, t, "bool")) return bool;
+    if (comptime std.mem.eql(u8, t, "bytes") or std.mem.eql(u8, t, "string")) return []const u8;
     if (comptime std.mem.startsWith(u8, t, "uint")) return std.meta.Int(.unsigned, parseBits(t["uint".len..]));
     if (comptime std.mem.startsWith(u8, t, "int")) return std.meta.Int(.signed, parseBits(t["int".len..]));
     if (comptime std.mem.startsWith(u8, t, "bytes") and t.len > "bytes".len) {
         return [parseBits(t["bytes".len..])]u8;
     }
-    @compileError("DecodedLog: type `" ++ t ++ "` not auto-decodable (dynamic `bytes`/`string` land with v1.2 blobs). Use slot-positional helpers.");
+    @compileError("DecodedLog: type `" ++ t ++ "` not auto-decodable. Use slot-positional helpers.");
 }
 
 fn TupleType(comptime components: []const []const u8) type {
@@ -247,7 +250,17 @@ fn decodeValue(comptime t: []const u8, data: []const u8, head_off: usize) TypeFo
     const s = comptime abi_parse.typeShape(t);
     switch (comptime s.tag) {
         .primitive => {
-            if (comptime abi_parse.isDynamicType(t)) @compileError("DecodedLog: decode of `" ++ t ++ "` not yet supported (v1.2 blobs)"); // You can read it slot-positionally
+            if (comptime abi_parse.isDynamicType(t)) {
+                // `bytes`/`string`: the head word holds the tail offset; at the
+                // tail a length word, then the bytes. The returned slice borrows
+                // `data` (`log.data`). A short or malformed payload yields an
+                // empty slice rather than reading out of bounds.
+                const tail = readOffset(data, head_off);
+                const len = readOffset(data, tail);
+                const start = tail + 32;
+                if (data.len < start + len) return data[0..0];
+                return data[start..][0..len];
+            }
             const w = wordOf(data, head_off);
             return decodeWord(PrimType(t), t, &w);
         },
@@ -816,6 +829,61 @@ test "param returns the right narrow integer type for sub-256 uintN" {
     try std.testing.expectEqual(u112, @TypeOf(r1));
     try std.testing.expectEqual(@as(u112, 0x1234), r0);
     try std.testing.expectEqual(@as(u112, 0xabcd), r1);
+}
+
+test "decode extracts a dynamic string param as a []const u8 borrow (ADR-005)" {
+    const NameReg = struct {
+        pub const signature = "NameRegistered(string name, uint256 cost)";
+    };
+    const name = "vitalik.eth";
+    // ABI: head[0] = offset to the string tail (past the 2-word head = 0x40),
+    // head[1] = cost. Tail: length word, then the bytes (32-byte padded).
+    var data_buf: [128]u8 = std.mem.zeroes([128]u8);
+    std.mem.writeInt(u256, data_buf[0..32], 0x40, .big);
+    std.mem.writeInt(u256, data_buf[32..64], 42, .big);
+    std.mem.writeInt(u256, data_buf[64..96], name.len, .big);
+    @memcpy(data_buf[96..][0..name.len], name);
+
+    const log: DecodedLog = .{
+        .block_number = 1,
+        .tx_index = 0,
+        .log_index = 0,
+        .tx_hash = [_]u8{0} ** 32,
+        .address = [_]u8{0} ** 20,
+        .topics = std.mem.zeroes([4][32]u8),
+        .topic_count = 1,
+        .data = &data_buf,
+    };
+
+    const d = log.decode(NameReg);
+    try std.testing.expectEqual([]const u8, @TypeOf(d.name));
+    try std.testing.expectEqualSlices(u8, name, d.name);
+    try std.testing.expectEqual(@as(u256, 42), d.cost);
+    // The slot-positional helper resolves the same bytes.
+    try std.testing.expectEqualSlices(u8, name, log.param(NameReg, "name"));
+}
+
+test "decode extracts dynamic bytes and tolerates a truncated tail" {
+    const Blob = struct {
+        pub const signature = "Blob(bytes payload)";
+    };
+    // Well-formed: 3-byte payload.
+    {
+        var data_buf: [96]u8 = std.mem.zeroes([96]u8);
+        std.mem.writeInt(u256, data_buf[0..32], 0x20, .big); // offset
+        std.mem.writeInt(u256, data_buf[32..64], 3, .big); // length
+        data_buf[64..67].* = [_]u8{ 0xDE, 0xAD, 0xBE };
+        const log: DecodedLog = .{ .block_number = 0, .tx_index = 0, .log_index = 0, .tx_hash = [_]u8{0} ** 32, .address = [_]u8{0} ** 20, .topics = std.mem.zeroes([4][32]u8), .topic_count = 1, .data = &data_buf };
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 0xDE, 0xAD, 0xBE }, log.decode(Blob).payload);
+    }
+    // Malformed: length claims 99 bytes but data is short. Yields empty, no OOB.
+    {
+        var data_buf: [64]u8 = std.mem.zeroes([64]u8);
+        std.mem.writeInt(u256, data_buf[0..32], 0x20, .big);
+        std.mem.writeInt(u256, data_buf[32..64], 99, .big);
+        const log: DecodedLog = .{ .block_number = 0, .tx_index = 0, .log_index = 0, .tx_hash = [_]u8{0} ** 32, .address = [_]u8{0} ** 20, .topics = std.mem.zeroes([4][32]u8), .topic_count = 1, .data = &data_buf };
+        try std.testing.expectEqual(@as(usize, 0), log.decode(Blob).payload.len);
+    }
 }
 
 test "decode returns a struct with one field per named parameter, correct types" {
