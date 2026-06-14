@@ -59,10 +59,41 @@ pub fn calldataHashOf(comptime method: []const u8) [32]u8 {
     };
 }
 
+/// Head words a fixed-size return type occupies: one per primitive, the sum
+/// for a struct/tuple of fixed fields. Dynamic types are not counted here.
+fn wordCount(comptime T: type) comptime_int {
+    return switch (@typeInfo(T)) {
+        .int, .bool, .array => 1,
+        .@"struct" => |s| blk: {
+            var n: comptime_int = 0;
+            for (s.fields) |f| n += wordCount(f.type);
+            break :blk n;
+        },
+        else => @compileError(
+            "ethcall.decodeAs: unsupported field type `" ++ @typeName(T) ++ "` in a multi-return struct",
+        ),
+    };
+}
+
 pub fn decodeAs(comptime T: type, bytes: []const u8) !T {
+    const info = @typeInfo(T);
+    // Struct or tuple return: one or more 32-byte words, one (sub)field at a
+    // time. `getReserves() -> (uint112,uint112,uint32)`, EIP-712 domain getters.
+    // Each field is itself fixed-size, so the walk is a per-field offset.
+    if (info == .@"struct") {
+        const need = comptime wordCount(T) * 32;
+        if (bytes.len < need) return error.MalformedResult;
+        var out: T = undefined;
+        comptime var off: usize = 0;
+        inline for (info.@"struct".fields) |f| {
+            @field(out, f.name) = try decodeAs(f.type, bytes[off * 32 ..]);
+            off += comptime wordCount(f.type);
+        }
+        return out;
+    }
+
     if (bytes.len < 32) return error.MalformedResult;
     const word = bytes[0..32];
-    const info = @typeInfo(T);
     return switch (info) {
         .int => |int_info| if (int_info.signedness == .unsigned)
             @truncate(std.mem.readInt(u256, word, .big))
@@ -81,7 +112,8 @@ pub fn decodeAs(comptime T: type, bytes: []const u8) !T {
         },
         else => @compileError(
             "ethcall.decodeAs: type `" ++ @typeName(T) ++ "` is not supported. " ++
-                "Use an int (u8..u256, i8..i256), bool, [20]u8, or [N]u8 for fixed N <= 32.",
+                "Use an int (u8..u256, i8..i256), bool, [20]u8, [N]u8 for N <= 32, " ++
+                "or a struct/tuple of those for a multi-return.",
         ),
     };
 }
@@ -420,6 +452,39 @@ test "decodeAs reads bytes32-class from the left-aligned head" {
 test "decodeAs returns MalformedResult for a short payload" {
     var short: [4]u8 = .{ 1, 2, 3, 4 };
     try testing.expectError(error.MalformedResult, decodeAs(u8, &short));
+}
+
+test "decodeAs reads a fixed-size multi-return struct, one word per field" {
+    const Reserves = struct { reserve0: u112, reserve1: u112, ts: u32 };
+    var buf: [96]u8 = std.mem.zeroes([96]u8);
+    std.mem.writeInt(u256, buf[0..32], 0x1111, .big);
+    std.mem.writeInt(u256, buf[32..64], 0x2222, .big);
+    std.mem.writeInt(u256, buf[64..96], 1_700_000_000, .big);
+
+    const r = try decodeAs(Reserves, &buf);
+    try testing.expectEqual(@as(u112, 0x1111), r.reserve0);
+    try testing.expectEqual(@as(u112, 0x2222), r.reserve1);
+    try testing.expectEqual(@as(u32, 1_700_000_000), r.ts);
+}
+
+test "decodeAs reads a tuple multi-return and mixed field types" {
+    const T = struct { addr: [20]u8, amount: u256, flag: bool };
+    var buf: [96]u8 = std.mem.zeroes([96]u8);
+    const A = [_]u8{0xAB} ** 20;
+    @memcpy(buf[12..32], &A); // address right-aligned
+    std.mem.writeInt(u256, buf[32..64], 0xDEAD, .big);
+    buf[95] = 1; // bool true
+
+    const r = try decodeAs(T, &buf);
+    try testing.expectEqualSlices(u8, &A, &r.addr);
+    try testing.expectEqual(@as(u256, 0xDEAD), r.amount);
+    try testing.expect(r.flag);
+}
+
+test "decodeAs multi-return rejects a payload short of the field count" {
+    const Reserves = struct { a: u256, b: u256, c: u256 };
+    var buf: [64]u8 = std.mem.zeroes([64]u8); // only 2 words, need 3
+    try testing.expectError(error.MalformedResult, decodeAs(Reserves, &buf));
 }
 
 test "cache survives close and re-open" {
