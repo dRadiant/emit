@@ -68,10 +68,19 @@ pub fn MutableStore(comptime T: type) type {
         /// payloads the fixed records address by `BlobRef`. `void` for a
         /// numeric entity, which compiles to the exact pre-blob layout.
         blob_log: if (HAS_BLOBS) BlobLog else void = if (HAS_BLOBS) undefined else {},
-        /// Backs the blob bytes of saved-but-uncommitted entities. `save`
-        /// copies each blob field here so the cached slice outlives the
-        /// transient `log.data` it came from. Reset after each commit.
+        /// Backs the blob bytes of backfill saves. `save` copies each blob
+        /// field here so the cached slice outlives the transient `log.data` it
+        /// came from. Reset after each commit. Unused on the live path, which
+        /// uses per-block arenas instead.
         blob_arena: if (HAS_BLOBS) std.heap.ArenaAllocator else void = if (HAS_BLOBS) undefined else {},
+        /// Live path: one blob arena per pending block, so a reorg that drops
+        /// a block frees exactly that block's blob bytes. Parallel to the
+        /// `pending` submaps. Bounded by FINALITY_DEPTH.
+        pending_arenas: if (HAS_BLOBS) std.AutoHashMapUnmanaged(u64, *std.heap.ArenaAllocator) else void = if (HAS_BLOBS) .{} else {},
+        /// Blocks drained by `commitBlock` whose arenas back cache entries
+        /// awaiting `materialize`. Freed in `refreshSlab` once those blobs are
+        /// durable in `blobs.dat`.
+        committing_arenas: if (HAS_BLOBS) std.ArrayListUnmanaged(*std.heap.ArenaAllocator) else void = if (HAS_BLOBS) .{} else {},
 
         /// `slab` is borrowed from the owning `StateSnap`. Caller must call
         /// `refreshSlab` after every `state_snap.commit` to avoid dangling.
@@ -114,9 +123,19 @@ pub fn MutableStore(comptime T: type) type {
             self.pending.deinit(self.allocator);
             self.cache.deinit();
             if (comptime HAS_BLOBS) {
+                var ait = self.pending_arenas.valueIterator();
+                while (ait.next()) |a| self.destroyArena(a.*);
+                self.pending_arenas.deinit(self.allocator);
+                for (self.committing_arenas.items) |a| self.destroyArena(a);
+                self.committing_arenas.deinit(self.allocator);
                 self.blob_arena.deinit();
                 self.blob_log.deinit();
             }
+        }
+
+        fn destroyArena(self: *Self, arena: *std.heap.ArenaAllocator) void {
+            arena.deinit();
+            self.allocator.destroy(arena);
         }
 
         pub fn load(self: *Self, key: KeyField) !?T {
@@ -157,7 +176,6 @@ pub fn MutableStore(comptime T: type) type {
             var entity = std.mem.zeroes(T);
             @field(entity, key_field_name) = key;
             if (self.live) {
-                if (comptime HAS_BLOBS) return error.LiveBlobUnsupported;
                 try self.putPending(key, entity);
             } else {
                 try self.cache.put(key, .{ .entity = entity, .dirty = true });
@@ -166,23 +184,36 @@ pub fn MutableStore(comptime T: type) type {
         }
 
         /// Single-arg save derives the primary key from `entity`'s first field.
-        /// Blob payloads are copied into `blob_arena` so the cached entity owns
-        /// bytes that outlive the handler's transient `log.data` slice.
+        /// Blob payloads are copied into a store-owned arena (the cycle arena
+        /// on backfill, the current block's arena live) so the stored entity
+        /// owns bytes that outlive the handler's transient `log.data` slice.
         pub fn save(self: *Self, entity: T) !void {
             const key = @field(entity, key_field_name);
             if (self.live) {
-                if (comptime HAS_BLOBS) return error.LiveBlobUnsupported;
                 try self.putPending(key, entity);
                 return;
             }
-            const owned = if (comptime HAS_BLOBS) try self.ownBlobs(entity) else entity;
+            const owned = if (comptime HAS_BLOBS) try self.ownBlobs(entity, self.blob_arena.allocator()) else entity;
             try self.cache.put(key, .{ .entity = owned, .dirty = true });
         }
 
         fn putPending(self: *Self, key: KeyField, value: T) !void {
+            const owned = if (comptime HAS_BLOBS) try self.ownBlobs(value, try self.pendingArena()) else value;
             const gop = try self.pending.getOrPut(self.allocator, self.live_block);
             if (!gop.found_existing) gop.value_ptr.* = .{};
-            try gop.value_ptr.put(self.allocator, key, value);
+            try gop.value_ptr.put(self.allocator, key, owned);
+        }
+
+        /// Allocator for the current `live_block`'s blob arena, creating it on
+        /// first save to the block. Freed when the block commits or reorgs out.
+        fn pendingArena(self: *Self) !std.mem.Allocator {
+            const gop = try self.pending_arenas.getOrPut(self.allocator, self.live_block);
+            if (!gop.found_existing) {
+                const arena = try self.allocator.create(std.heap.ArenaAllocator);
+                arena.* = std.heap.ArenaAllocator.init(self.allocator);
+                gop.value_ptr.* = arena;
+            }
+            return gop.value_ptr.*.allocator();
         }
 
         /// Deserialize the slab record at `idx`, resolving blob refs against
@@ -193,11 +224,10 @@ pub fn MutableStore(comptime T: type) type {
             return entity_serial.deserialize(T, record);
         }
 
-        /// Copy `entity`'s blob payloads into `blob_arena`, repointing each
-        /// slice at the stable copy. Blob entities only.
-        fn ownBlobs(self: *Self, entity: T) !T {
+        /// Copy `entity`'s blob payloads into `a`, repointing each slice at the
+        /// stable copy. Blob entities only.
+        fn ownBlobs(_: *Self, entity: T, a: std.mem.Allocator) !T {
             var out = entity;
-            const a = self.blob_arena.allocator();
             inline for (fields) |f| {
                 if (comptime entity_serial.fieldKind(f.type, @typeName(T) ++ "." ++ f.name) == .blob) {
                     const src = @field(entity, f.name);
@@ -214,11 +244,21 @@ pub fn MutableStore(comptime T: type) type {
             // Reserve cache capacity before removing the submap. A partial OOM
             // would otherwise strand entries between pending and cache.
             try self.cache.ensureUnusedCapacity(sub.count());
+            // The drained cache entries' blob slices reference this block's
+            // arena, so it must outlive the drain. Hand it to `committing`,
+            // freed by `refreshSlab` once the blobs are durable. Reserve the
+            // list slot first so the move cannot half-fail.
+            if (comptime HAS_BLOBS) {
+                if (self.pending_arenas.get(block)) |_| try self.committing_arenas.ensureUnusedCapacity(self.allocator, 1);
+            }
             var removed = self.pending.fetchRemove(block).?;
             defer removed.value.deinit(self.allocator);
             var it = removed.value.iterator();
             while (it.next()) |entry| {
                 self.cache.putAssumeCapacity(entry.key_ptr.*, .{ .entity = entry.value_ptr.*, .dirty = true });
+            }
+            if (comptime HAS_BLOBS) {
+                if (self.pending_arenas.fetchRemove(block)) |kv| self.committing_arenas.appendAssumeCapacity(kv.value);
             }
         }
 
@@ -228,6 +268,11 @@ pub fn MutableStore(comptime T: type) type {
             var it = self.pending.valueIterator();
             while (it.next()) |bm| bm.deinit(self.allocator);
             self.pending.clearRetainingCapacity();
+            if (comptime HAS_BLOBS) {
+                var ait = self.pending_arenas.valueIterator();
+                while (ait.next()) |a| self.destroyArena(a.*);
+                self.pending_arenas.clearRetainingCapacity();
+            }
         }
 
         /// Drop overlay submaps at or above `block`, keeping canonical blocks
@@ -243,6 +288,9 @@ pub fn MutableStore(comptime T: type) type {
                     if (k.* >= block) {
                         var removed = self.pending.fetchRemove(k.*).?;
                         removed.value.deinit(self.allocator);
+                        if (comptime HAS_BLOBS) {
+                            if (self.pending_arenas.fetchRemove(k.*)) |kv| self.destroyArena(kv.value);
+                        }
                         continue :outer;
                     }
                 }
@@ -360,7 +408,11 @@ pub fn MutableStore(comptime T: type) type {
             self.slab = new_slab;
             if (comptime HAS_BLOBS) {
                 self.cache.clearRetainingCapacity();
+                // Backfill saves lived in blob_arena, finalized live blocks in
+                // committing arenas. Both are now durable in blobs.dat.
                 _ = self.blob_arena.reset(.retain_capacity);
+                for (self.committing_arenas.items) |a| self.destroyArena(a);
+                self.committing_arenas.clearRetainingCapacity();
                 return;
             }
             var it = self.cache.valueIterator();
@@ -747,4 +799,56 @@ test "mutable array blob: []const [20]u8 round-trips" {
     try testing.expectEqual(@as(usize, 3), got.addrs.len);
     try testing.expectEqualSlices(u8, &addrs[0], &got.addrs[0]);
     try testing.expectEqualSlices(u8, &addrs[2], &got.addrs[2]);
+}
+
+test "live blob: per-block overlay, newest-block wins, commit reloads" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try MutableStore(Named).openWithBlobs(alloc, &.{}, tmp.dir, "named.blobs.dat", 0);
+    defer store.deinit();
+    store.live = true;
+
+    // Block 100 saves into its own overlay arena; read-your-writes from it.
+    store.live_block = 100;
+    try store.save(.{ .id = id8(1), .label = "live-name" });
+    try testing.expectEqualSlices(u8, "live-name", (try store.load(id8(1))).?.label);
+
+    // Block 101 overwrites the key. Newest pending block wins on load.
+    store.live_block = 101;
+    try store.save(.{ .id = id8(1), .label = "newer-name" });
+    try testing.expectEqualSlices(u8, "newer-name", (try store.load(id8(1))).?.label);
+
+    // Finalize both, then commit. The committing arenas back the cache until
+    // materialize stages their blobs; refreshSlab frees them (leak checker
+    // catches a mismanaged arena).
+    try store.commitBlock(100);
+    try store.commitBlock(101);
+    const slab = try cycleNamed(&store, alloc);
+    defer alloc.free(slab);
+    try testing.expectEqualSlices(u8, "newer-name", (try store.load(id8(1))).?.label);
+}
+
+test "live blob reorg: discardFrom frees the dropped block's arena, keeps below" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try MutableStore(Named).openWithBlobs(alloc, &.{}, tmp.dir, "named.blobs.dat", 0);
+    defer store.deinit();
+    store.live = true;
+
+    store.live_block = 100;
+    try store.save(.{ .id = id8(1), .label = "kept-below-fork" });
+    store.live_block = 101;
+    try store.save(.{ .id = id8(2), .label = "dropped-at-fork" });
+
+    // Reorg at 101: block 101's arena + submap drop, block 100 survives.
+    store.discardFrom(101);
+    try testing.expectEqualSlices(u8, "kept-below-fork", (try store.load(id8(1))).?.label);
+    try testing.expectEqual(@as(?Named, null), try store.load(id8(2)));
+
+    // discardAll then frees the remaining block 100 arena (leak checker
+    // verifies nothing is stranded).
+    store.discardAll();
+    try testing.expectEqual(@as(?Named, null), try store.load(id8(1)));
 }
