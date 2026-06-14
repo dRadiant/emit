@@ -15,8 +15,9 @@ Endianness convention:
 ```
 <data_dir>/
 ├── entity/
-│   ├── state.snap              cursor + every MutableStore slab + every ImmutableStore count
-│   └── <entity>.events.dat     append-only records, one file per ImmutableStore entity type
+│   ├── state.snap              cursor + every MutableStore slab + every ImmutableStore count + blob lengths
+│   ├── <entity>.events.dat     append-only records, one file per ImmutableStore entity type
+│   └── <entity>.blobs.dat      variable-length field payloads, one file per blob-bearing entity type
 ├── filter/
 │   ├── primary.dat             filtered-index payloads (internal; rebuildable)
 │   ├── primary.idx             filtered-index offsets (internal; rebuildable)
@@ -36,22 +37,27 @@ struct.
 ## state.snap
 
 The single atomicity-bearing file. Every commit writes a new `state.snap`
-via tmp + fsync + rename. Cursor advance, MutableStore updates, and
-ImmutableStore count advances are all published by this one rename.
+via tmp + fsync + rename. Cursor advance, MutableStore updates,
+ImmutableStore count advances, and blob-file lengths are all published by
+this one rename.
 
 ```
 offset  size                            field
 0       8                               magic "EMITSTAT"
-8       4                               version (u32 LE; currently 1)
+8       4                               version (u32 LE; 1 with no blob stores, 2 with any)
 12      8                               cursor (u64 LE; last fully-dispatched block)
 20      mutable_count × 8               mutable_bytes[i] (u64 LE; slab byte length per MutableStore slot)
 +       immutable_count × 8             immutable_counts[i] (u64 LE; authoritative record count per ImmutableStore slot)
++       blob_count × 8                  blob_bytes[i] (u64 LE; committed payload length per `<entity>.blobs.dat`) — version 2 only
 +       Σ mutable_bytes[i]              body: MutableStore slabs concatenated in slot order
 ```
 
-`mutable_count` and `immutable_count` are *not stored* in the file — they
-are comptime-known from the indexer's entities tuple. Readers know N and M
-from the schema spec they were written against.
+`mutable_count`, `immutable_count`, and `blob_count` are *not stored* in the
+file — they are comptime-known from the indexer's entities tuple. Readers
+know them from the schema spec they were written against. A schema with no
+blob-bearing entity writes version 1 with no `blob_bytes` array, byte-
+identical to the pre-blob layout. `blob_count` is the number of entities
+(either kind) with a variable-length field, in entity-declaration order.
 
 ### Slab layout (one per MutableStore type)
 
@@ -63,9 +69,29 @@ entity is serialized field-by-field in declaration order:
 
 - Field 0 (the primary key): big-endian.
 - Fields 1..N: little-endian for integers; raw bytes for `[N]u8` arrays.
+- A variable-length field (`[]const u8`, or `[]const T` for a fixed-size `T`)
+  serializes to an 8-byte `BlobRef`, not the payload. The bytes live in
+  `<entity>.blobs.dat` (see below). The record stays fixed-width, so binary
+  search is unaffected.
 
 Binary search on the slab is `O(log N)` using `std.mem.order(u8, ...)` on
 the first `key_size` bytes of each record.
+
+### BlobRef (8 bytes, variable-length fields)
+
+```
+A BlobRef is a u64 LE with two packed fields:
+  bits 0..40   offset (absolute byte offset into <entity>.blobs.dat)
+  bits 40..64  len    (payload byte length)
+  (0, 0) = empty / unset → empty slice
+```
+
+Read it as `ref = u64_le(record[field_off..field_off+8])`, then
+`offset = ref & 0xFFFFFFFFFF`, `len = ref >> 40`. The payload is
+`blobs[offset : offset+len]` in the matching `<entity>.blobs.dat`. For a
+`[]const u8`/`string`/`bytes` field that is the value directly; for a
+`[]const T` field it is `len / sizeof(T)` little-endian elements (the writer
+aligns the offset to `T`'s alignment).
 
 ## `<entity>.events.dat`
 
@@ -84,7 +110,29 @@ Those bytes are invisible to readers (bounded by the count from
 `state.snap`) and are overwritten by the next append.
 
 Records share the same serialization rule as MutableStore slabs:
-big-endian primary key, little-endian everything else.
+big-endian primary key, little-endian everything else, and an 8-byte
+`BlobRef` for any variable-length field (resolved against the entity's
+`<entity>.blobs.dat`).
+
+## `<entity>.blobs.dat`
+
+Append-only payload file for one blob-bearing entity type's variable-length
+fields (ADR-005). The fixed slab/events record holds a `BlobRef`
+(`offset`, `len`); the bytes live here. Never mutated in place — an updated
+field appends fresh bytes and orphans the old (garbage, not corruption).
+
+```
+offset                     size                    field
+0                          8                       magic "EMITBLOB"
+8                          variable                concatenated payloads, element-aligned
+```
+
+The authoritative valid length is `state.snap.blob_bytes[slot]`, not this
+file's size. Bytes past it are orphan tail from a crashed commit (the commit
+order is blobs.dat append + fsync, then the `state.snap` rename), invisible
+to readers and overwritten by the next append — the same discipline as
+`events.dat`. A `BlobRef.offset` is an absolute file offset (so it includes
+the 8-byte header); resolve a payload as `blobs[offset : offset+len]`.
 
 ## primary.dat / primary.idx (filtered index, internal)
 
@@ -176,13 +224,15 @@ further writes — the file is self-healing in this respect.
 
 ## Schema evolution
 
-The `version` field in `state.snap` is reserved for future format bumps.
-The current shipping version is **1**.
+The `version` field in `state.snap` selects the layout: **1** for a schema
+with no blob-bearing entity (the original layout), **2** when any entity has
+a variable-length field (adds the `blob_bytes` array). A reader keys off the
+version to decide whether to parse `blob_bytes`.
 
-If the SDK detects an unrecognized version on open, it raises a loud error
-directing the operator to delete the data directory and re-backfill. There
-is no in-place migration — re-backfill is fast enough that maintenance
-cost beats the savings.
+If the SDK detects a version it does not expect for the schema it was built
+for, it raises a loud error directing the operator to delete the data
+directory and re-backfill. There is no in-place migration — re-backfill is
+fast enough that maintenance cost beats the savings.
 
 ## Reference readers
 
@@ -194,6 +244,9 @@ Working examples that decode entity files in other languages:
 - `examples/readers/c/reader.c` — mmaps `state.snap` and prints cursor +
   per-store record counts.
 - `examples/readers/zig/reader.zig` — sdk-free Zig decode of the same.
+- `examples/readers/python/blob_reader.py` — decodes a blob-bearing entity
+  (the ENS `Registration`), resolving each `BlobRef` against
+  `<entity>.blobs.dat` to recover the variable-length field.
 
-The readers consume the format documented above and stay in sync with
-the schema as long as `version == 1` is unchanged.
+The readers consume the format documented above. The first three target the
+blobless ERC20 schema (version 1); `blob_reader.py` shows the version-2 path.

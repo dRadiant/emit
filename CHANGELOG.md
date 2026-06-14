@@ -6,6 +6,19 @@ EMIT follows semantic versioning. Major bumps (1.x → 2.x) signal breaking chan
 
 ## EMIT 1.2.0 (UNRELEASED)
 
+### Variable-Length Entity Fields
+
+Entities can now hold variable-length fields — `string`, dynamic `bytes`, and flat dynamic arrays — closing the one entity-model gap against Postgres-backed indexers (NFT names/URIs, ENS names, governance text, address lists). A field is declared as a plain slice, no marker type: `name: []const u8` or `members: []const [20]u8` sits next to `balance: u256`, and handlers read and `save` it like any other field.
+
+- Storage stays flat-file and zero-copy. The fixed record holds an 8-byte `BlobRef` (`offset:40 | len:24`); the payload lives in an append-only `<entity>.blobs.dat`, mmap-read. The slab stays fixed-width, so binary search and the HashMap front are untouched. `state.snap` gains a `blob_bytes[]` array and bumps to version 2 — but only when a schema actually has a blob field; a numeric-only indexer writes version 1, byte-identical to before, with zero added cost (the 2M-events/s path is unchanged).
+- Both element shapes ship: `[]const u8` (string/bytes) and `[]const T` for a fixed-size `T`. Array blobs align the offset to `@alignOf(T)` so the read is a zero-copy aligned cast. Nested dynamics (`[]const []const u8`) are a loud compile error.
+- Crash-safe by the proven discipline: `blobs.dat` append + fsync precedes the `state.snap` rename, so a crash leaves only invisible orphan tail (overwritten next commit) — the same contract as `events.dat`. Live mode rides the per-block overlay: blob bytes accumulate in per-block arenas, dropped on reorg, flushed on finalize.
+- Event params: top-level `string`/`bytes` now decode to a `[]const u8` borrowing the log data (the deferred half of the v1.1 ABI work). `log.params.name` flows straight into a blob `save`.
+- Read safety is a compile-time contract: a blob field slice borrows the store mmap, so the auto-locking `ctx.read`/`count`/`range` reject blob entities (they release the lock on return) and point at `ctx.readView()`, a guard that holds the lock across the borrow. Handlers are unaffected.
+- The `examples/ens` indexer demonstrates it (stores each registration's `name`); verified on the reference box — 799,333 registrations, 400/400 sampled names matching an independent `eth_getLogs` decode, and a reference `blob_reader.py` re-derives them from the documented format. ImmutableStore (append-only) blob support is the remaining piece; blob entities are `mutable` for now.
+
+Separately, `sdk.address` now **requires** the EIP-55 checksum: a manifest address typo fails the build (with the correct checksum printed) instead of silently matching no logs. An all-lowercase literal is rejected.
+
 ### Top-Level Transaction Fields
 
 Handlers can now read the owning transaction's `from`/`to`/`value` alongside the log — the identity data that lives in no event. An event opts in with `pub const tx_fields = true;` (next to its `signature`, mirroring an entity's `storage` declaration), and its handler reads `log.tx: sdk.Tx { from, to (null = contract creation), value, tx_type }` — decoded and non-optional. Reading `log.tx` on an event that did not declare it is a compile error, and a manifest with no declaration compiles byte-identical to before. The hot loop stays network-free: fields resolve from the store at dispatch, zero RPC.
