@@ -75,19 +75,58 @@ fn wordCount(comptime T: type) comptime_int {
     };
 }
 
+/// An ABI-dynamic return: `string`/`bytes` decoded as `[]const u8`. In a
+/// tuple its head slot carries a tail offset, not the value inline.
+fn isDynamic(comptime T: type) bool {
+    return @typeInfo(T) == .pointer;
+}
+
+/// Head slots `T` occupies in a tuple head: one offset word if dynamic, its
+/// full fixed width otherwise.
+fn headWords(comptime T: type) comptime_int {
+    return if (comptime isDynamic(T)) 1 else wordCount(T);
+}
+
+/// Decode a dynamic `[]const u8` whose `[length][data]` tail starts at
+/// `bytes[off]`. The slice aliases `bytes` (no copy). `off` and the length
+/// word are bounds checked against the buffer. `off` is relative to the
+/// encoding base, the same base the head offsets resolve against.
+fn decodeTail(comptime T: type, bytes: []const u8, off: usize) error{MalformedResult}![]const u8 {
+    comptime {
+        const ptr = @typeInfo(T).pointer;
+        if (ptr.size != .slice or ptr.child != u8 or !ptr.is_const) @compileError(
+            "ethcall.decodeAs: only `[]const u8` is supported for a dynamic `string`/`bytes` return; got `" ++ @typeName(T) ++ "`",
+        );
+    }
+    if (off > bytes.len or bytes.len - off < 32) return error.MalformedResult;
+    const length: usize = @truncate(std.mem.readInt(u256, bytes[off..][0..32], .big));
+    if (length > bytes.len - off - 32) return error.MalformedResult;
+    return bytes[off + 32 ..][0..length];
+}
+
 pub fn decodeAs(comptime T: type, bytes: []const u8) !T {
     const info = @typeInfo(T);
-    // Struct or tuple return: one or more 32-byte words, one (sub)field at a
-    // time. `getReserves() -> (uint112,uint112,uint32)`, EIP-712 domain getters.
-    // Each field is itself fixed-size, so the walk is a per-field offset.
+    // Struct or tuple return. The head is one slot per field: a static field
+    // holds its value(s) inline, a dynamic field holds a tail offset relative
+    // to the head start. `getReserves() -> (uint112,uint112,uint32)` is all
+    // static, `totalSupplyAndName() -> (uint256,string)` mixes both.
     if (info == .@"struct") {
-        const need = comptime wordCount(T) * 32;
-        if (bytes.len < need) return error.MalformedResult;
+        const head = comptime blk: {
+            var n: usize = 0;
+            for (info.@"struct".fields) |f| n += headWords(f.type);
+            break :blk n;
+        };
+        if (bytes.len < head * 32) return error.MalformedResult;
         var out: T = undefined;
         comptime var off: usize = 0;
         inline for (info.@"struct".fields) |f| {
-            @field(out, f.name) = try decodeAs(f.type, bytes[off * 32 ..]);
-            off += comptime wordCount(f.type);
+            if (comptime isDynamic(f.type)) {
+                const tail_off: usize = @truncate(std.mem.readInt(u256, bytes[off * 32 ..][0..32], .big));
+                @field(out, f.name) = try decodeTail(f.type, bytes, tail_off);
+            } else {
+                @field(out, f.name) = try decodeAs(f.type, bytes[off * 32 ..]);
+            }
+            off += comptime headWords(f.type);
         }
         return out;
     }
@@ -100,6 +139,11 @@ pub fn decodeAs(comptime T: type, bytes: []const u8) !T {
         else
             @truncate(@as(i256, @bitCast(std.mem.readInt(u256, word, .big)))),
         .bool => word[31] != 0,
+        // Dynamic `string`/`bytes` return. The head word is the tail offset.
+        // The slice borrows `bytes` (the cache entry's owned buffer), valid
+        // for the cache's lifetime. Copy it to hold past a re-prefetch that
+        // overwrites the same key.
+        .pointer => try decodeTail(T, bytes, @truncate(std.mem.readInt(u256, word, .big))),
         .array => |arr| blk: {
             if (arr.child != u8) @compileError(
                 "ethcall.decodeAs: arrays must be `[N]u8`; got `" ++ @typeName(T) ++ "`",
@@ -537,6 +581,103 @@ test "decodeAs multi-return rejects a payload short of the field count" {
     const Reserves = struct { a: u256, b: u256, c: u256 };
     var buf: [64]u8 = std.mem.zeroes([64]u8); // only 2 words, need 3
     try testing.expectError(error.MalformedResult, decodeAs(Reserves, &buf));
+}
+
+test "decodeAs reads a dynamic string borrowing the source bytes" {
+    // ABI: [offset=0x20][length=5]["hello" padded to 32].
+    var buf: [96]u8 = std.mem.zeroes([96]u8);
+    std.mem.writeInt(u256, buf[0..32], 0x20, .big);
+    std.mem.writeInt(u256, buf[32..64], 5, .big);
+    @memcpy(buf[64..69], "hello");
+
+    const s = try decodeAs([]const u8, &buf);
+    try testing.expectEqualStrings("hello", s);
+    // Slice aliases the input buffer, no copy.
+    try testing.expectEqual(@intFromPtr(&buf[64]), @intFromPtr(s.ptr));
+}
+
+test "decodeAs reads an empty dynamic bytes" {
+    var buf: [64]u8 = std.mem.zeroes([64]u8);
+    std.mem.writeInt(u256, buf[0..32], 0x20, .big);
+    // length word already zero.
+    const s = try decodeAs([]const u8, &buf);
+    try testing.expectEqual(@as(usize, 0), s.len);
+}
+
+test "decodeAs reads a dynamic return at a non-canonical offset" {
+    // A padding word precedes the tail. Offset points past it.
+    var buf: [128]u8 = std.mem.zeroes([128]u8);
+    std.mem.writeInt(u256, buf[0..32], 0x40, .big); // tail at byte 64
+    std.mem.writeInt(u256, buf[64..96], 3, .big);
+    @memcpy(buf[96..99], "abc");
+    try testing.expectEqualStrings("abc", try decodeAs([]const u8, &buf));
+}
+
+test "decodeAs dynamic rejects an out-of-bounds offset" {
+    var buf: [64]u8 = std.mem.zeroes([64]u8);
+    std.mem.writeInt(u256, buf[0..32], 0x1000, .big); // offset past the payload
+    try testing.expectError(error.MalformedResult, decodeAs([]const u8, &buf));
+}
+
+test "decodeAs dynamic rejects a length running past the payload" {
+    var buf: [96]u8 = std.mem.zeroes([96]u8);
+    std.mem.writeInt(u256, buf[0..32], 0x20, .big);
+    std.mem.writeInt(u256, buf[32..64], 1000, .big); // claims 1000 bytes, only 32 follow
+    try testing.expectError(error.MalformedResult, decodeAs([]const u8, &buf));
+}
+
+test "decodeAs reads a tuple trailing a dynamic field after a fixed one" {
+    // `(string name, uint256 supply)`. head[0]=offset, head[1]=supply.
+    const T = struct { name: []const u8, supply: u256 };
+    var buf: [128]u8 = std.mem.zeroes([128]u8);
+    std.mem.writeInt(u256, buf[0..32], 0x40, .big); // name tail at byte 64
+    std.mem.writeInt(u256, buf[32..64], 1_000_000, .big);
+    std.mem.writeInt(u256, buf[64..96], 5, .big); // name length
+    @memcpy(buf[96..101], "hello");
+
+    const r = try decodeAs(T, &buf);
+    try testing.expectEqualStrings("hello", r.name);
+    try testing.expectEqual(@as(u256, 1_000_000), r.supply);
+}
+
+test "decodeAs reads a dynamic field between two fixed fields" {
+    // `(uint256 id, string label, address owner)`.
+    const T = struct { id: u256, label: []const u8, owner: [20]u8 };
+    var buf: [160]u8 = std.mem.zeroes([160]u8);
+    const OWNER = [_]u8{0xCC} ** 20;
+    std.mem.writeInt(u256, buf[0..32], 42, .big);
+    std.mem.writeInt(u256, buf[32..64], 0x60, .big); // label tail at byte 96
+    @memcpy(buf[76..96], &OWNER); // address right-aligned in head[2]
+    std.mem.writeInt(u256, buf[96..128], 4, .big); // label length
+    @memcpy(buf[128..132], "usdc");
+
+    const r = try decodeAs(T, &buf);
+    try testing.expectEqual(@as(u256, 42), r.id);
+    try testing.expectEqualStrings("usdc", r.label);
+    try testing.expectEqualSlices(u8, &OWNER, &r.owner);
+}
+
+test "decodeAs reads two dynamic fields sharing one tail" {
+    // `(string a, string b)`. Both head slots are offsets.
+    const T = struct { a: []const u8, b: []const u8 };
+    var buf: [192]u8 = std.mem.zeroes([192]u8);
+    std.mem.writeInt(u256, buf[0..32], 0x40, .big); // a tail at 64
+    std.mem.writeInt(u256, buf[32..64], 0x80, .big); // b tail at 128
+    std.mem.writeInt(u256, buf[64..96], 3, .big);
+    @memcpy(buf[96..99], "foo");
+    std.mem.writeInt(u256, buf[128..160], 3, .big);
+    @memcpy(buf[160..163], "bar");
+
+    const r = try decodeAs(T, &buf);
+    try testing.expectEqualStrings("foo", r.a);
+    try testing.expectEqualStrings("bar", r.b);
+}
+
+test "decodeAs tuple rejects a dynamic field offset past the payload" {
+    const T = struct { a: []const u8, n: u256 };
+    var buf: [128]u8 = std.mem.zeroes([128]u8);
+    std.mem.writeInt(u256, buf[0..32], 0x9999, .big); // offset past the buffer
+    try testing.expectError(error.MalformedResult, decodeAs(T, &buf));
 }
 
 test "cache survives close and re-open" {

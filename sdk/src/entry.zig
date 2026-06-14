@@ -466,6 +466,10 @@ pub fn Context(comptime entities: anytype) type {
 
         /// Strict cache read, never issues HTTP. Returns `error.NotPrefetched`
         /// for undeclared pairs, `error.CallReverted` for status=1 entries.
+        /// Any `[]const u8` in the result (a dynamic `string`/`bytes`, bare or
+        /// a tuple field) borrows the cache entry's bytes, stable until a
+        /// re-prefetch overwrites the same key. Copy it to hold past the
+        /// current handler.
         pub fn ethCall(
             self: *Self,
             comptime T: type,
