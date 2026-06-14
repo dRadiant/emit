@@ -132,6 +132,7 @@ pub fn build(b: *std.Build) void {
         .{ .path = "test/compile_fail/event_nested_dynamic.zig", .expected = "is a tuple with a dynamic component; nested dynamics are not yet supported" },
         .{ .path = "test/compile_fail/factory_disjoint_child_events.zig", .expected = "factories must declare identical child_events. Split distinct protocols into separate manifests." },
         .{ .path = "test/compile_fail/log_tx_undeclared.zig", .expected = "type 'void' does not support field access" },
+        .{ .path = "test/compile_fail/blob_read_needs_view.zig", .expected = "copy any blob bytes out before the view is released." },
     };
     for (compile_fail) |s| {
         const obj = b.addObject(.{

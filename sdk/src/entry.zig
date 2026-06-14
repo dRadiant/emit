@@ -243,12 +243,16 @@ pub fn Context(comptime entities: anytype) type {
         /// immutable store's live log (finalized records plus the overlay). Not
         /// for handlers, which already run under the loop's lock so a read here
         /// would deadlock.
+        ///
+        /// Blob entities (ADR-005) cannot use this path: a blob field is a
+        /// slice borrowing the store mmap, and `read` releases the lock on
+        /// return, so a concurrent commit could remap under the borrow. Read
+        /// them through `readView`, which holds the lock across the borrow.
         pub fn read(self: *Self, comptime T: type, key: anytype) !?T {
+            comptime assertNoBlobs(T, "read");
             self.lock();
             defer self.unlock();
-            const store = &@field(self.stores, entityFieldName(T));
-            if (comptime T.storage == .immutable) return store.get(key);
-            return store.load(key);
+            return self.readLocked(T, key);
         }
 
         /// Live record count of immutable entity `T` (finalized + overlay).
@@ -267,13 +271,56 @@ pub fn Context(comptime entities: anytype) type {
         /// `count` and `range` take the lock separately, so a commit between
         /// the two can shift the page by a few records. Never incoherent data,
         /// just a moved window. Wrap both in `lock`/`unlock` for a pinned page.
-        /// Mutable entities are point-read by key via `read`.
+        /// Mutable entities are point-read by key via `read`. Blob entities use
+        /// `readView` (the filled `out` would borrow the mmap past the lock).
         pub fn range(self: *Self, comptime T: type, start: u64, out: []T) ![]T {
             comptime assertImmutable(T, "range");
+            comptime assertNoBlobs(T, "range");
             self.lock();
             defer self.unlock();
             return @field(self.stores, entityFieldName(T)).range(start, out);
         }
+
+        fn readLocked(self: *Self, comptime T: type, key: anytype) !?T {
+            const store = &@field(self.stores, entityFieldName(T));
+            if (comptime T.storage == .immutable) return store.get(key);
+            return store.load(key);
+        }
+
+        /// Open a read view: holds the Context lock so blob field slices stay
+        /// valid for the borrow's use, then released on `deinit`. The sound way
+        /// to read blob entities from an external thread (ADR-005). Numeric
+        /// entities can use it too for a pinned multi-read snapshot. Copy any
+        /// blob bytes out before `deinit` if they must outlive the view. Never
+        /// open a view from a handler, which already holds the lock.
+        pub fn readView(self: *Self) ReadView {
+            self.lock();
+            return .{ .ctx = self };
+        }
+
+        /// RAII read guard from `readView`. Reads borrow the store mmap and are
+        /// valid until `deinit` releases the lock.
+        pub const ReadView = struct {
+            ctx: *Self,
+
+            pub fn read(self: ReadView, comptime T: type, key: anytype) !?T {
+                return self.ctx.readLocked(T, key);
+            }
+
+            pub fn count(self: ReadView, comptime T: type) u64 {
+                comptime assertImmutable(T, "count");
+                return @field(self.ctx.stores, entityFieldName(T)).count();
+            }
+
+            pub fn range(self: ReadView, comptime T: type, start: u64, out: []T) ![]T {
+                comptime assertImmutable(T, "range");
+                return @field(self.ctx.stores, entityFieldName(T)).range(start, out);
+            }
+
+            pub fn deinit(self: ReadView) void {
+                self.ctx.unlock();
+            }
+        };
 
         /// Manual guard for multi-key snapshots. Prefer `read` for single keys.
         pub fn lock(self: *Self) void {
@@ -1291,6 +1338,17 @@ fn assertImmutable(comptime T: type, comptime who: []const u8) void {
     if (T.storage != .immutable) @compileError(
         "Context." ++ who ++ "(): '" ++ @typeName(T) ++ "' is a mutable entity. " ++
             who ++ "() serves immutable event-log entities; use read() for keyed state.",
+    );
+}
+
+/// Blob fields borrow the store mmap, so a value returned past the lock would
+/// dangle on a concurrent commit. The auto-locking accessors reject them and
+/// point at `readView`, which holds the lock across the borrow (ADR-005).
+fn assertNoBlobs(comptime T: type, comptime who: []const u8) void {
+    if (entity_serial.hasBlobs(T)) @compileError(
+        "Context." ++ who ++ "(): '" ++ @typeName(T) ++ "' has blob fields whose slices " ++
+            "borrow the store mmap. Read it through `ctx.readView()` so the borrow stays " ++
+            "valid under the lock, and copy any blob bytes out before the view is released.",
     );
 }
 
