@@ -133,6 +133,7 @@ pub fn build(b: *std.Build) void {
         .{ .path = "test/compile_fail/factory_disjoint_child_events.zig", .expected = "factories must declare identical child_events. Split distinct protocols into separate manifests." },
         .{ .path = "test/compile_fail/log_tx_undeclared.zig", .expected = "type 'void' does not support field access" },
         .{ .path = "test/compile_fail/blob_read_needs_view.zig", .expected = "copy any blob bytes out before the view is released." },
+        .{ .path = "test/compile_fail/address_not_checksummed.zig", .expected = "is not EIP-55 checksummed. Use '0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045'." },
     };
     for (compile_fail) |s| {
         const obj = b.addObject(.{
