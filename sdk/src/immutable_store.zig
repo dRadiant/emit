@@ -13,17 +13,22 @@ const std = @import("std");
 
 const event_log_mod = @import("event_log.zig");
 const entity_serial = @import("entity_serial.zig");
+const blob_log_mod = @import("blob_log.zig");
+
+const BlobLog = blob_log_mod.BlobLog;
 
 pub const AppendError = error{ KeyOutOfOrder, OutOfMemory };
 
 pub fn ImmutableStore(comptime T: type) type {
     const fields = @typeInfo(T).@"struct".fields;
     if (fields.len == 0) @compileError("ImmutableStore: entity '" ++ @typeName(T) ++ "' has no fields. The first field must be the primary key.");
+    comptime entity_serial.validate(T);
 
     const KEY_SIZE = entity_serial.fixedSize(fields[0].type, @typeName(T) ++ "." ++ fields[0].name);
     const VALUE_SIZE = entity_serial.entitySize(T);
     const KeyField = fields[0].type;
     const key_field_name = fields[0].name;
+    const HAS_BLOBS = entity_serial.hasBlobs(T);
 
     return struct {
         const Self = @This();
@@ -32,6 +37,7 @@ pub fn ImmutableStore(comptime T: type) type {
         pub const Log = event_log_mod.EventLog(T);
         pub const key_size = KEY_SIZE;
         pub const value_size = VALUE_SIZE;
+        pub const has_blobs = HAS_BLOBS;
 
         allocator: std.mem.Allocator,
         log: *Log,
@@ -48,17 +54,57 @@ pub fn ImmutableStore(comptime T: type) type {
         live_block: u64 = 0,
         block_pending: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(T)) = .{},
 
+        /// `<entity>.blobs.dat` for variable-length fields (ADR-005), owned by
+        /// this store (the borrowed `log` resolves refs against it). Write-once,
+        /// so it never accumulates garbage. `void` for a numeric entity.
+        blob_log: if (HAS_BLOBS) BlobLog else void = if (HAS_BLOBS) undefined else {},
+        /// Backs blob bytes of backfill saves (the append queue), reset at
+        /// `markCommitted`. Live saves use the per-block arenas instead.
+        append_arena: if (HAS_BLOBS) std.heap.ArenaAllocator else void = if (HAS_BLOBS) undefined else {},
+        /// One blob arena per pending block, freed when the block reorgs out.
+        block_arenas: if (HAS_BLOBS) std.AutoHashMapUnmanaged(u64, *std.heap.ArenaAllocator) else void = if (HAS_BLOBS) .{} else {},
+        /// Drained blocks' arenas backing queued records until `markCommitted`.
+        committing_arenas: if (HAS_BLOBS) std.ArrayListUnmanaged(*std.heap.ArenaAllocator) else void = if (HAS_BLOBS) .{} else {},
+
         /// `log` is caller-owned (typically the SDK Context). `deinit` frees
-        /// only this store's buffers, never the log.
+        /// only this store's buffers, never the log. Numeric entities only;
+        /// blob entities use `openWithBlobs`.
         pub fn open(
             allocator: std.mem.Allocator,
             log: *Log,
             initial_count: u64,
         ) !Self {
+            if (comptime HAS_BLOBS) @compileError(
+                "ImmutableStore(" ++ @typeName(T) ++ "): entity has blob fields; use openWithBlobs",
+            );
             var self = Self{
                 .allocator = allocator,
                 .log = log,
                 .committed_count = initial_count,
+            };
+            if (initial_count > 0) self.last_key = try log.readKey(initial_count - 1);
+            return self;
+        }
+
+        /// Open a blob-bearing immutable store, also opening `<name>` in `dir`
+        /// at `committed_blob_len` (from `state.snap.blob_bytes[slot]`).
+        pub fn openWithBlobs(
+            allocator: std.mem.Allocator,
+            log: *Log,
+            initial_count: u64,
+            dir: std.fs.Dir,
+            name: []const u8,
+            committed_blob_len: u64,
+        ) !Self {
+            if (comptime !HAS_BLOBS) @compileError(
+                "ImmutableStore(" ++ @typeName(T) ++ "): entity has no blob fields; use open",
+            );
+            var self = Self{
+                .allocator = allocator,
+                .log = log,
+                .committed_count = initial_count,
+                .blob_log = try BlobLog.open(allocator, dir, name, committed_blob_len),
+                .append_arena = std.heap.ArenaAllocator.init(allocator),
             };
             if (initial_count > 0) self.last_key = try log.readKey(initial_count - 1);
             return self;
@@ -69,6 +115,43 @@ pub fn ImmutableStore(comptime T: type) type {
             var it = self.block_pending.iterator();
             while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
             self.block_pending.deinit(self.allocator);
+            if (comptime HAS_BLOBS) {
+                var ait = self.block_arenas.valueIterator();
+                while (ait.next()) |a| self.destroyArena(a.*);
+                self.block_arenas.deinit(self.allocator);
+                for (self.committing_arenas.items) |a| self.destroyArena(a);
+                self.committing_arenas.deinit(self.allocator);
+                self.append_arena.deinit();
+                self.blob_log.deinit();
+            }
+        }
+
+        fn destroyArena(self: *Self, arena: *std.heap.ArenaAllocator) void {
+            arena.deinit();
+            self.allocator.destroy(arena);
+        }
+
+        /// Copy `entity`'s blob payloads into `a`, repointing each slice.
+        fn ownBlobs(_: *Self, entity: T, a: std.mem.Allocator) !T {
+            var out = entity;
+            inline for (fields) |f| {
+                if (comptime entity_serial.fieldKind(f.type, @typeName(T) ++ "." ++ f.name) == .blob) {
+                    const src = @field(entity, f.name);
+                    if (src.len > 0) @field(out, f.name) = try a.dupe(@typeInfo(f.type).pointer.child, src);
+                }
+            }
+            return out;
+        }
+
+        /// Allocator for `live_block`'s blob arena, created on first save.
+        fn blockArena(self: *Self) !std.mem.Allocator {
+            const gop = try self.block_arenas.getOrPut(self.allocator, self.live_block);
+            if (!gop.found_existing) {
+                const arena = try self.allocator.create(std.heap.ArenaAllocator);
+                arena.* = std.heap.ArenaAllocator.init(self.allocator);
+                gop.value_ptr.* = arena;
+            }
+            return gop.value_ptr.*.allocator();
         }
 
         pub fn save(self: *Self, entity: T) AppendError!void {
@@ -80,12 +163,15 @@ pub fn ImmutableStore(comptime T: type) type {
             self.last_key = key_buf;
 
             if (self.live) {
+                const a = if (comptime HAS_BLOBS) (self.blockArena() catch return error.OutOfMemory) else undefined;
+                const owned = if (comptime HAS_BLOBS) (self.ownBlobs(entity, a) catch return error.OutOfMemory) else entity;
                 const gop = self.block_pending.getOrPut(self.allocator, self.live_block) catch return error.OutOfMemory;
                 if (!gop.found_existing) gop.value_ptr.* = .{};
-                gop.value_ptr.append(self.allocator, entity) catch return error.OutOfMemory;
+                gop.value_ptr.append(self.allocator, owned) catch return error.OutOfMemory;
                 return;
             }
-            self.pending_appended.append(self.allocator, entity) catch return error.OutOfMemory;
+            const owned = if (comptime HAS_BLOBS) (self.ownBlobs(entity, self.append_arena.allocator()) catch return error.OutOfMemory) else entity;
+            self.pending_appended.append(self.allocator, owned) catch return error.OutOfMemory;
         }
 
         /// Immutable entities are never loaded during backfill. A `load` call
@@ -101,17 +187,42 @@ pub fn ImmutableStore(comptime T: type) type {
             const entry = self.block_pending.getPtr(block) orelse return;
             // Reserve capacity before draining so a partial OOM can't strand entries.
             try self.pending_appended.ensureUnusedCapacity(self.allocator, entry.items.len);
+            // The drained records' blob slices reference this block's arena, so
+            // it must outlive the drain until `flushAppends` stages them.
+            if (comptime HAS_BLOBS) {
+                if (self.block_arenas.get(block)) |_| self.committing_arenas.ensureUnusedCapacity(self.allocator, 1) catch return error.OutOfMemory;
+            }
             for (entry.items) |e| self.pending_appended.appendAssumeCapacity(e);
             var removed = self.block_pending.fetchRemove(block).?;
             removed.value.deinit(self.allocator);
+            if (comptime HAS_BLOBS) {
+                if (self.block_arenas.fetchRemove(block)) |kv| self.committing_arenas.appendAssumeCapacity(kv.value);
+            }
         }
 
-        /// Append every queued record to `events.dat`. Caller must then
-        /// `state_snap.commit` to publish the new count, then `markCommitted`
-        /// to advance this store's view.
+        /// Append every queued record to `events.dat`. For a blob entity this
+        /// stages the records' payloads into `blob_log` (the caller flushes it
+        /// before the `state.snap` rename). Caller then `state_snap.commit`s the
+        /// new count, then `markCommitted` advances this store's view.
         pub fn flushAppends(self: *Self) !void {
             if (self.pending_appended.items.len == 0) return;
-            try self.log.append(self.pending_appended.items, self.committed_count);
+            if (comptime HAS_BLOBS) {
+                try self.log.append(self.pending_appended.items, self.committed_count, &self.blob_log);
+            } else {
+                try self.log.append(self.pending_appended.items, self.committed_count, {});
+            }
+        }
+
+        /// Flush staged blob payloads to `blobs.dat` (write + fsync + remap)
+        /// after `flushAppends`, before the `state.snap` rename. No-op numeric.
+        pub fn flushBlobs(self: *Self) !void {
+            if (comptime HAS_BLOBS) try self.blob_log.flush();
+        }
+
+        /// Committed `blobs.dat` payload length for `state.snap.blob_bytes`.
+        pub fn committedBlobLen(self: *const Self) u64 {
+            if (comptime HAS_BLOBS) return self.blob_log.committed_len;
+            return 0;
         }
 
         /// New authoritative count to embed in `state.snap.immutable_counts`.
@@ -123,6 +234,13 @@ pub fn ImmutableStore(comptime T: type) type {
         pub fn markCommitted(self: *Self) void {
             self.committed_count += self.pending_appended.items.len;
             self.pending_appended.clearRetainingCapacity();
+            if (comptime HAS_BLOBS) {
+                // Backfill saves lived in append_arena, drained live blocks in
+                // committing arenas. Both are now durable in blobs.dat.
+                _ = self.append_arena.reset(.retain_capacity);
+                for (self.committing_arenas.items) |a| self.destroyArena(a);
+                self.committing_arenas.clearRetainingCapacity();
+            }
         }
 
         /// Drop the entire overlay. Used on reorg.
@@ -131,6 +249,11 @@ pub fn ImmutableStore(comptime T: type) type {
             while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
             self.block_pending.clearRetainingCapacity();
             self.pending_appended.clearRetainingCapacity();
+            if (comptime HAS_BLOBS) {
+                var ait = self.block_arenas.valueIterator();
+                while (ait.next()) |a| self.destroyArena(a.*);
+                self.block_arenas.clearRetainingCapacity();
+            }
             // last_key remains anchored to whatever is durably committed.
             if (self.committed_count > 0) {
                 self.last_key = self.log.readKey(self.committed_count - 1) catch null;
@@ -151,6 +274,9 @@ pub fn ImmutableStore(comptime T: type) type {
                     if (k.* >= block) {
                         var removed = self.block_pending.fetchRemove(k.*).?;
                         removed.value.deinit(self.allocator);
+                        if (comptime HAS_BLOBS) {
+                            if (self.block_arenas.fetchRemove(k.*)) |kv| self.destroyArena(kv.value);
+                        }
                         continue :outer;
                     }
                 }
@@ -208,7 +334,8 @@ pub fn ImmutableStore(comptime T: type) type {
             var target: [KEY_SIZE]u8 = undefined;
             entity_serial.encodeKey(KeyField, key, &target);
             if (try self.log.binarySearch(self.committed_count, target)) |idx| {
-                return try self.log.read(idx);
+                if (comptime HAS_BLOBS) return try self.log.read(idx, self.blob_log.map_bytes());
+                return try self.log.read(idx, {});
             }
             return self.overlayGet(&target);
         }
@@ -229,7 +356,7 @@ pub fn ImmutableStore(comptime T: type) type {
             if (i < self.committed_count) {
                 const fin_end = @min(end, self.committed_count);
                 n = @intCast(fin_end - i);
-                try self.log.readRange(i, out[0..n]);
+                if (comptime HAS_BLOBS) try self.log.readRange(i, out[0..n], self.blob_log.map_bytes()) else try self.log.readRange(i, out[0..n], {});
                 i = fin_end;
             }
             if (i >= end) return out[0..n];
@@ -357,7 +484,7 @@ test "flushAppends + markCommitted advance the durable count" {
     try testing.expectEqual(@as(u32, 0), store.pendingCount());
 
     // Records readable via the log.
-    const got = try log.read(0);
+    const got = try log.read(0, {});
     try testing.expectEqual(@as(u64, 100), got.value);
 }
 
@@ -578,4 +705,89 @@ test "count, get, range span the finalized log and the live overlay" {
 
     // Out-of-range start yields an empty slice.
     try testing.expectEqual(@as(usize, 0), (try store.range(99, &buf)).len);
+}
+
+// ── Blob fields (ADR-005) ──────────────────────────────────────────────────
+
+const NamedEvent = struct { id: [8]u8, label: []const u8 };
+
+fn nameId(n: u8) [8]u8 {
+    return [_]u8{ 0, 0, 0, 0, 0, 0, 0, n };
+}
+
+test "immutable blob: append, flush, get + range resolve; persists across reopen" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var blob_len: u64 = 0;
+    {
+        var log = try event_log_mod.EventLog(NamedEvent).open(alloc, tmp.dir, "named.events.dat");
+        defer log.deinit();
+        var store = try ImmutableStore(NamedEvent).openWithBlobs(alloc, &log, 0, tmp.dir, "named.blobs.dat", 0);
+        defer store.deinit();
+
+        try store.save(.{ .id = nameId(1), .label = "alpha" });
+        try store.save(.{ .id = nameId(2), .label = "" });
+        try store.save(.{ .id = nameId(3), .label = "gamma-longer-name" });
+
+        // Read-your-writes from the overlay before commit.
+        try testing.expectEqualSlices(u8, "alpha", (try store.get(nameId(1))).?.label);
+
+        // Commit cycle: stage (flushAppends) → write blobs → advance count.
+        try store.flushAppends();
+        try store.flushBlobs();
+        store.markCommitted();
+        try testing.expectEqual(@as(u64, 3), store.committed_count);
+
+        // Finalized reads resolve from events.dat + blobs.dat.
+        try testing.expectEqualSlices(u8, "alpha", (try store.get(nameId(1))).?.label);
+        try testing.expectEqual(@as(usize, 0), (try store.get(nameId(2))).?.label.len);
+        try testing.expectEqualSlices(u8, "gamma-longer-name", (try store.get(nameId(3))).?.label);
+
+        var buf: [4]NamedEvent = undefined;
+        const all = try store.range(0, &buf);
+        try testing.expectEqual(@as(usize, 3), all.len);
+        try testing.expectEqualSlices(u8, "alpha", all[0].label);
+        try testing.expectEqualSlices(u8, "gamma-longer-name", all[2].label);
+        blob_len = store.committedBlobLen();
+    }
+
+    // Reopen at the committed count + blob length: blobs persist.
+    var log = try event_log_mod.EventLog(NamedEvent).open(alloc, tmp.dir, "named.events.dat");
+    defer log.deinit();
+    var store = try ImmutableStore(NamedEvent).openWithBlobs(alloc, &log, 3, tmp.dir, "named.blobs.dat", blob_len);
+    defer store.deinit();
+    try testing.expectEqualSlices(u8, "gamma-longer-name", (try store.get(nameId(3))).?.label);
+}
+
+test "immutable blob live: per-block overlay, commit, reorg frees the arena" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var log = try event_log_mod.EventLog(NamedEvent).open(alloc, tmp.dir, "named.events.dat");
+    defer log.deinit();
+    var store = try ImmutableStore(NamedEvent).openWithBlobs(alloc, &log, 0, tmp.dir, "named.blobs.dat", 0);
+    defer store.deinit();
+    store.live = true;
+
+    store.live_block = 100;
+    try store.save(.{ .id = nameId(1), .label = "block-100" });
+    store.live_block = 101;
+    try store.save(.{ .id = nameId(2), .label = "block-101" });
+    // Overlay read before any commit.
+    try testing.expectEqualSlices(u8, "block-100", (try store.get(nameId(1))).?.label);
+
+    // Finalize block 100, commit it (drains via the committing arena).
+    try store.commitBlock(100);
+    try store.flushAppends();
+    try store.flushBlobs();
+    store.markCommitted();
+    try testing.expectEqualSlices(u8, "block-100", (try store.get(nameId(1))).?.label);
+
+    // Reorg block 101: its arena + overlay drop (leak checker verifies).
+    store.discardFrom(101);
+    try testing.expectEqual(@as(?NamedEvent, null), try store.get(nameId(2)));
+    store.discardAll();
 }

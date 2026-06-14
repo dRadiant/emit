@@ -812,11 +812,23 @@ pub fn init(
                 mut_slot += 1;
             } else {
                 const log_ptr = &@field(ctx._event_logs, field_name);
-                @field(ctx.stores, field_name) = try immutable_store_mod.ImmutableStore(T).open(
-                    allocator,
-                    log_ptr,
-                    ctx._state_snap.immutableCount(imm_slot),
-                );
+                if (comptime entity_serial.hasBlobs(T)) {
+                    @field(ctx.stores, field_name) = try immutable_store_mod.ImmutableStore(T).openWithBlobs(
+                        allocator,
+                        log_ptr,
+                        ctx._state_snap.immutableCount(imm_slot),
+                        entity_dh,
+                        comptime field_name ++ ".blobs.dat",
+                        ctx._state_snap.blobBytes(blob_slot),
+                    );
+                    blob_slot += 1;
+                } else {
+                    @field(ctx.stores, field_name) = try immutable_store_mod.ImmutableStore(T).open(
+                        allocator,
+                        log_ptr,
+                        ctx._state_snap.immutableCount(imm_slot),
+                    );
+                }
                 imm_slot += 1;
             }
         }
