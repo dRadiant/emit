@@ -9,10 +9,18 @@ const m = @import("manifest.zig");
 const Ctx = sdk.Context(@import("entities.zig"));
 
 pub fn handleNameRegistered(log: sdk.Log(m.NameRegistered), ctx: *Ctx) !void {
+    // Mutable: latest name per label.
     try ctx.stores.registrations.save(.{
         .id = log.params.label,
         .owner = log.params.owner,
         .expires = log.params.expires,
+        .name = log.params.name,
+    });
+    // Immutable: append-only log of every registration, keyed by event id
+    // (monotonic in dispatch order). Same blob field on the append path.
+    try ctx.stores.registrationLogs.save(.{
+        .id = log.eventId(),
+        .owner = log.params.owner,
         .name = log.params.name,
     });
 }
