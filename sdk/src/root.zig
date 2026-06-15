@@ -50,7 +50,14 @@ pub const PrefetchDef = manifest.PrefetchDef;
 pub const run = entry.run;
 pub const spawn = entry.spawn;
 pub const RunStats = entry.RunStats;
+pub const printStats = entry.printStats;
 pub const StaticCall = manifest.StaticCall;
+/// The owning transaction's fields behind `log.tx` (ADR-006), on events
+/// declaring `pub const tx_fields = true;`.
+pub const Tx = handler.Tx;
+/// Leveled CLI output, shared with the engine. Set via `log.setLevel` from the
+/// indexer's `--silent` / `--verbose` flags.
+pub const log = @import("core").log;
 
 /// Storage mode declared per-entity via `pub const storage: sdk.StorageMode`.
 /// `mutable` -> MutableStore (HashMap-fronted, dirty-flag flush, supports
@@ -62,10 +69,12 @@ pub const StaticCall = manifest.StaticCall;
 pub const StorageMode = enum { mutable, immutable };
 
 /// Parse a 20-byte Ethereum address from hex at compile time.
-/// Optional `0x` prefix. Any uppercase hex digit makes the input an
-/// EIP-55 checksum, rejected at compile time on mismatch. All-lowercase
-/// or all-uppercase skips checksum validation (EIP-55 uses mixed case as
-/// the validation signal).
+/// Optional `0x` prefix. The EIP-55 mixed-case checksum is **required** and
+/// verified at compile time: a manifest address is a write-once, security-
+/// critical literal, so a typo must fail the build rather than silently match
+/// no logs. An all-lowercase or all-uppercase form (which makes no checksum
+/// claim) is rejected unless it happens to be the checksummed form. The error
+/// prints the correct address to paste.
 ///
 /// Manifest call site:
 /// `.address = sdk.address("0xae78736Cd615f374D3085123A210448E74Fc6393")`.
@@ -75,26 +84,16 @@ pub fn address(comptime hex: []const u8) [20]u8 {
             "sdk.address: failed to parse '" ++ hex ++ "': " ++ @errorName(err),
         );
 
-        // Mixed case is the EIP-55 signal. All-lower or all-upper opts out
-        // of the checksum check.
+        // checksum is "0x" + 40 hex chars. Compare against the body so the
+        // match holds whether or not the input carried a "0x" prefix.
         const body: []const u8 = if (hex.len >= 2 and hex[0] == '0' and (hex[1] == 'x' or hex[1] == 'X'))
             hex[2..]
         else
             hex;
-        var has_upper = false;
-        var has_lower = false;
-        for (body) |c| {
-            if (c >= 'a' and c <= 'f') has_lower = true;
-            if (c >= 'A' and c <= 'F') has_upper = true;
-        }
-        if (has_upper and has_lower) {
-            const checksum = eth.primitives.addressToChecksum(&parsed);
-            // checksum is "0x" + 40 hex chars. Compare against body so the
-            // match holds whether or not the input had a "0x" prefix.
-            if (!std.mem.eql(u8, body, checksum[2..])) @compileError(
-                "sdk.address: '" ++ hex ++ "' fails EIP-55 checksum. Expected '" ++ checksum ++ "'.",
-            );
-        }
+        const checksum = eth.primitives.addressToChecksum(&parsed);
+        if (!std.mem.eql(u8, body, checksum[2..])) @compileError(
+            "sdk.address: '" ++ hex ++ "' is not EIP-55 checksummed. Use '" ++ checksum ++ "'.",
+        );
         break :blk parsed;
     };
 }
@@ -188,6 +187,7 @@ test {
     _ = state_snap;
     _ = tcp_client;
     _ = event_log;
+    _ = @import("blob_log.zig");
     _ = entry;
     // Test-only fixture.
     _ = @import("testing/fake_engine.zig");
@@ -212,19 +212,18 @@ test "concat builds owner+spender allowance key" {
     try std.testing.expectEqualSlices(u8, &spender, key[20..40]);
 }
 
-test "address parses lowercase, EIP-55, and rejects bad checksum" {
-    // EIP-55 checksum (vitalik.eth).
+test "address requires the EIP-55 checksum, with or without the 0x prefix" {
+    // EIP-55 checksummed (vitalik.eth).
     const a = address("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045");
     try std.testing.expectEqual(@as(u8, 0xd8), a[0]);
     try std.testing.expectEqual(@as(u8, 0x45), a[19]);
 
-    // All-lowercase skips the checksum check.
-    const b = address("0xd8da6bf26964af9d7eed9e03e53415d37aa96045");
-    try std.testing.expectEqualSlices(u8, &a, &b);
-
-    // No-prefix lowercase also accepted.
-    const c = address("d8da6bf26964af9d7eed9e03e53415d37aa96045");
+    // Same checksum, no prefix.
+    const c = address("d8dA6BF26964aF9D7eEd9e03E53415D37aA96045");
     try std.testing.expectEqualSlices(u8, &a, &c);
+
+    // A non-checksummed (all-lowercase) literal is a compile error, covered by
+    // test/compile_fail/address_not_checksummed.zig.
 }
 
 test "storeFor picks MutableStore vs ImmutableStore by entity.storage" {

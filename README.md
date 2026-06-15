@@ -2,6 +2,10 @@
 
 Event Materialization & Indexing Toolkit
 
+![EMIT building a filtered index over rETH's full history, then replaying 1.25M logs in under 3s](docs/assets/demo.gif)
+
+*Full rETH backfill over the Engine's flat store (~15s, the Merge to chain tip), then a warm handler re-run replaying 1.25M logs in under 3s. Real timings, recorded against a live mainnet node.*
+
 ## What is EMIT?
 
 EMIT is an EVM indexer rooted in a no compromise ethos of free software. Achieving frontier performance, without compromising on freedom.
@@ -26,7 +30,7 @@ EMIT Indexers then read that store and produce whatever entities your applicatio
 - **Multi-chain by composition.** One engine per chain, one indexer binary per chain. Cross-chain joins are application-level.
 - **You own the API.** EMIT fills entity stores. Your choice is to serve them via REST, GraphQL, WebSocket, or raw memory map.
 
-Currently requires the Execution Client, Engine, and Indexer to be collocated on the same machine. This will change with the introduction of remote engine TCP streaming in v1.1.0, allowing indexers to be remote.
+The Execution Client and Engine live on the same machine; Indexers can run anywhere since v1.1.0's remote engine TCP streaming.
 
 ## Quickstart
 
@@ -130,7 +134,7 @@ $170/month Hetzner dedicated server (i9-13900, 128GB DDR5 ECC, 2x 2TB Gen4 U.2 N
 
 ## Status
 
-**v1.1.0** EMIT is not yet fully production ready, and is still under active development. Use at your own risk, and expect breaking changes.
+**v1.2.0** EMIT is not yet fully production ready, and is still under active development. Use at your own risk, and expect breaking changes.
 
 ## Packages
 
@@ -167,7 +171,7 @@ A dedicated migration guide is planned for the future. Until then, the example i
 ## Documentation
 
 - `docs/` — contains documentation, architecture, and technical documents. (TBA)
-- [`docs/adr/`](docs/adr/) — architectural decision records (pending block storage, filtered-index format, SDK storage, ethcall strictness)
+- [`docs/adr/`](docs/adr/) — architectural decision records (pending block storage, filtered-index format, SDK storage, ethcall strictness, entity blobs, tx fields, chained prefetch)
 - [`core/README.md`](core/README.md), [`engine/README.md`](engine/README.md), [`sdk/README.md`](sdk/README.md) — per-package orientation
 - [`examples/`](examples/) — runnable reference indexers with their own READMEs
 - [`CHANGELOG.md`](CHANGELOG.md) — release history

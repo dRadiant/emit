@@ -1,7 +1,7 @@
-/// Watching the engine's head. Read the pending ring, diff successive snapshots
-/// into new/finalized/reorged buckets, and wake on ring updates via inotify.
-/// Shared by the sdk live loop and the engine's remote streaming server, which
-/// both tail `pending.bin` the same way.
+//! Watching the engine's head. Read the pending ring, diff successive snapshots
+//! into new/finalized/reorged buckets, and wake on ring updates via inotify.
+//! Shared by the sdk live loop and the engine's remote streaming server, which
+//! both tail `pending.bin` the same way.
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -47,7 +47,10 @@ pub fn readPending(allocator: std.mem.Allocator, engine_data_dir: []const u8) !P
     errdefer allocator.free(buf);
     _ = try file.readAll(buf);
 
-    const entries = pending_format.parse(allocator, buf) catch |err| switch (err) {
+    // Validated parse: `classifyChanges` indexes the ring as a sorted dense
+    // array, so a non-dense or oversized ring would silently misclassify
+    // finalized vs reorged blocks. Structural corruption fails loud.
+    const entries = pending_format.parseValidated(allocator, buf) catch |err| switch (err) {
         // An old (pre-magic) or unrecognized pending.bin reads as empty. The
         // engine rewrites it in the current format on its next ingest. Genuine
         // truncation of a current-format file still surfaces.
@@ -58,6 +61,28 @@ pub fn readPending(allocator: std.mem.Allocator, engine_data_dir: []const u8) !P
         else => return err,
     };
     return .{ .buf = buf, .entries = entries };
+}
+
+/// Build a `prev` seed for the live loop holding only entries at or below
+/// `bound`. `classifyChanges` reads just `block_number` and `hash` from `prev`,
+/// so the lz4 payload is dropped (left empty) and `buf` is unused. The pending
+/// ring holds the pre-finalization window above the committed cursor, and those
+/// blocks must surface as new on the first tick. Seeding `prev` with the whole
+/// ring hides them. The diff sees no new tail, so they are never dispatched and
+/// are silently skipped when they later finalize past the cursor.
+pub fn snapshotUpTo(allocator: std.mem.Allocator, src: PendingSnapshot, bound: u64) !PendingSnapshot {
+    var k: usize = 0;
+    while (k < src.entries.len and src.entries[k].block_number <= bound) : (k += 1) {}
+    if (k == 0) return PendingSnapshot{ .buf = &.{}, .entries = &.{} };
+
+    const entries = try allocator.alloc(Entry, k);
+    for (entries, src.entries[0..k]) |*dst, s| {
+        dst.* = s;
+        // prev's payload is never read. Drop the alias into src.buf so the seed
+        // owns nothing and stays valid after the source snapshot is freed.
+        dst.lz4_entry = &.{};
+    }
+    return .{ .buf = &.{}, .entries = entries };
 }
 
 /// Missing or malformed meta degrades to 0. Safe default for `classifyChanges`
@@ -353,6 +378,22 @@ test "classifyChanges: identical snapshots produce no work" {
     try testing.expectEqual(@as(usize, 0), c.new_blocks.len);
     try testing.expectEqual(@as(usize, 0), c.finalized.len);
     try testing.expectEqual(@as(usize, 0), c.reorged_out.len);
+}
+
+test "snapshotUpTo keeps only entries at or below the bound" {
+    const full = [_]Entry{ mkEntry(100, 0xAA), mkEntry(101, 0xAA), mkEntry(102, 0xAA) };
+    const src = PendingSnapshot{ .buf = &.{}, .entries = @constCast(full[0..]) };
+
+    // Bound below the ring keeps nothing. The whole ring is backlog to dispatch.
+    var none = try snapshotUpTo(testing.allocator, src, 99);
+    defer none.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), none.entries.len);
+
+    // Bound inside the ring keeps the covered prefix only.
+    var some = try snapshotUpTo(testing.allocator, src, 101);
+    defer some.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), some.entries.len);
+    try testing.expectEqual(@as(u64, 101), some.entries[1].block_number);
 }
 
 test "Watcher.wait honors timeout when no event arrives" {

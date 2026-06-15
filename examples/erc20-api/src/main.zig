@@ -12,6 +12,7 @@
 ///   GET /allowance/:owner/:spender    allowance (mutable point read)
 ///   GET /transfers?limit=&offset=     newest-first transfer page (immutable range)
 const std = @import("std");
+const builtin = @import("builtin");
 const sdk = @import("sdk");
 const httpz = @import("httpz");
 const cli = @import("cli");
@@ -27,13 +28,20 @@ const Ctx = sdk.Context(e);
 const App = struct { ctx: *Ctx };
 
 pub fn main() !void {
+    // Same split as `cli.run`: DebugAllocator catches leaks in dev builds,
+    // smp_allocator drops the safety bookkeeping in ReleaseFast serving.
+    const dev = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
     var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = if (comptime dev) gpa.allocator() else std.heap.smp_allocator;
+    defer if (comptime dev) {
+        _ = gpa.deinit();
+    } else {
+        _ = &gpa;
+    };
 
     // Shared flag parser handles standard dirs + node RPC. The API-only
     // `--port` (default 8080) is pulled from argv separately.
-    const args = try cli.parseStandardArgs(allocator, "erc20-api");
+    const args = try cli.parseStandardArgs(allocator, "erc20-api", &.{"--port"});
     defer allocator.free(args.engine_data_dir);
     defer allocator.free(args.data_dir);
     defer if (args.node_rpc) |s| allocator.free(s);
@@ -57,7 +65,7 @@ pub fn main() !void {
     router.get("/allowance/:owner/:spender", allowance, .{});
     router.get("/transfers", transfers, .{});
 
-    std.debug.print("erc20-api serving on http://127.0.0.1:{d}\n", .{port});
+    sdk.log.info("erc20-api serving on http://127.0.0.1:{d}\n", .{port});
     try server.listen();
 }
 
@@ -112,7 +120,9 @@ fn transfers(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const n: usize = @intCast(@min(limit, remaining));
 
     var buf: [100]e.Transfer = undefined;
-    const start = total - offset - n; // ascending index of the window's oldest
+    // `remaining` is already clamped to 0, so this cannot underflow on an
+    // untrusted `offset > total`. Same value as `total - offset - n` when valid.
+    const start = remaining - n;
     const window = try app.ctx.range(e.Transfer, start, buf[0..n]);
 
     // `EventId.unpack` decodes the packed key back into its coordinates.

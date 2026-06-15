@@ -38,6 +38,10 @@ pub const RunOptions = struct {
     multicall_batch_size: usize = ethcall.DEFAULT_BATCH_SIZE,
 };
 
+/// Liveness heartbeat cadence in finalized blocks. ~300 × 12 s ≈ hourly,
+/// matching the engine follower's cadence.
+const HEARTBEAT_BLOCKS: u64 = 300;
+
 /// Resources that persist across ticks: watcher, last-seen pending
 /// snapshot, per-block decompress + log buffers. Held here so `tick`
 /// doesn't reallocate per call. `run` constructs one session and loops.
@@ -49,16 +53,27 @@ const LiveSession = struct {
     prev: head_watch.PendingSnapshot,
     decompress_buf: []u8,
     log_buf: []core.RawLog,
+    /// TxRecord scratch for tx-enabled manifests, lazily allocated on the
+    /// first dispatch (init does not see the manifest). Empty stays empty
+    /// for tx-blind manifests.
+    tx_buf: []core.txs.TxRecord = &.{},
     /// Optional Multicall3 for per-block prefetch of factory children.
     /// Null leaves uncached calls to surface as `error.NotPrefetched`.
     multicall: ?*eth.multicall.Multicall = null,
     multicall_batch_size: usize = ethcall.DEFAULT_BATCH_SIZE,
 
-    pub fn init(allocator: std.mem.Allocator, engine_data_dir: []const u8) !LiveSession {
+    /// `cursor` is the context's last-dispatched block (the committed
+    /// `state.snap` tip). `prev` is seeded with only the pending entries at or
+    /// below it, so the pre-finalization window already sitting in the ring at
+    /// startup dispatches as new on the first tick instead of being silently
+    /// dropped when it finalizes.
+    pub fn init(allocator: std.mem.Allocator, engine_data_dir: []const u8, cursor: u64) !LiveSession {
         var watcher = try head_watch.Watcher.init(engine_data_dir);
         errdefer watcher.deinit();
 
-        var prev = try head_watch.readPending(allocator, engine_data_dir);
+        var full = try head_watch.readPending(allocator, engine_data_dir);
+        defer full.deinit(allocator);
+        var prev = try head_watch.snapshotUpTo(allocator, full, cursor);
         errdefer prev.deinit(allocator);
 
         const decompress_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
@@ -77,6 +92,7 @@ const LiveSession = struct {
     }
 
     pub fn deinit(self: *LiveSession) void {
+        if (self.tx_buf.len > 0) self.allocator.free(self.tx_buf);
         self.allocator.free(self.log_buf);
         self.allocator.free(self.decompress_buf);
         self.prev.deinit(self.allocator);
@@ -114,7 +130,14 @@ const LiveSession = struct {
         // Promote first so a finalized block's overlay slice is committed
         // through state.snap before this tick's dispatches could overwrite
         // its tag.
+        const cursor_before = cursorOf(ctx);
         try promoteFinalized(ctx, classification.finalized);
+
+        // Liveness heartbeat on a finalization boundary crossing, mirroring
+        // the engine's cadence, so a default-level follow is visibly alive.
+        const cursor_after = cursorOf(ctx);
+        if (cursor_before > 0 and cursor_before / HEARTBEAT_BLOCKS != cursor_after / HEARTBEAT_BLOCKS)
+            core.log.info("{s}: finalized through block {d}\n", .{ m.name, cursor_after });
 
         if (classification.reorg_from != null or classification.reorged_out.len > 0) {
             if (classification.reorg_from) |rf| {
@@ -152,6 +175,16 @@ const LiveSession = struct {
             log.block_number = entry.block_number;
         }
 
+        // Tx-fields carry. The pending entry holds the block's full table
+        // (the follower fetches it per block). An absent table means the
+        // engine follows with --no-tx-fields, fail loud via Truncated.
+        var tx_records: []const core.txs.TxRecord = &.{};
+        if (comptime sdk_manifest.wantsTxFields(m)) {
+            if (self.tx_buf.len == 0)
+                self.tx_buf = try self.allocator.alloc(core.txs.TxRecord, core.txs.MAX_RECORDS);
+            tx_records = try core.txs.deserializeRecords(entry.tx_table, self.tx_buf);
+        }
+
         // Pending blocks are raw. Unlike the backfill path, nothing filtered
         // them by address. Discover factory children spawned in this block
         // first (a create-event is emitted by the factory, which always
@@ -180,7 +213,11 @@ const LiveSession = struct {
             humanize.timestampOf(ctx, entry.block_number);
 
         for (self.log_buf[0..keep]) |log| {
-            try handler_mod.dispatchLog(m, Handler, ctx, log);
+            const tx: ?*const core.txs.TxRecord = if (comptime sdk_manifest.wantsTxFields(m))
+                core.txs.find(tx_records, log.tx_index) orelse return error.MissingTxRecord
+            else
+                null;
+            try handler_mod.dispatchLog(m, Handler, ctx, log, tx);
         }
     }
 
@@ -232,10 +269,14 @@ const LiveSession = struct {
         }
     }
 
-    /// Gather → dedupe → filterUncached → preload. Skips when the manifest
-    /// declares no prefetch, when ctx has no cache (counter-shaped tests),
-    /// or when the block has no matching factory events. Missing entries
-    /// surface as `error.NotPrefetched` in handlers when multicall is null.
+    /// Bounded multi-round prefetch for one block. Each round gathers →
+    /// dedupes → drops cached → preloads, so round `k+1` resolves chained
+    /// `.of`/`.of_return` targets the prior round cached. Round cap is the
+    /// manifest's deepest chain (1 when none chain, the unchained fast path).
+    /// Skips when the manifest declares no prefetch, ctx has no cache
+    /// (counter-shaped tests), or multicall is null (no RPC, handlers then
+    /// see `error.NotPrefetched`). Per-round arena reset frees each round's
+    /// gather before the next.
     fn maybePrefetchBlock(
         self: *LiveSession,
         comptime m: sdk_manifest.Manifest,
@@ -246,20 +287,23 @@ const LiveSession = struct {
         const T = std.meta.Child(@TypeOf(ctx));
         if (comptime !@hasField(T, "_cache")) return;
         const cache = ctx._cache orelse return;
+        const mc = self.multicall orelse return;
+        const max_rounds = comptime sdk_manifest.prefetchMaxDepth(m);
 
         var arena_state = std.heap.ArenaAllocator.init(ctx._allocator);
         defer arena_state.deinit();
-        const arena = arena_state.allocator();
 
-        const calls = try prefetch.gatherOneBlock(arena, logs, m);
-        if (calls.len == 0) return;
+        var round: usize = 0;
+        while (round < max_rounds) : (round += 1) {
+            _ = arena_state.reset(.retain_capacity);
+            const arena = arena_state.allocator();
 
-        const unique = try prefetch.dedupe(arena, calls);
-        const missing = try prefetch.filterUncached(arena, cache, unique);
-        if (missing.len == 0) return;
-
-        const mc = self.multicall orelse return;
-        try cache.preload(ctx._allocator, mc, missing, self.multicall_batch_size);
+            const calls = try prefetch.gatherOneBlock(arena, logs, m, cache);
+            const unique = try prefetch.dedupe(arena, calls);
+            const missing = try prefetch.filterUncached(arena, cache, unique);
+            if (missing.len == 0) break;
+            try cache.preload(ctx._allocator, mc, missing, self.multicall_batch_size);
+        }
     }
 };
 
@@ -273,16 +317,21 @@ pub fn promoteFinalized(ctx: anytype, finalized: []const u64) !void {
     const T = std.meta.Child(@TypeOf(ctx));
     if (comptime !@hasField(T, "stores")) return;
     const Stores = @FieldType(T, "stores");
+    // Drain every finalized block's overlay into the dirty cache first, then
+    // flush the batch with one `commitCycle`. Blocks arrive ascending and
+    // `commitBlock` is newest-wins, so the accumulated cache equals the newest
+    // finalized state. One state.snap rewrite + rename for the batch, not one
+    // per block.
     for (finalized) |block| {
         inline for (std.meta.fields(Stores)) |f| {
             try @field(ctx.stores, f.name).commitBlock(block);
         }
-        if (comptime @hasField(T, "_last_dispatched_block")) {
-            ctx._last_dispatched_block = block;
-        }
-        if (comptime @hasDecl(T, "commitCycle")) {
-            try ctx.commitCycle();
-        }
+    }
+    if (comptime @hasField(T, "_last_dispatched_block")) {
+        ctx._last_dispatched_block = finalized[finalized.len - 1];
+    }
+    if (comptime @hasDecl(T, "commitCycle")) {
+        try ctx.commitCycle();
     }
 }
 
@@ -297,7 +346,7 @@ pub fn run(
 
     enter(ctx);
 
-    var session = try LiveSession.init(ctx._allocator, options.engine_data_dir);
+    var session = try LiveSession.init(ctx._allocator, options.engine_data_dir, cursorOf(ctx));
     defer session.deinit();
     session.multicall = options.multicall;
     session.multicall_batch_size = options.multicall_batch_size;
@@ -305,6 +354,14 @@ pub fn run(
     while (!stopRequested(ctx)) {
         try session.tick(m, Handler, ctx, options.tick_timeout_ms);
     }
+}
+
+/// Committed cursor (last-dispatched block) used to seed the live session's
+/// `prev`. Counter-shaped test contexts without the field start from 0.
+fn cursorOf(ctx: anytype) u64 {
+    const T = std.meta.Child(@TypeOf(ctx));
+    if (comptime @hasField(T, "_last_dispatched_block")) return ctx._last_dispatched_block;
+    return 0;
 }
 
 /// `deinit` sets `_stop`. The loop exits within one `tick`. Test contexts have
@@ -435,10 +492,9 @@ test "tick dispatches a pending block ingested by FakeEngine" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const engine_path = try engine_tmp.dir.realpath(".", &path_buf);
 
-    // Session must initialize BEFORE the ingest so its `prev` snapshot
-    // starts empty. Otherwise the planted block would already be in
-    // `prev` and the diff would report no new blocks.
-    var session = try LiveSession.init(testing.allocator, engine_path);
+    // Cursor 0: nothing dispatched yet, so the session seeds an empty `prev`
+    // and a block arriving after init is new.
+    var session = try LiveSession.init(testing.allocator, engine_path, 0);
     defer session.deinit();
 
     const ALICE: [20]u8 = [_]u8{0xA1} ** 20;
@@ -453,6 +509,90 @@ test "tick dispatches a pending block ingested by FakeEngine" {
     try testing.expectEqual(@as(u64, 100), runner.block_number);
 }
 
+test "tick with tx_fields resolves the dispatched log's TxRecord from the pending table" {
+    var engine_tmp = testing.tmpDir(.{});
+    defer engine_tmp.cleanup();
+    var fake = fake_engine.FakeEngine.init(engine_tmp.dir, testing.allocator);
+    defer fake.deinit();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const engine_path = try engine_tmp.dir.realpath(".", &path_buf);
+
+    var session = try LiveSession.init(testing.allocator, engine_path, 0);
+    defer session.deinit();
+
+    const TxTestTransfer = struct {
+        pub const signature = "Transfer(address,address,uint256)";
+        pub const tx_fields = true;
+    };
+    const TxManifest: sdk_manifest.Manifest = .{
+        .name = "live-tx",
+        .chain_id = 1,
+        .start_block = 0,
+        .contracts = &.{.{ .name = "T", .address = TEST_CONTRACT, .events = &.{TxTestTransfer} }},
+    };
+    const TxRunner = struct {
+        _allocator: std.mem.Allocator,
+        block_number: u64 = 0,
+        timestamp: u64 = 0,
+        seen_tx: ?handler_mod.Tx = null,
+        _last_dispatched_block: u64 = 0,
+
+        pub fn handleTransfer(log: handler_mod.Log(TxTestTransfer), self: *@This()) !void {
+            self.seen_tx = log.tx;
+        }
+    };
+
+    var data_buf: [32]u8 = undefined;
+    var log = makeTransferLog([_]u8{0} ** 20, [_]u8{0xA1} ** 20, 100, &data_buf);
+    log.tx_index = 3;
+    // Table holds tx 1 and tx 3, dispatch must resolve 3.
+    const records = [_]core.txs.TxRecord{
+        .{ .tx_index = 1, .tx_type = 2, .flags = 0, .from = [_]u8{0xAA} ** 20, .to = [_]u8{0xAB} ** 20, .value = [_]u8{0} ** 32 },
+        .{ .tx_index = 3, .tx_type = 2, .flags = 0, .from = [_]u8{0x33} ** 20, .to = [_]u8{0x34} ** 20, .value = [_]u8{7} ++ [_]u8{0} ** 31 },
+    };
+    try fake.ingestWithTxs(100, [_]u8{0xAA} ** 32, &.{log}, &records);
+
+    var runner = TxRunner{ ._allocator = testing.allocator };
+    try session.tick(TxManifest, TxRunner, &runner, 200);
+
+    try testing.expect(runner.seen_tx != null);
+    try testing.expectEqualSlices(u8, &([_]u8{0x33} ** 20), &runner.seen_tx.?.from);
+    try testing.expectEqualSlices(u8, &([_]u8{0x34} ** 20), &runner.seen_tx.?.to.?);
+    try testing.expectEqual(@as(u256, 7), runner.seen_tx.?.value);
+}
+
+test "tick dispatches a pending backlog already in the ring at session init" {
+    // Regression for silent follow-startup loss: when a local indexer starts
+    // following, the engine's pending ring already holds the pre-finalization
+    // window. Those blocks sit above the committed cursor (0 here) and must
+    // dispatch on the first tick. Seeding `prev` with the full ring used to
+    // hide them, and they vanished when they later finalized past the cursor.
+    var engine_tmp = testing.tmpDir(.{});
+    defer engine_tmp.cleanup();
+    var fake = fake_engine.FakeEngine.init(engine_tmp.dir, testing.allocator);
+    defer fake.deinit();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const engine_path = try engine_tmp.dir.realpath(".", &path_buf);
+
+    // Ingest BEFORE the session initializes: the ring is already populated.
+    const ALICE: [20]u8 = [_]u8{0xA1} ** 20;
+    var d0: [32]u8 = undefined;
+    var d1: [32]u8 = undefined;
+    try fake.ingest(100, [_]u8{0xAA} ** 32, &.{makeTransferLog([_]u8{0} ** 20, ALICE, 1, &d0)});
+    try fake.ingest(101, [_]u8{0xAB} ** 32, &.{makeTransferLog([_]u8{0} ** 20, ALICE, 1, &d1)});
+
+    var session = try LiveSession.init(testing.allocator, engine_path, 0);
+    defer session.deinit();
+
+    var runner = TestRunner{ ._allocator = testing.allocator };
+    try session.tick(TestManifest, TestRunner, &runner, 200);
+
+    try testing.expectEqual(@as(u32, 2), runner.transfers);
+    try testing.expectEqual(@as(u64, 101), runner.block_number);
+}
+
 test "tick drops a pending log whose emitter is not in the manifest" {
     // Regression: foreign emitters must be rejected. A raw pending block can
     // carry Ethereum-wide ERC-20 Transfers. Only manifest contracts dispatch.
@@ -464,7 +604,7 @@ test "tick drops a pending log whose emitter is not in the manifest" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const engine_path = try engine_tmp.dir.realpath(".", &path_buf);
 
-    var session = try LiveSession.init(testing.allocator, engine_path);
+    var session = try LiveSession.init(testing.allocator, engine_path, 0);
     defer session.deinit();
 
     const ALICE: [20]u8 = [_]u8{0xA1} ** 20;
@@ -523,7 +663,7 @@ test "tick discovers a factory child spawned live and dispatches its events" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const engine_path = try engine_tmp.dir.realpath(".", &path_buf);
 
-    var session = try LiveSession.init(testing.allocator, engine_path);
+    var session = try LiveSession.init(testing.allocator, engine_path, 0);
     defer session.deinit();
 
     // Empty runtime child set. The child is unknown until the create-event in
@@ -619,7 +759,7 @@ test "tick routes saves through the per-block overlay, not the slab" {
 
     enter(ctx);
 
-    var session = try LiveSession.init(testing.allocator, engine_path);
+    var session = try LiveSession.init(testing.allocator, engine_path, 0);
     defer session.deinit();
 
     // Three pending blocks, each crediting a different recipient.
@@ -664,7 +804,7 @@ test "reorg recovery drops overlay and re-dispatches fresh pending" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const engine_path = try engine_tmp.dir.realpath(".", &path_buf);
 
-    var session = try LiveSession.init(testing.allocator, engine_path);
+    var session = try LiveSession.init(testing.allocator, engine_path, 0);
     defer session.deinit();
 
     var runner = TestRunner{ ._allocator = testing.allocator };
@@ -697,7 +837,7 @@ test "reorg below the cursor raises ReorgExceedsFinalityDepth" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const engine_path = try engine_tmp.dir.realpath(".", &path_buf);
 
-    var session = try LiveSession.init(testing.allocator, engine_path);
+    var session = try LiveSession.init(testing.allocator, engine_path, 0);
     defer session.deinit();
 
     // Simulate prior finalization having advanced the cursor past block 200.
@@ -783,7 +923,7 @@ test "live prefetch hits warm cache, issues no Multicall" {
 
     var runner = PrefetchRunner{ ._allocator = testing.allocator, ._cache = &cache };
 
-    var session = try LiveSession.init(testing.allocator, engine_path);
+    var session = try LiveSession.init(testing.allocator, engine_path, 0);
     defer session.deinit();
     // session.multicall stays null. The warm cache must satisfy every
     // prefetch call. A miss would surface here.
@@ -838,7 +978,7 @@ test "finalized blocks commit to state.snap and advance the cursor" {
     };
 
     const state_snap = @import("state_snap.zig");
-    const Snap = state_snap.StateSnap(1, 0);
+    const Snap = state_snap.StateSnap(1, 0, 0);
     const TestStores = struct { accounts: mutable_store.MutableStore(Account) };
     const TestCtx = struct {
         _allocator: std.mem.Allocator,
@@ -851,7 +991,7 @@ test "finalized blocks commit to state.snap and advance the cursor" {
         pub fn commitCycle(self: *@This()) !void {
             const buf = try self.stores.accounts.materialize(self._allocator);
             defer self._allocator.free(buf);
-            try self._state_snap.commit(self._last_dispatched_block, &.{buf}, &.{});
+            try self._state_snap.commit(self._last_dispatched_block, &.{buf}, &.{}, &.{});
             self.stores.accounts.refreshSlab(self._state_snap.mutableSlab(0));
         }
     };
@@ -881,7 +1021,7 @@ test "finalized blocks commit to state.snap and advance the cursor" {
 
     enter(ctx);
 
-    var session = try LiveSession.init(testing.allocator, engine_path);
+    var session = try LiveSession.init(testing.allocator, engine_path, 0);
     defer session.deinit();
 
     // Two pending blocks. Tick once → both land in the overlay.
@@ -927,7 +1067,7 @@ test "tick is a no-op when pending is unchanged" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const engine_path = try engine_tmp.dir.realpath(".", &path_buf);
 
-    var session = try LiveSession.init(testing.allocator, engine_path);
+    var session = try LiveSession.init(testing.allocator, engine_path, 0);
     defer session.deinit();
 
     const ALICE: [20]u8 = [_]u8{0xA1} ** 20;
@@ -952,7 +1092,7 @@ test "live dispatch uses the exact pending.bin timestamp, not the slot formula" 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const engine_path = try engine_tmp.dir.realpath(".", &path_buf);
 
-    var session = try LiveSession.init(testing.allocator, engine_path);
+    var session = try LiveSession.init(testing.allocator, engine_path, 0);
     defer session.deinit();
 
     const ALICE: [20]u8 = [_]u8{0xA1} ** 20;
@@ -978,7 +1118,7 @@ test "live dispatch falls back to the formula when pending carries no timestamp"
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const engine_path = try engine_tmp.dir.realpath(".", &path_buf);
 
-    var session = try LiveSession.init(testing.allocator, engine_path);
+    var session = try LiveSession.init(testing.allocator, engine_path, 0);
     defer session.deinit();
 
     const ALICE: [20]u8 = [_]u8{0xA1} ** 20;

@@ -6,6 +6,7 @@
 /// structured logging) skip `cli.run` and call `sdk.run` directly,
 /// composing `parseStandardArgs` and `printStats`.
 const std = @import("std");
+const builtin = @import("builtin");
 const sdk = @import("sdk");
 
 pub const StandardArgs = struct {
@@ -26,17 +27,27 @@ pub const StandardArgs = struct {
 
 /// Parse `--engine-data-dir`, `--data-dir`, `--commit-interval`,
 /// `--node-rpc`, `--follow`. Missing required args print usage and return
-/// `error.MissingArgs`. Caller frees the duped string fields.
-pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8) !StandardArgs {
+/// `error.MissingArgs`. Caller frees the duped string fields. `passthrough`
+/// lists value-taking flags owned by the caller (erc20-api's `--port`),
+/// skipped here. Anything else unrecognized is an error: a typo'd flag
+/// silently changing behavior (`--folow` running backfill-only) is worse
+/// than a startup failure.
+pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8, passthrough: []const []const u8) !StandardArgs {
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
 
     var engine_data_dir: ?[]const u8 = null;
+    errdefer if (engine_data_dir) |s| allocator.free(s);
     var data_dir: ?[]const u8 = null;
+    errdefer if (data_dir) |s| allocator.free(s);
     var commit_interval: u32 = 100_000;
     var node_rpc: ?[]const u8 = null;
+    errdefer if (node_rpc) |s| allocator.free(s);
     var follow: bool = false;
     var remote_engine: ?sdk.RemoteEngine = null;
+    errdefer if (remote_engine) |re| allocator.free(re.host);
+    var silent = false;
+    var verbose = false;
 
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -63,8 +74,27 @@ pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8) !S
             i += 1;
         } else if (std.mem.eql(u8, a, "--follow")) {
             follow = true;
+        } else if (std.mem.eql(u8, a, "--silent")) {
+            silent = true;
+        } else if (std.mem.eql(u8, a, "--verbose")) {
+            verbose = true;
+        } else {
+            const skipped = for (passthrough) |p| {
+                if (std.mem.eql(u8, a, p)) {
+                    i += 1; // skip the caller-owned flag's value
+                    break true;
+                }
+            } else false;
+            if (!skipped) {
+                // Also catches a value-taking flag as the last arg (its own
+                // branch fails the `i + 1 < argv.len` check and lands here).
+                sdk.log.err("{s}: unknown flag or missing value: {s}\n", .{ prog_name, a });
+                return error.BadFlag;
+            }
         }
     }
+
+    sdk.log.setLevel(sdk.log.levelFromFlags(silent, verbose));
 
     // Remote mode reads no local store, so engine_data_dir is unused. Default
     // it to data_dir to keep `Options.engine_data_dir` populated.
@@ -73,14 +103,11 @@ pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8) !S
     }
 
     if (engine_data_dir == null or data_dir == null) {
-        std.debug.print(
-            "usage: {s} --engine-data-dir <path> --data-dir <path> [--commit-interval N] [--node-rpc URL] [--remote-engine host:port] [--follow]\n",
+        sdk.log.err(
+            "usage: {s} --engine-data-dir <path> --data-dir <path> [--commit-interval N] [--node-rpc URL] [--remote-engine host:port] [--follow] [--silent] [--verbose]\n",
             .{prog_name},
         );
-        if (engine_data_dir) |s| allocator.free(s);
-        if (data_dir) |s| allocator.free(s);
-        if (node_rpc) |s| allocator.free(s);
-        if (remote_engine) |re| allocator.free(re.host);
+        // The errdefers at the declarations free the duped fields.
         return error.MissingArgs;
     }
 
@@ -94,64 +121,9 @@ pub fn parseStandardArgs(allocator: std.mem.Allocator, prog_name: []const u8) !S
     };
 }
 
-/// Canonical RunStats printout covering both factory and non-factory
-/// manifests. Factory fields read zero for non-factory indexers, kept
-/// visible so users can confirm no children were unexpectedly discovered.
-pub fn printStats(prog_name: []const u8, stats: sdk.RunStats) void {
-    const ms = std.time.ns_per_ms;
-    const phases = stats.filter_build_ns + stats.scan_creations_ns + stats.append_children_ns + stats.prefetch_ns + stats.replay_ns;
-    const overhead_ns = if (stats.elapsed_ns > phases) stats.elapsed_ns - phases else 0;
-    // Batch count derived from executed pairs and the default Multicall3
-    // chunk. Exact count would need the per-run override routed through stats.
-    const batches = (stats.prefetch_calls_executed + sdk.DEFAULT_BATCH_SIZE - 1) / sdk.DEFAULT_BATCH_SIZE;
-    std.debug.print(
-        \\{s} indexer complete
-        \\  blocks scanned:    {d}
-        \\  blocks matched:    {d}
-        \\  filter logs:       {d}
-        \\  discovered child:  {d}
-        \\  child blocks:      {d}
-        \\  child logs:        {d}
-        \\  logs dispatched:   {d}
-        \\  blocks dispatched: {d}
-        \\  commits:           {d}
-        \\  phases skipped:    {}
-        \\  prefetch gathered: {d}
-        \\  prefetch executed: {d}
-        \\  prefetch batches:  {d}
-        \\  ── timing ──
-        \\  filter build:      {d} ms
-        \\  scan creations:    {d} ms
-        \\  append children:   {d} ms
-        \\  prefetch:          {d} ms
-        \\  replay:            {d} ms
-        \\  overhead:          {d} ms
-        \\  elapsed:           {d} ms
-        \\
-    , .{
-        prog_name,
-        stats.filter_blocks_scanned,
-        stats.filter_blocks_matched,
-        stats.filter_total_logs,
-        stats.discovered_children,
-        stats.children_blocks_matched,
-        stats.children_total_logs,
-        stats.logs_dispatched,
-        stats.blocks_dispatched,
-        stats.commits_performed,
-        stats.phases_skipped,
-        stats.prefetch_calls_gathered,
-        stats.prefetch_calls_executed,
-        batches,
-        stats.filter_build_ns / ms,
-        stats.scan_creations_ns / ms,
-        stats.append_children_ns / ms,
-        stats.prefetch_ns / ms,
-        stats.replay_ns / ms,
-        overhead_ns / ms,
-        stats.elapsed_ns / ms,
-    });
-}
+/// Canonical RunStats printout, owned by the SDK so blocking entry points
+/// (`run --follow`, `spawn`) can render it before entering the live loop.
+pub const printStats = sdk.printStats;
 
 /// All-in-one: GPA, parse args, run, print stats. Returns the wrapped
 /// error if anything fails before stats print.
@@ -160,11 +132,20 @@ pub fn run(
     comptime handlers: type,
     comptime entities: anytype,
 ) !void {
+    // DebugAllocator catches leaks under Debug/ReleaseSafe. ReleaseFast
+    // benchmarks use smp_allocator to drop the per-alloc safety metadata and
+    // bucket bookkeeping. The store hot path runs on per-thread arenas, so this
+    // allocator only sees setup and entity-store growth.
+    const dev = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
     var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = if (comptime dev) gpa.allocator() else std.heap.smp_allocator;
+    defer if (comptime dev) {
+        _ = gpa.deinit();
+    } else {
+        _ = &gpa;
+    };
 
-    const args = try parseStandardArgs(allocator, manifest.name);
+    const args = try parseStandardArgs(allocator, manifest.name, &.{});
     defer allocator.free(args.engine_data_dir);
     defer allocator.free(args.data_dir);
     defer if (args.node_rpc) |s| allocator.free(s);
@@ -179,7 +160,11 @@ pub fn run(
         .remote_engine = args.remote_engine,
     }, allocator);
 
-    // Unreachable under `--follow`. sdk.run enters the live loop and never
-    // returns. Reaching here means backfill-only completed.
-    printStats(manifest.name, stats);
+    // Unreachable under `--follow` (sdk.run announces completion itself and
+    // never returns). Reaching here means backfill-only completed: one line
+    // by default, the full stats block under --verbose.
+    if (sdk.log.getLevel() == .verbose)
+        printStats(manifest.name, stats)
+    else
+        sdk.log.info("{s}: done in {d} ms ({d} logs dispatched)\n", .{ manifest.name, stats.elapsed_ns / std.time.ns_per_ms, stats.logs_dispatched });
 }

@@ -1,6 +1,9 @@
-/// Magic-header helpers for flat files. Every flat file in `core` and `sdk`
-/// carries an 8-byte magic at offset 0 so a stray copy, truncated download,
-/// or arbitrary bytes is rejected loud rather than misread as empty state.
+//! Magic-header helpers for flat files. The sdk stores (`state.snap`,
+//! `events.dat`, `ethcall.dat`), `timestamps.bin`, and `pending.bin` carry an
+//! 8-byte magic at offset 0 so a stray copy, truncated download, or arbitrary
+//! bytes is rejected loud rather than misread as empty state. The flat-store
+//! trio (`blocks.dat`, `blocks.idx`, `blooms.bin`) and `meta.bin` predate the
+//! convention and rely on meta's checksum + open-time size validation.
 const std = @import("std");
 
 pub const MAGIC_SIZE: usize = 8;

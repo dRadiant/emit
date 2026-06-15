@@ -93,11 +93,16 @@ pub const Amount = struct {
     decimals: u8,
 
     pub fn format(self: Amount, writer: anytype) !void {
-        if (self.decimals == 0) {
+        // Saturate at 77, the largest exponent where 10^d fits u256.
+        // `decimals` is chain-controlled (a token's `decimals()` return), so
+        // a hostile value must not overflow pow10 or overrun the digit
+        // buffer. A saturated render of a garbage token beats a panic.
+        const decimals: u8 = @min(self.decimals, 77);
+        if (decimals == 0) {
             try writer.print("{d}", .{self.value});
             return;
         }
-        const scale = pow10(self.decimals);
+        const scale = pow10(decimals);
         const integer_part = self.value / scale;
         const fractional_part = self.value % scale;
 
@@ -107,15 +112,15 @@ pub const Amount = struct {
         // Fractional left-padded to `decimals` width, trailing zeros trimmed.
         // 78 digits covers u256.MAX (10^78 > 2^256).
         var buf: [78]u8 = undefined;
-        const slice = buf[0..self.decimals];
+        const slice = buf[0..decimals];
         var remainder = fractional_part;
-        var i: usize = self.decimals;
+        var i: usize = decimals;
         while (i > 0) {
             i -= 1;
             slice[i] = '0' + @as(u8, @intCast(remainder % 10));
             remainder /= 10;
         }
-        var end = self.decimals;
+        var end = decimals;
         while (end > 0 and slice[end - 1] == '0') end -= 1;
         try writer.writeAll(".");
         try writer.writeAll(slice[0..end]);
@@ -138,6 +143,16 @@ fn formatAmount(a: Amount, buf: []u8) ![]const u8 {
     var writer = stream.writer();
     try a.format(&writer);
     return stream.getWritten();
+}
+
+test "Amount saturates hostile decimals instead of overflowing" {
+    // `decimals` comes from a chain-controlled `decimals()` return. 255 used
+    // to overflow pow10 (u256 multiply) and overrun the 78-digit buffer.
+    // Saturated to 77, the value renders as a tiny fraction instead.
+    var buf: [120]u8 = undefined;
+    const out = try formatAmount(amount(123, 255), &buf);
+    try std.testing.expect(std.mem.startsWith(u8, out, "0.0"));
+    try std.testing.expectEqual(@as(usize, 2 + 77), out.len);
 }
 
 test "Amount formats 1.5 ETH at 18 decimals" {

@@ -58,19 +58,44 @@ pub const FactoryDef = struct {
 /// Per-log target-address source for a `PrefetchCall`. `.log` selects the
 /// emitter address. `.param: "name"` resolves a named event parameter via
 /// `abi_parse.paramByName` (same machinery as `FactoryDef.spawn_param`).
-/// Comptime validation rejects names absent from the signature or not of
-/// type `address`.
+/// `.of`/`.of_return` chain: the target is an address an earlier call in the
+/// same `PrefetchDef` returned, resolved from the cache one prefetch round
+/// later (`pool.token0()` then `token0.decimals()`).
+///
+/// `.of: "method()"` names the producer by method and takes its first return
+/// value (a bare `address`, or return value 0 of a tuple). `.of_return` takes
+/// return value `index`, for an address that isn't first
+/// (`getReserveTokensAddresses() -> (aToken, stable, …)`). `index` is the
+/// 0-based return value for fixed-size returns (each one occupies one word).
+/// Comptime validation rejects names absent from the signature or not
+/// `address`, and a producer method that is absent or ambiguous among earlier
+/// calls.
 pub const AddressSource = union(enum) {
     log,
     param: []const u8,
+    of: []const u8,
+    of_return: struct { call: []const u8, index: u16 },
+};
+
+/// One argument of a parameterized call. `param` names an event parameter
+/// resolved per-log (its ABI word becomes the calldata arg); `word` is a
+/// literal pre-encoded 32-byte ABI word (build one at comptime with
+/// `ethcall.encodeArg`). Fixed-size args only.
+pub const ArgSource = union(enum) {
+    param: []const u8,
+    word: [32]u8,
 };
 
 /// One declared eth_call. Target address resolves per-log via `address`.
-/// `method` is the no-argument Solidity signature whose first four keccak
-/// bytes form the call selector.
+/// `method` is the Solidity signature whose first four keccak bytes form the
+/// call selector. `args` is empty for a no-arg method (`decimals()`), or one
+/// `ArgSource` per parameter for a parameterized one (`tokenURI(uint256)`,
+/// `getPair(address,address)`). The handler reads the result with the same
+/// args via `ctx.ethCallArgs(T, addr, method, .{...})`.
 pub const PrefetchCall = struct {
     address: AddressSource,
     method: []const u8,
+    args: []const ArgSource = &.{},
 };
 
 pub const PrefetchDef = struct {
@@ -100,7 +125,9 @@ pub fn parsedEvent(comptime E: type) abi_parse.ParsedEvent {
 /// the same selector as `solc`.
 pub fn eventTopic0(comptime E: type) [32]u8 {
     return comptime blk: {
-        @setEvalBranchQuota(200_000);
+        // Headroom for callers that resolve many topic0 hashes in one comptime
+        // evaluation (the dispatcher gate). @setEvalBranchQuota only raises.
+        @setEvalBranchQuota(1_000_000);
         break :blk eth.keccak.hash(parsedEvent(E).canonical);
     };
 }
@@ -110,6 +137,30 @@ pub fn eventName(comptime E: type) []const u8 {
         if (@hasDecl(E, "name")) break :blk E.name;
         break :blk parsedEvent(E).name;
     };
+}
+
+/// True when the event declares `pub const tx_fields = true;`, opting its
+/// handler into `log.tx` (the owning transaction's from/to/value, ADR-006).
+/// Declared per event, like an entity's `storage`, so the field exists only
+/// where a handler reads it and the compiler rejects the read elsewhere.
+pub fn eventWantsTx(comptime E: type) bool {
+    return @hasDecl(E, "tx_fields") and E.tx_fields;
+}
+
+/// True when any declared event wants tx fields. Turns on the whole carry:
+/// the filtered index's tx subtables, the fail-loud `txs.{dat,idx}` coverage
+/// check at init, and the remote REGISTER flag.
+pub fn wantsTxFields(comptime m: Manifest) bool {
+    comptime {
+        for (m.contracts) |c| for (c.events) |E| {
+            if (eventWantsTx(E)) return true;
+        };
+        for (m.factories) |f| {
+            if (eventWantsTx(f.create_event)) return true;
+            for (f.child_events) |E| if (eventWantsTx(E)) return true;
+        }
+        return false;
+    }
 }
 
 pub fn validateEvent(comptime E: type) void {
@@ -130,6 +181,30 @@ pub fn validateManifest(comptime m: Manifest) void {
     }
     inline for (m.prefetch) |d| validatePrefetch(d);
     inline for (m.static_prefetch) |c| validateStaticCall(c);
+    validateFactoryDispatch(m);
+}
+
+/// Comptime: dispatch routes by topic0 with no per-child factory provenance, so
+/// two factories declaring different child events would mis-dispatch a child of
+/// one emitting the other's event. Require identical child-event sets. Split
+/// distinct protocols into separate manifests instead.
+fn validateFactoryDispatch(comptime m: Manifest) void {
+    if (comptime m.factories.len < 2) return;
+    const first = m.factories[0].child_events;
+    inline for (m.factories[1..]) |f| {
+        if (comptime !sameTopicSet(first, f.child_events)) @compileError(
+            "manifest: factories must declare identical child_events. Split distinct protocols into separate manifests.",
+        );
+    }
+}
+
+/// Comptime: do `a` and `b` cover the same set of event topic0s?
+fn sameTopicSet(comptime a: []const type, comptime b: []const type) bool {
+    comptime {
+        if (a.len != b.len) return false;
+        for (a) |E| if (!eventListHas(b, E)) return false;
+        return true;
+    }
 }
 
 fn validateStaticCall(comptime c: StaticCall) void {
@@ -138,13 +213,14 @@ fn validateStaticCall(comptime c: StaticCall) void {
     );
 }
 
-/// Comptime check: every `PrefetchCall` in `d` has a non-empty method, and
-/// any `.param: name` source resolves to an `address` parameter on
-/// `d.on_event`'s signature.
+/// Comptime check: every `PrefetchCall` in `d` has a non-empty method, any
+/// `.param: name` source resolves to an `address` parameter on `d.on_event`'s
+/// signature, and any `.of`/`.of_return` names a method that is declared by
+/// exactly one earlier call (so the chain resolves and can't cycle).
 fn validatePrefetch(comptime d: PrefetchDef) void {
     comptime {
         validateEvent(d.on_event);
-        for (d.calls) |c| {
+        for (d.calls, 0..) |c, i| {
             if (c.method.len == 0) @compileError(
                 "manifest: prefetch on `" ++ @typeName(d.on_event) ++ "` has an empty method string",
             );
@@ -157,8 +233,64 @@ fn validatePrefetch(comptime d: PrefetchDef) void {
                         "manifest: prefetch on `" ++ @typeName(d.on_event) ++ "` references parameter `" ++ name ++ "` of type `" ++ p.type_str ++ "`, expected `address`",
                     );
                 },
+                // Trigger the absent/ambiguous checks. Return ignored.
+                .of => |m| _ = producerIndex(d, i, m),
+                .of_return => |r| _ = producerIndex(d, i, r.call),
             }
         }
+    }
+}
+
+/// Index of the unique earlier call in `d.calls` whose method is `method`,
+/// resolving an `.of`/`.of_return` chain reference. Compile error when no
+/// earlier call declares it (the producer must sit above its consumer) or
+/// more than one does (`.of` must name a unique earlier method). Strict
+/// "earlier" (`< self_idx`) makes a cycle unconstructable.
+pub fn producerIndex(comptime d: PrefetchDef, comptime self_idx: usize, comptime method: []const u8) usize {
+    comptime {
+        var found: ?usize = null;
+        for (d.calls[0..self_idx], 0..) |c, j| {
+            if (std.mem.eql(u8, c.method, method)) {
+                if (found != null) @compileError(
+                    "manifest: prefetch on `" ++ @typeName(d.on_event) ++ "` chains `.of \"" ++ method ++
+                        "\"` but multiple earlier calls declare that method.",
+                );
+                found = j;
+            }
+        }
+        return found orelse @compileError(
+            "manifest: prefetch on `" ++ @typeName(d.on_event) ++ "` chains `.of \"" ++ method ++
+                "\"` but no earlier call declares it.",
+        );
+    }
+}
+
+/// Round depth of `d.calls[idx]`: 1 for a log/param target, else one past the
+/// depth of the producer it chains from. Drives the prefetch round cap.
+fn callDepth(comptime d: PrefetchDef, comptime idx: usize) usize {
+    comptime {
+        return switch (d.calls[idx].address) {
+            .log, .param => 1,
+            .of => |m| 1 + callDepth(d, producerIndex(d, idx, m)),
+            .of_return => |r| 1 + callDepth(d, producerIndex(d, idx, r.call)),
+        };
+    }
+}
+
+/// Deepest prefetch chain across every `PrefetchDef`, the exact number of
+/// resolve rounds the prefetch fixpoint needs. 1 when no call chains (every
+/// target is log/param/static), so the round loop runs once with zero
+/// overhead for the common manifest.
+pub fn prefetchMaxDepth(comptime m: Manifest) usize {
+    comptime {
+        var max: usize = 1;
+        for (m.prefetch) |d| {
+            for (d.calls, 0..) |_, i| {
+                const depth = callDepth(d, i);
+                if (depth > max) max = depth;
+            }
+        }
+        return max;
     }
 }
 
@@ -200,7 +332,20 @@ pub fn extractAddress(
             const word = abi_parse.wordAt(p, topics, data);
             break :blk word[12..32].*;
         },
+        // Chained targets depend on a prior call's cached result, unknown to
+        // the log-only path. `prefetch.resolveTarget` handles them.
+        .of, .of_return => @compileError(
+            "manifest.extractAddress: a chained `.of`/`.of_return` target resolves through prefetch.resolveTarget against the ethcall cache, not from the log",
+        ),
     };
+}
+
+/// Resolve a named event parameter to its full 32-byte ABI word (from the
+/// topic or data region). Used to build the calldata args of a parameterized
+/// prefetch call, so an `address`/`uintN` param flows straight into the call.
+pub fn paramWord(comptime E: type, comptime name: []const u8, topics: []const [32]u8, data: []const u8) [32]u8 {
+    const p = comptime abi_parse.paramByName(parsedEvent(E), name);
+    return abi_parse.wordAt(p, topics, data);
 }
 
 /// Statically known emitter addresses: every contract plus every factory.
@@ -249,6 +394,107 @@ fn containsTopic(haystack: []const [32]u8, needle: [32]u8) bool {
     return false;
 }
 
+/// Comptime: does `events` list one whose topic0 equals `E`'s?
+fn eventListHas(comptime events: []const type, comptime E: type) bool {
+    comptime {
+        const t = eventTopic0(E);
+        for (events) |X| {
+            if (std.mem.eql(u8, &eventTopic0(X), &t)) return true;
+        }
+        return false;
+    }
+}
+
+/// Comptime: can a factory legitimately emit `E` (its create-event or a child
+/// event)? Then runtime children emit it, so the dispatcher cannot gate it by a
+/// comptime address set.
+fn factoryEmits(comptime m: Manifest, comptime E: type) bool {
+    comptime {
+        const t = eventTopic0(E);
+        for (m.factories) |f| {
+            if (std.mem.eql(u8, &eventTopic0(f.create_event), &t)) return true;
+            if (eventListHas(f.child_events, E)) return true;
+        }
+        return false;
+    }
+}
+
+/// Comptime: must the dispatcher gate `E` by emitter address? Gate when a
+/// statically-known address could reach dispatch for `E` without legitimately
+/// emitting it: a static contract that did not declare `E` (it emits `E`
+/// cross-product), or, for a static-only event, a factory child (children are
+/// arbitrary contracts that can emit any topic, e.g. an LP-token pair emitting
+/// Transfer). False for the degenerate manifests (single contract, every
+/// contract declaring `E`, or pure factory) so dispatch compiles identically to
+/// the un-gated topic0 switch. The flagship ERC20 and single-factory paths pay
+/// nothing. `isLegitEmitter` is the runtime predicate.
+pub fn dispatchGateNeeded(comptime m: Manifest, comptime E: type) bool {
+    comptime {
+        var declarers: usize = 0;
+        for (m.contracts) |c| {
+            if (eventListHas(c.events, E)) declarers += 1;
+        }
+        if (factoryEmits(m, E)) {
+            // Factory event. Children legitimately emit it (the strict
+            // multi-factory check keeps child events identical) and pass the
+            // gate as non-static addresses. Gate only to reject a static
+            // contract that emits it without declaring it.
+            return declarers < m.contracts.len;
+        }
+        // Static-only event. Children never legitimately emit it. Gate when a
+        // known static is not a declarer, or any factory exists (a child could
+        // cross-emit). `isLegitEmitter` excludes both.
+        if (declarers == 0) return false;
+        return declarers < m.contracts.len or m.factories.len > 0;
+    }
+}
+
+/// Did a static contract at `addr` declare `E`? A building block of
+/// `isLegitEmitter`, also used directly by the dispatcher gate tests.
+pub fn contractDeclaredEvent(comptime m: Manifest, comptime E: type, addr: [20]u8) bool {
+    inline for (m.contracts) |c| {
+        if (comptime eventListHas(c.events, E)) {
+            if (std.mem.eql(u8, &addr, &c.address)) return true;
+        }
+    }
+    return false;
+}
+
+/// Comptime: is `addr` a statically-known emitter (a contract or factory
+/// address)? Any other address reaching dispatch is a runtime child, since the
+/// address pre-filter admits only known statics and discovered children.
+fn isKnownStatic(comptime m: Manifest, addr: [20]u8) bool {
+    inline for (m.contracts) |c| if (std.mem.eql(u8, &addr, &c.address)) return true;
+    inline for (m.factories) |f| if (std.mem.eql(u8, &addr, &f.address)) return true;
+    return false;
+}
+
+/// Comptime: does any factory list `E` among its child events?
+fn factoryHasChildEvent(comptime m: Manifest, comptime E: type) bool {
+    comptime {
+        for (m.factories) |f| if (eventListHas(f.child_events, E)) return true;
+        return false;
+    }
+}
+
+/// Does `addr` legitimately emit `E`? The dispatcher gate, evaluated only when
+/// `dispatchGateNeeded(m, E)`. Legitimate when `addr` is a static contract that
+/// declared `E`, the factory whose create-event is `E`, or (for a factory child
+/// event) a runtime child, i.e. any address not statically known. Rejects a
+/// known static that did not declare `E` (a Swap-less contract emitting Swap)
+/// while passing children, with no per-child provenance, because the strict
+/// multi-factory check keeps every factory's child events identical.
+pub fn isLegitEmitter(comptime m: Manifest, comptime E: type, addr: [20]u8) bool {
+    if (contractDeclaredEvent(m, E, addr)) return true;
+    inline for (m.factories) |f| {
+        if (comptime eventListHas(&[_]type{f.create_event}, E)) {
+            if (std.mem.eql(u8, &addr, &f.address)) return true;
+        }
+    }
+    if (comptime factoryHasChildEvent(m, E)) return !isKnownStatic(m, addr);
+    return false;
+}
+
 /// SHA-256 over fields that affect filtered-index content. Persisted next to
 /// the filter dir, triggering a rebuild on mismatch. Without it, manifest
 /// edits between runs would replay stale data into new handlers.
@@ -261,6 +507,10 @@ pub fn fingerprint(comptime m: Manifest) [32]u8 {
         hasher.update(std.mem.asBytes(&m.start_block));
         const end: u64 = m.end_block orelse std.math.maxInt(u64);
         hasher.update(std.mem.asBytes(&end));
+        // Flipping the tx carry changes the filtered-entry layout (tx subtable
+        // after the lz4 payload), so it must force a rebuild.
+        const wants_tx = wantsTxFields(m);
+        hasher.update(std.mem.asBytes(&wants_tx));
         for (m.contracts) |c| {
             hasher.update(c.name);
             hasher.update(&c.address);
@@ -282,6 +532,15 @@ pub fn fingerprint(comptime m: Manifest) [32]u8 {
                     .param => |name| {
                         hasher.update("param:");
                         hasher.update(name);
+                    },
+                    .of => |meth| {
+                        hasher.update("of:");
+                        hasher.update(meth);
+                    },
+                    .of_return => |r| {
+                        hasher.update("ofr:");
+                        hasher.update(r.call);
+                        hasher.update(std.mem.asBytes(&r.index));
                     },
                 }
             }
@@ -452,6 +711,87 @@ test "validateManifest accepts prefetch and static_prefetch" {
             .{ .address = [_]u8{0xC0} ** 20, .method = "symbol()" },
             .{ .address = [_]u8{0xC0} ** 20, .method = "name()" },
         },
+    };
+    validateManifest(m);
+}
+
+test "prefetchMaxDepth is 1 when no call chains" {
+    const m = Manifest{
+        .name = "x",
+        .chain_id = 1,
+        .start_block = 0,
+        .prefetch = &.{.{
+            .on_event = NamedTransfer,
+            .calls = &.{
+                .{ .address = .log, .method = "decimals()" },
+                .{ .address = .{ .param = "from" }, .method = "balanceOf()" },
+            },
+        }},
+    };
+    try std.testing.expectEqual(@as(usize, 1), comptime prefetchMaxDepth(m));
+}
+
+test "prefetchMaxDepth counts a single .of chain as depth 2" {
+    const m = Manifest{
+        .name = "x",
+        .chain_id = 1,
+        .start_block = 0,
+        .prefetch = &.{.{
+            .on_event = NamedTransfer,
+            .calls = &.{
+                .{ .address = .log, .method = "token0()" },
+                .{ .address = .{ .of = "token0()" }, .method = "decimals()" },
+                .{ .address = .{ .of = "token0()" }, .method = "symbol()" },
+            },
+        }},
+    };
+    try std.testing.expectEqual(@as(usize, 2), comptime prefetchMaxDepth(m));
+}
+
+test "prefetchMaxDepth counts a two-level chain through .of_return as depth 3" {
+    const m = Manifest{
+        .name = "x",
+        .chain_id = 1,
+        .start_block = 0,
+        .prefetch = &.{.{
+            .on_event = NamedTransfer,
+            .calls = &.{
+                .{ .address = .log, .method = "getReserveTokensAddresses(address)" },
+                .{ .address = .{ .of_return = .{ .call = "getReserveTokensAddresses(address)", .index = 1 } }, .method = "POOL()" },
+                .{ .address = .{ .of = "POOL()" }, .method = "decimals()" },
+            },
+        }},
+    };
+    try std.testing.expectEqual(@as(usize, 3), comptime prefetchMaxDepth(m));
+}
+
+test "producerIndex resolves the unique earlier call by method" {
+    const d = PrefetchDef{
+        .on_event = NamedTransfer,
+        .calls = &.{
+            .{ .address = .log, .method = "token0()" },
+            .{ .address = .log, .method = "token1()" },
+            .{ .address = .{ .of = "token1()" }, .method = "decimals()" },
+        },
+    };
+    try std.testing.expectEqual(@as(usize, 0), comptime producerIndex(d, 2, "token0()"));
+    try std.testing.expectEqual(@as(usize, 1), comptime producerIndex(d, 2, "token1()"));
+}
+
+test "validateManifest accepts a chained .of / .of_return prefetch" {
+    const m = Manifest{
+        .name = "x",
+        .chain_id = 1,
+        .start_block = 0,
+        .contracts = &.{.{ .name = "c", .address = [_]u8{0xAE} ** 20, .events = &.{NamedTransfer} }},
+        .prefetch = &.{.{
+            .on_event = NamedTransfer,
+            .calls = &.{
+                .{ .address = .log, .method = "token0()" },
+                .{ .address = .{ .of = "token0()" }, .method = "decimals()" },
+                .{ .address = .{ .of_return = .{ .call = "token0()", .index = 0 } }, .method = "symbol()" },
+            },
+        }},
     };
     validateManifest(m);
 }

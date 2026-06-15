@@ -4,6 +4,56 @@ All notable changes to EMIT are documented here.
 
 EMIT follows semantic versioning. Major bumps (1.x → 2.x) signal breaking changes. Minor bumps (1.0 → 1.1) add features in a backward-compatible way, but may contain breaking changes. Patch bumps (1.0.0 → 1.0.1) are bug fixes only.
 
+## EMIT 1.2.0
+
+### Variable-Length Entity Fields
+
+Entities can now hold variable-length fields — `string`, dynamic `bytes`, and flat dynamic arrays — closing the one entity-model gap against Postgres-backed indexers (NFT names/URIs, ENS names, governance text, address lists). A field is declared as a plain slice, no marker type: `name: []const u8` or `members: []const [20]u8` sits next to `balance: u256`, and handlers read and `save` it like any other field.
+
+- Storage stays flat-file and zero-copy. The fixed record holds an 8-byte `BlobRef` (`offset:40 | len:24`); the payload lives in an append-only `<entity>.blobs.dat`, mmap-read. The slab stays fixed-width, so binary search and the HashMap front are untouched. `state.snap` gains a `blob_bytes[]` array and bumps to version 2 — but only when a schema actually has a blob field; a numeric-only indexer writes version 1, byte-identical to before, with zero added cost.
+- Both element shapes ship: `[]const u8` (string/bytes) and `[]const T` for a fixed-size `T`. Array blobs align the offset to `@alignOf(T)` so the read is a zero-copy aligned cast. Nested dynamics (`[]const []const u8`) are a loud compile error.
+- Crash-safe by the proven discipline: `blobs.dat` append + fsync precedes the `state.snap` rename, so a crash leaves only invisible orphan tail (overwritten next commit) — the same contract as `events.dat`. Live mode rides the per-block overlay: blob bytes accumulate in per-block arenas, dropped on reorg, flushed on finalize.
+- Event params: top-level `string`/`bytes` now decode to a `[]const u8` borrowing the log data (the deferred half of the v1.1 ABI work). `log.params.name` flows straight into a blob `save`.
+- Read safety is a compile-time contract: a blob field slice borrows the store mmap, so the auto-locking `ctx.read`/`count`/`range` reject blob entities (they release the lock on return) and point at `ctx.readView()`, a guard that holds the lock across the borrow. Handlers are unaffected.
+- Both store kinds: `MutableStore` (keyed, overwrite-in-place) and `ImmutableStore` (append-only event log, garbage-free since write-once). The `examples/ens` indexer demonstrates both — a mutable `Registration` (latest name per label) and an immutable `RegistrationLog` (every registration, keyed by event id).
+
+Separately, `sdk.address` now **requires** the EIP-55 checksum: a manifest address typo fails the build (with the correct checksum printed) instead of silently matching no logs. An all-lowercase literal is rejected.
+
+### Top-Level Transaction Fields
+
+Handlers can now read the owning transaction's `from`/`to`/`value` alongside the log — the identity data that lives in no event. An event opts in with `pub const tx_fields = true;` (next to its `signature`, mirroring an entity's `storage` declaration), and its handler reads `log.tx: sdk.Tx { from, to (null = contract creation), value, tx_type }` — decoded and non-optional. Reading `log.tx` on an event that did not declare it is a compile error, and a manifest with no declaration compiles byte-identical to before. The hot loop stays network-free: fields resolve from the store at dispatch, zero RPC.
+
+- New advisory store pair `txs.{dat,idx}`: per-block LZ4 tables of 76 B `TxRecord`s (index, type, flags, from, to, value), one per log-producing transaction, dense by block with the `timestamps.bin` resume discipline — backfillable into an existing store, no re-import; `--no-tx-fields` opts out. Full mainnet measured: 45 GB, ~2.2 h one-time pass.
+- Senders are hybrid-sourced on the RocksDB path: read from the receipt row when stored, recovered via splice-sighash ecrecover when the compact format leaves the slot empty (the default — Nethermind recovers on demand rather than persisting; the design's zero-crypto assumption was disproven against ground truth and recorded in ADR-006). The splice rebuilds the signing payload from the signed RLP without a per-type re-encoder, shape-generic from legacy through EIP-7702; recovery parallelizes across a 10-worker slot pipeline (~1,250 blk/s sustained). `to`/`value` decode from the raw transactions in Nethermind's sibling `blocks` DB by canonical point-get. Zero unrecovered senders over 9.76 M blocks.
+- Live end to end: the RPC import gains a tx-table pass, the follower fetches each block's table via `eth_getBlockByNumber(full=true)`, `pending.bin` v2 (`EMITPND2` magic, self-migrating) carries per-block tables through the pre-finality window, and finalization mirrors them into `txs.dat` so coverage tracks the tip.
+- The carry preserves wire = disk: the filter build appends the kept logs' records after each filtered entry's LZ4 payload (trailing bytes are invisible to tx-blind readers; the manifest fingerprint forces a rebuild when a declaration changes), the scanner resolves per log fail-loud, and a tx-registered remote client receives the same bytes in PUSH. The TCP protocol bumps to v2 (REGISTER gains a `tx_fields` byte; the server refuses with GOAWAY when its store cannot cover the range). `init` fails loud when `txs.{dat,idx}` is absent or does not span the indexed range.
+- The uniswap-v2 example demonstrates it: `Swap` declares `tx_fields` and `SwapEvent` stores `trader = log.tx.from` — the EOA behind the swap, where the log's own `sender` param is just the router.
+
+### Richer `eth_call` Prefetch
+
+`ctx.ethCall` grows from no-arg, single-fixed-value calls to the full shape real metadata needs — still strict-prefetched and Multicall3-batched (ADR-004), so the hot loop stays network-free and replay-deterministic.
+
+- **Multi-return.** A method returning a tuple of fixed-size values (`getReserves() -> (uint112,uint112,uint32)`, EIP-712 domain getters) decodes into a struct or tuple `T`, one ABI word per field.
+- **Parameters.** Methods that take arguments (`getPair(address,address)`, `tokenURI(uint256)`). `PrefetchCall` gains `args` (an event param's word, or a literal); the handler reads with `ctx.ethCallArgs(T, addr, method, .{...})`. Prefetch and handler derive byte-identical calldata, so the cache key matches.
+- **Dynamic returns.** `string`/`bytes` (`symbol()`, `name()`) decode to a `[]const u8` borrowing the cache entry, valid for the `Context`. No read-view machinery: the ethcall cache is heap-owned, not mmap. Mixed tuples (`(string, uint256)`) resolve via ABI head/tail offsets.
+- **Chained metadata (ADR-007).** A call whose target is a prior call's result (`pool.token0()` then `token0.decimals()`), declared by naming the producer method — `.address = .{ .of = "token0()" }`, or `.of_return = .{ .call, .index }` for a non-first return value. A bounded multi-round prefetch resolves the chain *before* dispatch (round *k+1* resolves targets round *k* cached); the round cap is the comptime deepest chain, so an unchained manifest runs a single round byte-identical to before. Supersedes ADR-004's withdrawn lazy `ethCall` hatch.
+
+The `uniswap-v2` example now derives each pair's token decimals and symbols through the chain (`Swap → token0()/token1() → decimals()/symbol()`), working even for pairs created before the scan window where no `PairCreated` carries the token addresses.
+
+### CLI & Output
+
+- Unified leveled output across the engine and SDK (`core.log`): `--silent` (errors only), default (progress + result), `--verbose` (per-step detail), consistently parsed by every binary and example. Default-level runs show live progress (`indexing blocks X → Y`, `filtering N/M matching blocks`, `replaying N/M blocks`, a skip notice when the filtered index is reused) and a one-line result; `--verbose` prints the full stats block. Test binaries are fully silent — expected fail-loud messages no longer leak into suite output.
+- `emit-engine status` reports tx-fields coverage alongside timestamps coverage. Non-zero exit on CLI misuse; the examples reject unknown flags.
+
+### Hardening & Performance
+
+- Dispatch correctness: cross-emitted events gate to their declaring contract (a known address emitting another contract's event no longer mis-dispatches), manifests validate at build time, and a factory child cannot cross-emit a static-only event.
+- Fail loud over fail silent: corrupt filtered-store entries, corrupt prefetch cache entries, and dropped blocks in any filter phase abort instead of degrading; log deserialization on the TCP path is bounds-checked so a forged frame errors instead of reading out of bounds in ReleaseFast.
+- Follow-mode gaps closed: the pending backlog already in the ring at startup dispatches on the first tick, the engine finalizes during catch-up and validates fork points, the SDK re-runs its gap-fill at the live handoff, and the follower WebSocket reconnects with bounded reads and a liveness heartbeat.
+- Store throughput: the commit buffer backs `state.snap` directly, dirty rows merge into the sorted slab on materialize, immutable ranges read with chunked preads, large address sets sort once and binary-search per log, and `promoteFinalized` batches per block.
+- Importer robustness: the rocksdb-import subprocess is streamed and exit-checked, import workers join before the slot ring frees, ingestion dedups duplicate rows, and reorg resolution is tested against a mock chain.
+- Fixed: HTTP connection pools now free after the prefetch phase and the live loop.
+
 ## EMIT 1.1.0
 
 ### Remote Engine TCP Streaming

@@ -46,6 +46,12 @@ pub const DecodedLog = struct {
     topics: [4][32]u8,
     topic_count: u8,
     data: []const u8,
+    /// Dispatch plumbing: the owning transaction's storage record, resolved
+    /// by the replay/live loop. Non-null for every log when the manifest's
+    /// events want tx fields (resolution fails loud otherwise), always null
+    /// for tx-blind manifests. `Log(E)` decodes it into `Tx` for events
+    /// declaring `tx_fields`. Borrowed for the dispatch only.
+    tx: ?*const core.txs.TxRecord = null,
 
     pub fn fromRawLog(raw: core.RawLog) DecodedLog {
         return .{
@@ -87,7 +93,8 @@ pub const DecodedLog = struct {
 
     /// Read a named parameter from `E.signature`. Return type derived at
     /// comptime: `address`→`[20]u8`, `uintN`→`uN`, `intN`→`iN`, `bool`→`bool`,
-    /// `bytesN`→`[N]u8`, `T[N]`→`[N]…`, `(t1,…)`→a Zig tuple, `T[]`→a zero-copy
+    /// `bytesN`→`[N]u8`, dynamic `bytes`/`string`→`[]const u8` borrowing
+    /// `log.data`, `T[N]`→`[N]…`, `(t1,…)`→a Zig tuple, `T[]`→a zero-copy
     /// `Array(T)` view borrowing `log.data`. Wrong names list the available
     /// params. An indexed array/tuple/`bytes`/`string` stores `keccak(value)`,
     /// not the value, so those error with a pointer at the raw `log.topics[i]`.
@@ -187,17 +194,19 @@ fn TypeFor(comptime t: []const u8) type {
 }
 
 /// Primitive Solidity type → Zig type. `address`→`[20]u8`, `uintN`→`uN`,
-/// `intN`→`iN`, `bytesN`→`[N]u8`, `bool`→`bool`. Dynamic `bytes`/`string`
-/// values are rejected.
+/// `intN`→`iN`, `bytesN`→`[N]u8`, `bool`→`bool`, dynamic `bytes`/`string`→a
+/// `[]const u8` borrowing `log.data` (ADR-005). The borrow is valid for the
+/// source log's lifetime; copy it (or `save` it into a blob entity) to keep it.
 fn PrimType(comptime t: []const u8) type {
     if (comptime std.mem.eql(u8, t, "address")) return [20]u8;
     if (comptime std.mem.eql(u8, t, "bool")) return bool;
+    if (comptime std.mem.eql(u8, t, "bytes") or std.mem.eql(u8, t, "string")) return []const u8;
     if (comptime std.mem.startsWith(u8, t, "uint")) return std.meta.Int(.unsigned, parseBits(t["uint".len..]));
     if (comptime std.mem.startsWith(u8, t, "int")) return std.meta.Int(.signed, parseBits(t["int".len..]));
     if (comptime std.mem.startsWith(u8, t, "bytes") and t.len > "bytes".len) {
         return [parseBits(t["bytes".len..])]u8;
     }
-    @compileError("DecodedLog: type `" ++ t ++ "` not auto-decodable (dynamic `bytes`/`string` land with v1.2 blobs). Use slot-positional helpers.");
+    @compileError("DecodedLog: type `" ++ t ++ "` not auto-decodable. Use slot-positional helpers.");
 }
 
 fn TupleType(comptime components: []const []const u8) type {
@@ -241,7 +250,17 @@ fn decodeValue(comptime t: []const u8, data: []const u8, head_off: usize) TypeFo
     const s = comptime abi_parse.typeShape(t);
     switch (comptime s.tag) {
         .primitive => {
-            if (comptime abi_parse.isDynamicType(t)) @compileError("DecodedLog: decode of `" ++ t ++ "` not yet supported (v1.2 blobs)"); // You can read it slot-positionally
+            if (comptime abi_parse.isDynamicType(t)) {
+                // `bytes`/`string`: the head word holds the tail offset; at the
+                // tail a length word, then the bytes. The returned slice borrows
+                // `data` (`log.data`). A short or malformed payload yields an
+                // empty slice rather than reading out of bounds.
+                const tail = readOffset(data, head_off);
+                const len = readOffset(data, tail);
+                const start = tail + 32;
+                if (data.len < start + len) return data[0..0];
+                return data[start..][0..len];
+            }
             const w = wordOf(data, head_off);
             return decodeWord(PrimType(t), t, &w);
         },
@@ -336,10 +355,37 @@ fn parseBits(comptime s: []const u8) comptime_int {
     return n;
 }
 
+/// The owning transaction's fields (ADR-006), decoded for handler reads.
+/// Behind `log.tx` on events declaring `pub const tx_fields = true;`.
+pub const Tx = struct {
+    /// Sender. The zero address marks the rare source-store anomaly where no
+    /// sender was stored or recoverable (zero observed on full mainnet). A
+    /// real zero-address sender cannot exist, it has no key.
+    from: [20]u8,
+    /// Null for contract creations.
+    to: ?[20]u8,
+    value: u256,
+    tx_type: u8,
+
+    fn fromRecord(r: *const core.txs.TxRecord) Tx {
+        return .{
+            .from = r.from,
+            .to = if (r.flags & core.txs.FLAG_TO_ABSENT != 0) null else r.to,
+            .value = r.valueU256(),
+            .tx_type = r.tx_type,
+        };
+    }
+};
+
 /// Typed log handed to handlers by the dispatcher. Same meta shape as
 /// `DecodedLog`, plus a comptime-decoded `params: ParamsOf(E)` so handlers read
 /// named fields directly (`log.params.from`) instead of routing every access
 /// through `log.param(E, "from")`.
+///
+/// `tx` exists only for events declaring `pub const tx_fields = true;`. The
+/// declaration is what turns on the manifest's tx carry, so the field is
+/// never null where it compiles. Reading it elsewhere is a compile error
+/// (`tx` is `void` there).
 pub fn Log(comptime E: type) type {
     return struct {
         block_number: u64,
@@ -350,6 +396,7 @@ pub fn Log(comptime E: type) type {
         topics: [4][32]u8,
         topic_count: u8,
         data: []const u8,
+        tx: if (manifest.eventWantsTx(E)) Tx else void,
         params: ParamsOf(E),
 
         pub fn fromDecoded(d: DecodedLog) @This() {
@@ -362,6 +409,10 @@ pub fn Log(comptime E: type) type {
                 .topics = d.topics,
                 .topic_count = d.topic_count,
                 .data = d.data,
+                // The unwrap is guarded by the carry chain: the declaration
+                // implies `wantsTxFields`, so the dispatching loop resolved
+                // the record or failed loud before reaching here.
+                .tx = if (comptime manifest.eventWantsTx(E)) Tx.fromRecord(d.tx.?) else {},
                 .params = d.decode(E),
             };
         }
@@ -380,23 +431,31 @@ pub fn Log(comptime E: type) type {
 /// in one step. Backfill (`scanner.replay`) and live mode share this single
 /// per-log path.
 ///
-/// Routes by topic0 only, does NOT gate by emitter address. Callers feeding
-/// *untrusted* logs (the live path's raw pending blocks) MUST pre-filter by
-/// address first. Backfill is safe because `filter_builder` already pruned
-/// non-matching addresses before the filtered store was written.
+/// Routes by topic0, then applies the comptime per-contract gate so a known
+/// static address that did not declare the event never reaches its handler
+/// (`dispatchGateNeeded`). The gate refines which declared handler fires, it
+/// does not admit addresses. Callers feeding *untrusted* logs (the live path's
+/// raw pending blocks) MUST still pre-filter by address. Backfill is safe
+/// because `filter_builder` already pruned non-matching addresses before the
+/// filtered store was written.
 pub fn dispatchLog(
     comptime m: manifest.Manifest,
     comptime Handler: type,
     ctx: anytype,
     raw_log: core.RawLog,
+    tx: ?*const core.txs.TxRecord,
 ) !void {
-    return dispatcherFor(m).dispatch(Handler, DecodedLog.fromRawLog(raw_log), ctx);
+    var decoded = DecodedLog.fromRawLog(raw_log);
+    decoded.tx = tx;
+    return dispatcherFor(m).dispatch(Handler, decoded, ctx);
 }
 
 /// Build the comptime dispatch table for a manifest. Returns a type that
-/// switches on `log.topics[0]` against each declared event's topic0 and invokes
-/// `Handler.handle ++ event.name`. Logs whose topic0 matches no declared event
-/// are silently skipped.
+/// switches on `log.topics[0]` against each declared event's topic0, applies
+/// the per-contract emitter gate (`isLegitEmitter`, comptime-elided unless the
+/// manifest needs it), and invokes `Handler.handle ++ event.name`. Logs whose
+/// topic0 matches no declared event, or whose emitter the gate rejects, are
+/// silently skipped.
 ///
 /// `validateHandler(Handler, m)` runs at comptime. Any required handler method
 /// missing from `Handler` produces a `@compileError` listing the method name
@@ -409,6 +468,13 @@ pub fn dispatcherFor(comptime m: manifest.Manifest) type {
             inline for (events) |E| {
                 const topic = comptime manifest.eventTopic0(E);
                 if (std.mem.eql(u8, &log.topics[0], &topic)) {
+                    // Per-contract gate, comptime-elided unless a known static
+                    // address could reach `E` without declaring it. Degenerate
+                    // manifests and both flagship paths (single contract, single
+                    // factory) compile to the un-gated switch.
+                    if (comptime manifest.dispatchGateNeeded(m, E)) {
+                        if (!manifest.isLegitEmitter(m, E, log.address)) return;
+                    }
                     const method_name = comptime "handle" ++ manifest.eventName(E);
                     return @field(Handler, method_name)(Log(E).fromDecoded(log), ctx);
                 }
@@ -474,6 +540,156 @@ fn makeLog(topic0: [32]u8) DecodedLog {
         .topic_count = 1,
         .data = &.{},
     };
+}
+
+fn makeLogFrom(topic0: [32]u8, address: [20]u8) DecodedLog {
+    var d = makeLog(topic0);
+    d.address = address;
+    return d;
+}
+
+test "Tx.fromRecord decodes value and maps a creation to null `to`" {
+    const plain = core.txs.TxRecord{
+        .tx_index = 1,
+        .tx_type = 2,
+        .flags = 0,
+        .from = [_]u8{0x10} ** 20,
+        .to = [_]u8{0x20} ** 20,
+        .value = [_]u8{ 0xFF, 0x01 } ++ [_]u8{0} ** 30,
+    };
+    const tx = Tx.fromRecord(&plain);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0x10} ** 20), &tx.from);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0x20} ** 20), &tx.to.?);
+    try std.testing.expectEqual(@as(u256, 0x01FF), tx.value);
+    try std.testing.expectEqual(@as(u8, 2), tx.tx_type);
+
+    var creation = plain;
+    creation.flags = core.txs.FLAG_TO_ABSENT;
+    creation.to = [_]u8{0} ** 20;
+    try std.testing.expectEqual(@as(?[20]u8, null), Tx.fromRecord(&creation).to);
+}
+
+test "Log(E).tx exists only for events declaring tx_fields" {
+    const Declared = struct {
+        pub const signature = "Transfer(address,address,uint256)";
+        pub const tx_fields = true;
+    };
+    try std.testing.expectEqual(Tx, @FieldType(Log(Declared), "tx"));
+    try std.testing.expectEqual(void, @FieldType(Log(Transfer), "tx"));
+}
+
+test "dispatch gates a cross-emitted event to its declaring contract" {
+    // Disjoint per-contract events: A declares Transfer, B declares Approval.
+    // B emitting a Transfer (an LP token under a Swap-only entry, say) must not
+    // reach handleTransfer. Single-contract and homogeneous manifests skip the
+    // gate (compiled identically), so this disjoint manifest is the only one
+    // that pays for it.
+    const A: [20]u8 = [_]u8{0xA1} ** 20;
+    const B: [20]u8 = [_]u8{0xB2} ** 20;
+    const HetManifest: manifest.Manifest = .{
+        .name = "het",
+        .chain_id = 1,
+        .start_block = 0,
+        .contracts = &.{
+            .{ .name = "A", .address = A, .events = &.{Transfer} },
+            .{ .name = "B", .address = B, .events = &.{Approval} },
+        },
+    };
+    // Degenerate manifests carry no gate, the disjoint one gates both events.
+    try std.testing.expect(comptime !manifest.dispatchGateNeeded(TestManifest, Transfer));
+    try std.testing.expect(comptime manifest.dispatchGateNeeded(HetManifest, Transfer));
+    try std.testing.expect(comptime manifest.dispatchGateNeeded(HetManifest, Approval));
+
+    const D = dispatcherFor(HetManifest);
+    comptime D.validateHandler(Counter);
+    const tt = comptime manifest.eventTopic0(Transfer);
+    const at = comptime manifest.eventTopic0(Approval);
+
+    var c = Counter{};
+    try D.dispatch(Counter, makeLogFrom(tt, A), &c); // A's Transfer, dispatched
+    try D.dispatch(Counter, makeLogFrom(tt, B), &c); // B's Transfer, gated out
+    try D.dispatch(Counter, makeLogFrom(at, B), &c); // B's Approval, dispatched
+    try D.dispatch(Counter, makeLogFrom(at, A), &c); // A's Approval, gated out
+
+    try std.testing.expectEqual(@as(u32, 1), c.transfers);
+    try std.testing.expectEqual(@as(u32, 1), c.approvals);
+}
+
+test "dispatch passes every declarer of a shared event through the gate" {
+    // A and B both declare Transfer, C does not: the gate compiles for
+    // Transfer with two declarers and both must pass its unrolled compare
+    // chain. The single-declarer tests never run the second compare.
+    const A: [20]u8 = [_]u8{0xA1} ** 20;
+    const B: [20]u8 = [_]u8{0xB2} ** 20;
+    const C: [20]u8 = [_]u8{0xC3} ** 20;
+    const TriManifest: manifest.Manifest = .{
+        .name = "tri",
+        .chain_id = 1,
+        .start_block = 0,
+        .contracts = &.{
+            .{ .name = "A", .address = A, .events = &.{Transfer} },
+            .{ .name = "B", .address = B, .events = &.{Transfer} },
+            .{ .name = "C", .address = C, .events = &.{Approval} },
+        },
+    };
+    try std.testing.expect(comptime manifest.dispatchGateNeeded(TriManifest, Transfer));
+
+    const D = dispatcherFor(TriManifest);
+    comptime D.validateHandler(Counter);
+    const tt = comptime manifest.eventTopic0(Transfer);
+
+    var c = Counter{};
+    try D.dispatch(Counter, makeLogFrom(tt, A), &c); // first declarer, dispatched
+    try D.dispatch(Counter, makeLogFrom(tt, B), &c); // second declarer, dispatched
+    try D.dispatch(Counter, makeLogFrom(tt, C), &c); // non-declarer, gated out
+
+    try std.testing.expectEqual(@as(u32, 2), c.transfers);
+}
+
+test "a factory child cannot cross-emit a static-only event" {
+    // A token declares Transfer; a factory spawns children. A child is an
+    // arbitrary contract that can emit Transfer (an LP-token pair), but no
+    // factory declared Transfer, so the dispatcher gates it: the comptime
+    // static-declarer check excludes every non-token address, children included.
+    const X: [20]u8 = [_]u8{0x11} ** 20;
+    const PairCreated = struct {
+        pub const signature = "PairCreated(address,address,address,uint256)";
+    };
+    const Swap = struct {
+        pub const signature = "Swap(address,uint256,uint256,uint256,uint256,address)";
+    };
+    const FacManifest: manifest.Manifest = .{
+        .name = "fac",
+        .chain_id = 1,
+        .start_block = 0,
+        .contracts = &.{.{ .name = "X", .address = X, .events = &.{Transfer} }},
+        .factories = &.{.{ .name = "F", .address = [_]u8{0x33} ** 20, .create_event = PairCreated, .spawn_param = "pair", .child_events = &.{Swap} }},
+    };
+    // Transfer (static-only, factory present) gates; the token passes, a child does not.
+    try std.testing.expect(comptime manifest.dispatchGateNeeded(FacManifest, Transfer));
+    try std.testing.expect(comptime manifest.contractDeclaredEvent(FacManifest, Transfer, X));
+    try std.testing.expect(comptime !manifest.contractDeclaredEvent(FacManifest, Transfer, [_]u8{0x22} ** 20));
+    // Swap is a factory child event, but a static contract present didn't
+    // declare it, so it gates too: the contract is rejected, children pass.
+    try std.testing.expect(comptime manifest.dispatchGateNeeded(FacManifest, Swap));
+    try std.testing.expect(comptime !manifest.isLegitEmitter(FacManifest, Swap, X));
+    try std.testing.expect(comptime manifest.isLegitEmitter(FacManifest, Swap, [_]u8{0x22} ** 20));
+
+    // End to end: the token's stray Swap is gated out, a child's Swap dispatches.
+    const HandlerS = struct {
+        swaps: u32 = 0,
+        pub fn handleTransfer(_: Log(Transfer), _: *@This()) !void {}
+        pub fn handleSwap(_: Log(Swap), self: *@This()) !void {
+            self.swaps += 1;
+        }
+        pub fn handlePairCreated(_: Log(PairCreated), _: *@This()) !void {}
+    };
+    const D = dispatcherFor(FacManifest);
+    const st = comptime manifest.eventTopic0(Swap);
+    var h = HandlerS{};
+    try D.dispatch(HandlerS, makeLogFrom(st, X), &h); // token's Swap, gated out
+    try D.dispatch(HandlerS, makeLogFrom(st, [_]u8{0x22} ** 20), &h); // child's Swap, dispatched
+    try std.testing.expectEqual(@as(u32, 1), h.swaps);
 }
 
 test "dispatch routes by topic0" {
@@ -613,6 +829,61 @@ test "param returns the right narrow integer type for sub-256 uintN" {
     try std.testing.expectEqual(u112, @TypeOf(r1));
     try std.testing.expectEqual(@as(u112, 0x1234), r0);
     try std.testing.expectEqual(@as(u112, 0xabcd), r1);
+}
+
+test "decode extracts a dynamic string param as a []const u8 borrow (ADR-005)" {
+    const NameReg = struct {
+        pub const signature = "NameRegistered(string name, uint256 cost)";
+    };
+    const name = "vitalik.eth";
+    // ABI: head[0] = offset to the string tail (past the 2-word head = 0x40),
+    // head[1] = cost. Tail: length word, then the bytes (32-byte padded).
+    var data_buf: [128]u8 = std.mem.zeroes([128]u8);
+    std.mem.writeInt(u256, data_buf[0..32], 0x40, .big);
+    std.mem.writeInt(u256, data_buf[32..64], 42, .big);
+    std.mem.writeInt(u256, data_buf[64..96], name.len, .big);
+    @memcpy(data_buf[96..][0..name.len], name);
+
+    const log: DecodedLog = .{
+        .block_number = 1,
+        .tx_index = 0,
+        .log_index = 0,
+        .tx_hash = [_]u8{0} ** 32,
+        .address = [_]u8{0} ** 20,
+        .topics = std.mem.zeroes([4][32]u8),
+        .topic_count = 1,
+        .data = &data_buf,
+    };
+
+    const d = log.decode(NameReg);
+    try std.testing.expectEqual([]const u8, @TypeOf(d.name));
+    try std.testing.expectEqualSlices(u8, name, d.name);
+    try std.testing.expectEqual(@as(u256, 42), d.cost);
+    // The slot-positional helper resolves the same bytes.
+    try std.testing.expectEqualSlices(u8, name, log.param(NameReg, "name"));
+}
+
+test "decode extracts dynamic bytes and tolerates a truncated tail" {
+    const Blob = struct {
+        pub const signature = "Blob(bytes payload)";
+    };
+    // Well-formed: 3-byte payload.
+    {
+        var data_buf: [96]u8 = std.mem.zeroes([96]u8);
+        std.mem.writeInt(u256, data_buf[0..32], 0x20, .big); // offset
+        std.mem.writeInt(u256, data_buf[32..64], 3, .big); // length
+        data_buf[64..67].* = [_]u8{ 0xDE, 0xAD, 0xBE };
+        const log: DecodedLog = .{ .block_number = 0, .tx_index = 0, .log_index = 0, .tx_hash = [_]u8{0} ** 32, .address = [_]u8{0} ** 20, .topics = std.mem.zeroes([4][32]u8), .topic_count = 1, .data = &data_buf };
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 0xDE, 0xAD, 0xBE }, log.decode(Blob).payload);
+    }
+    // Malformed: length claims 99 bytes but data is short. Yields empty, no OOB.
+    {
+        var data_buf: [64]u8 = std.mem.zeroes([64]u8);
+        std.mem.writeInt(u256, data_buf[0..32], 0x20, .big);
+        std.mem.writeInt(u256, data_buf[32..64], 99, .big);
+        const log: DecodedLog = .{ .block_number = 0, .tx_index = 0, .log_index = 0, .tx_hash = [_]u8{0} ** 32, .address = [_]u8{0} ** 20, .topics = std.mem.zeroes([4][32]u8), .topic_count = 1, .data = &data_buf };
+        try std.testing.expectEqual(@as(usize, 0), log.decode(Blob).payload.len);
+    }
 }
 
 test "decode returns a struct with one field per named parameter, correct types" {

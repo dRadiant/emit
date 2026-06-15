@@ -1,6 +1,6 @@
-/// Comptime-generic bloom filter. Topic blooms use 256 bytes (2048 bits).
-/// Address blooms use 1024 bytes (8192 bits) for lower FP on blocks with
-/// hundreds of unique addresses (~3.4% FP at 500 addresses vs 25% at 256 bytes).
+//! Comptime-generic bloom filter. Topic blooms use 256 bytes (2048 bits).
+//! Address blooms use 1024 bytes (8192 bits) for lower FP on blocks with
+//! hundreds of unique addresses (~3.4% FP at 500 addresses vs 25% at 256 bytes).
 const std = @import("std");
 
 /// k=7 hash functions from non-overlapping 2-byte windows of the 32-byte key.
@@ -28,19 +28,11 @@ pub fn BloomFilter(comptime SIZE: comptime_int) type {
         }
 
         pub fn mightContain(self: *const Self, key: [32]u8) bool {
-            inline for (0..NUM_HASHES) |i| {
-                const pos = bitPosition(key, i);
-                if (self.bits[pos / 8] & (@as(u8, 1) << @intCast(pos % 8)) == 0)
-                    return false;
-            }
-            return true;
+            return bytesContain(&self.bits, key);
         }
 
         pub fn mightContainAny(self: *const Self, keys: []const [32]u8) bool {
-            for (keys) |k| {
-                if (self.mightContain(k)) return true;
-            }
-            return false;
+            return bytesContainAny(&self.bits, keys);
         }
 
         /// Check bloom from a raw byte pointer (e.g., directly from mmap'd blooms.bin).

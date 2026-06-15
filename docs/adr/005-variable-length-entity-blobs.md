@@ -1,6 +1,6 @@
 # ADR-005: Variable-Length Entity Fields — Out-of-Line Blobs
 
-**Status**: Proposed
+**Status**: Implemented
 **Date**: 2026-06-05 (proposed)
 **Context**: ADR-003 established the SDK's pure-Zig storage: fixed-stride sorted slabs in `state.snap` for `MutableStore`, append-only `<entity>.events.dat` for `ImmutableStore`, both serialized by the comptime `entity_serial.zig`. That serializer accepts only integers and fixed-size `[N]u8` arrays — every record has a comptime-constant width, which is what makes the slab binary-searchable (`base + i·stride`) and the records stack-copyable. This ADR decides how to add **variable-length fields** (Solidity `string`, dynamic `bytes`, flat dynamic arrays) without giving up any of those properties.
 
@@ -147,12 +147,22 @@ Rationale:
 - An offline `blobs.dat` compaction utility (deferrable — only needed for heavy mutable-blob churn).
 - No migration tool — consistent with ADR-003, operators delete the entity dir and re-backfill.
 
-### Open questions
+### Open questions — resolved at implementation
 
-- **Marker type.** `sdk.Text` / `sdk.Bytes` newtypes vs. detecting raw `[]const u8` in the serializer. A named marker reads more clearly at the entity definition and avoids ambiguity with any future genuine `[]const u8` use; leaning that way.
-- **Null vs empty.** v1.2 treats `(offset=0, len=0)` as empty and does not distinguish "absent." An explicit optional would need a sentinel bit; defer until a use case needs the distinction.
-- **Compaction trigger.** Manual utility first; an auto-compact-at-dead-ratio threshold only if a real churning-blob workload appears.
-- **Array support in v1.2.** Ship flat dynamic arrays with strings, or strings-first then arrays — decide at implementation based on demand.
+- **Marker type — plain `[]const u8`, no newtype.** The `sdk.Text`/`sdk.Bytes` newtypes were dropped. A field's type *is* the declaration (`label: []const u8`), read like any other field, no `.bytes` accessor. The feared ambiguity with "future genuine `[]const u8`" does not exist (an entity slice field has no other meaning), and plain slices extend to `[]const T` arrays for free. `entity_serial.fieldKind` classifies a `[]const T` (fixed-size `T`) field as a blob; any other slice type is a loud compile error.
+- **Array support — shipped with strings.** `[]const u8` (string/bytes) and `[]const T` for a fixed-size `T` (`[]const u64`, `[]const [20]u8`) both land. The writer aligns the blob offset to `@alignOf(T)`, so a `[]const T` read is a zero-copy aligned cast (host order == on-disk LE on x86-64). Nested dynamics (`[]const []const u8`) stay a compile error.
+- **Null vs empty.** Kept: `(offset=0, len=0)` is the empty slice; no "absent" distinction.
+- **Compaction trigger.** Kept: manual offline utility only, deferred until a churning-blob workload appears.
+
+### Read lifetime (an addition not in the original design)
+
+A blob field read borrows the store mmap, and `Context.read`/`count`/`range` release the lock on return — so a value handed past the lock would dangle on a concurrent commit (live mode). Resolution: those auto-locking accessors are a **compile error** for blob entities, which are read through `ctx.readView()` — a guard that holds the lock across the borrow's use (the caller copies out before `deinit`). Handlers are unaffected (they already run under the lock).
+
+## Implementation & verification (2026-06-14)
+
+Both `MutableStore` (backfill + live overlay with per-block arenas, reorg-safe) and `ImmutableStore` (append-stage with the same per-block arena discipline, garbage-free since write-once) blob paths landed, plus the `state.snap` conditional v2 header, the `blob_log.zig` append-stage-mmap module with crash-tail safety, the `readView` guard, and top-level `string`/`bytes` ABI decode; the numeric path is byte-identical (the pre-blob test suite passes unchanged). End-to-end on the reference box: an ENS indexer (`examples/ens`) stored each registration's `name` both ways — a mutable `Registration` (latest per label, **799,333**) and an immutable `RegistrationLog` (every registration, **814,437**). `state.snap` v2 carried two blob stores (`blob_bytes[2]`, ~9 MB each); 400/400 mutable and 300/300 immutable sampled names matched an independent `eth_getLogs` decode, the immutable log's keys were monotonic, and the reference `blob_reader.py` re-derives the names straight from the documented format.
+
+**Cost, measured.** A three-way benchmark over the same filtered index (799,333 records, mean of 3 warm replays, shared ~13 s filter build excluded): a `[]const u8` blob `name` field replayed in ~2.1 s / 78.8 MB store, a `[32]u8` inline cap of the same data in ~2.4 s / 88.4 MB, and a numeric-only entity (no name) in ~2.6 s / 88.4 MB. The blob path is ~11% smaller and ~10–15% faster than the fixed-cap workaround: the 8-byte `BlobRef` shrinks the per-commit slab rewrite more than the `blobs.dat` append + fsync costs, and exact-length payloads beat a generous cap that also cannot hold longer values. The "Cons" trade-off (a borrowed-slice lifetime, a second file, mutable-blob garbage) is the only real cost; the runtime overhead is not a regression for the common short-value case.
 
 ### Options not chosen
 

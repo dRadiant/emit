@@ -88,7 +88,7 @@ test "streamed FilteredStore matches a local build, with exact timestamps added"
     // Local build for comparison.
     var local = std.testing.tmpDir(.{});
     defer local.cleanup();
-    _ = try filter_builder.build(&reader, TokenManifest, local.dir, allocator);
+    _ = try filter_builder.build(&reader, TokenManifest, null, local.dir, allocator);
 
     // Remote stream into a separate store.
     var server = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
@@ -200,6 +200,14 @@ test "remote init produces the same entity state as a local init" {
     try std.testing.expectEqual(@as(u64, 2), remote_ctx.stats.blocks_dispatched);
     try std.testing.expectEqual(local_ctx.stats.blocks_dispatched, remote_ctx.stats.blocks_dispatched);
     try std.testing.expectEqual(local_ctx.count(Hit), remote_ctx.count(Hit));
+
+    // Indexed span is reported on both paths, not left at 0 on remote. Local
+    // reads it from the flat reader, remote from the streamed store. Endpoints
+    // coincide here since blocks 100 and 102 both match.
+    try std.testing.expectEqual(@as(u64, 100), remote_ctx.stats.start_block);
+    try std.testing.expectEqual(@as(u64, 102), remote_ctx.stats.end_block);
+    try std.testing.expectEqual(local_ctx.stats.start_block, remote_ctx.stats.start_block);
+    try std.testing.expectEqual(local_ctx.stats.end_block, remote_ctx.stats.end_block);
 
     // Record by record: same block, and the same exact timestamp (local reads
     // it from timestamps.bin, remote from the streamed FilteredStore entry).
@@ -475,6 +483,180 @@ test "remote follow rolls back a reorged live block and applies the canonical on
     try fake.reorg(101);
     try fake.ingest(101, [_]u8{0xBB} ** 32, &.{ transferLog(101, 0), transferLog(101, 1) });
     try std.testing.expect(try waitForCount(ctx, 3));
+}
+
+// ── Tx-fields streaming ─────────────────────────────────────────────────────
+
+// Transfer variant opting into `log.tx`. A distinct type keeps the other
+// manifests in this file tx-blind.
+const TxTransfer = struct {
+    pub const signature = "Transfer(address,address,uint256)";
+    pub const tx_fields = true;
+};
+
+const TxTokenManifest: sdk_manifest.Manifest = .{
+    .name = "loopback-tx",
+    .chain_id = 1,
+    .start_block = 0,
+    .contracts = &.{.{ .name = "Token", .address = ADDR_TOKEN, .events = &.{TxTransfer} }},
+};
+
+// Per-dispatch tally over the decoded tx fields. Sums make a wrong or stale
+// record visible, not just a missing one.
+const TxTally = struct {
+    pub const storage: sdk.StorageMode = .mutable;
+    id: u64,
+    count: u64,
+    from_sum: u64,
+    val_sum: u64,
+};
+
+const TxTallyHandler = struct {
+    pub fn handleTransfer(log: sdk.handler.Log(TxTransfer), ctx: anytype) !void {
+        var c = try ctx.stores.txTallys.loadOrInit(@as(u64, 0));
+        c.count += 1;
+        c.from_sum += log.tx.from[0];
+        c.val_sum += @as(u64, @intCast(log.tx.value));
+        try ctx.stores.txTallys.save(c);
+    }
+};
+
+fn waitForTxCount(ctx: anytype, target: u64) !bool {
+    var waited: u64 = 0;
+    while (waited < 3000) : (waited += 20) {
+        const c = try ctx.read(TxTally, @as(u64, 0));
+        if (c) |v| if (v.count == target) return true;
+        std.Thread.sleep(20 * std.time.ns_per_ms);
+    }
+    return false;
+}
+
+fn txRec(tx_index: u16, seed: u8) core.txs.TxRecord {
+    return .{
+        .tx_index = tx_index,
+        .tx_type = 2,
+        .flags = 0,
+        .from = [_]u8{seed} ** 20,
+        .to = [_]u8{seed +% 1} ** 20,
+        .value = [_]u8{seed} ++ [_]u8{0} ** 31,
+    };
+}
+
+fn transferLogAt(block: u64, tx_index: u16, log_index: u16) core.RawLog {
+    var log = transferLog(block, log_index);
+    log.tx_index = tx_index;
+    return log;
+}
+
+test "local init with tx_fields fails loud without txs.dat, then resolves with it" {
+    const allocator = std.testing.allocator;
+    const tt = sdk_manifest.eventTopic0(Transfer);
+
+    const blocks = [_]TestBlock{
+        .{ .block_number = 100, .timestamp = 1_700_000_000, .logs = &.{.{ .address = ADDR_TOKEN, .topic0 = tt, .tx_index = 4 }} },
+    };
+    var src = std.testing.tmpDir(.{});
+    defer src.cleanup();
+    try writeTestStore(src.dir, &blocks, allocator);
+    var src_path: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try src.dir.realpath(".", &src_path);
+
+    var data = std.testing.tmpDir(.{});
+    defer data.cleanup();
+    var dd: [std.fs.max_path_bytes]u8 = undefined;
+    const data_path = try data.dir.realpath(".", &dd);
+
+    // No txs.{dat,idx}: a tx-enabled manifest must refuse at init.
+    try std.testing.expectError(error.TxFieldsUnavailable, sdk.entry.init(TxTokenManifest, TxTallyHandler, .{TxTally}, .{
+        .engine_data_dir = path,
+        .data_dir = data_path,
+    }, allocator));
+
+    {
+        var sbuf: [4096]u8 = undefined;
+        var cbuf: [4096]u8 = undefined;
+        var tw = try core.txs.TxsWriter.open(src.dir, 100);
+        defer tw.deinit();
+        try tw.append(100, &.{txRec(4, 0x44)}, &sbuf, &cbuf);
+    }
+
+    const ctx = try sdk.entry.init(TxTokenManifest, TxTallyHandler, .{TxTally}, .{
+        .engine_data_dir = path,
+        .data_dir = data_path,
+    }, allocator);
+    defer ctx.deinit();
+
+    const c = (try ctx.read(TxTally, @as(u64, 0))).?;
+    try std.testing.expectEqual(@as(u64, 1), c.count);
+    try std.testing.expectEqual(@as(u64, 0x44), c.from_sum);
+}
+
+test "remote tx_fields: backfill and live PUSH both carry resolvable TxRecords" {
+    const allocator = std.testing.allocator;
+    const tt = sdk_manifest.eventTopic0(Transfer);
+
+    // Backfill: block 100 with a Transfer in tx 1. The table also holds tx 0
+    // (a log-producing tx the filter drops) to prove the carry selects.
+    const blocks = [_]TestBlock{
+        .{ .block_number = 100, .timestamp = 1_700_000_000, .logs = &.{
+            .{ .address = ADDR_OTHER, .topic0 = tt, .tx_index = 0 },
+            .{ .address = ADDR_TOKEN, .topic0 = tt, .tx_index = 1, .log_index = 1 },
+        } },
+    };
+    var src = std.testing.tmpDir(.{});
+    defer src.cleanup();
+    try writeTestStore(src.dir, &blocks, allocator);
+    {
+        var sbuf: [4096]u8 = undefined;
+        var cbuf: [4096]u8 = undefined;
+        var tw = try core.txs.TxsWriter.open(src.dir, 100);
+        defer tw.deinit();
+        try tw.append(100, &.{ txRec(0, 0xAA), txRec(1, 0x11) }, &sbuf, &cbuf);
+    }
+    var src_path: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try src.dir.realpath(".", &src_path);
+
+    var fake = fake_engine.FakeEngine.init(src.dir, allocator);
+    defer fake.deinit();
+
+    var reader = try FlatStoreReader.open(path);
+    defer reader.deinit();
+    var ts_reader = try TimestampReader.open(src.dir);
+    defer if (ts_reader) |*r| r.deinit();
+    const ts_ptr: ?*const TimestampReader = if (ts_reader) |*r| r else null;
+
+    var server = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+    var sctx = ServeCtx{ .server = &server, .reader = &reader, .ts = ts_ptr, .allocator = allocator, .conns = 2, .data_dir = path, .heartbeat_ms = 100 };
+    const th = try std.Thread.spawn(.{}, ServeCtx.run, .{&sctx});
+    defer th.join();
+
+    var remote_data = std.testing.tmpDir(.{});
+    defer remote_data.cleanup();
+    var rd: [std.fs.max_path_bytes]u8 = undefined;
+    const ctx = try sdk.entry.spawn(TxTokenManifest, TxTallyHandler, .{TxTally}, .{
+        .engine_data_dir = path,
+        .data_dir = try remote_data.dir.realpath(".", &rd),
+        .remote_engine = .{ .host = "127.0.0.1", .port = port },
+    }, allocator);
+    defer ctx.deinit();
+
+    // Backfill dispatched the kept log with tx 1's record.
+    {
+        const c = try ctx.read(TxTally, @as(u64, 0));
+        try std.testing.expect(c != null);
+        try std.testing.expectEqual(@as(u64, 1), c.?.count);
+        try std.testing.expectEqual(@as(u64, 0x11), c.?.from_sum);
+        try std.testing.expectEqual(@as(u64, 0x11), c.?.val_sum);
+    }
+
+    // Live: the pending entry's table feeds the PUSH subtable.
+    try fake.ingestWithTxs(101, [_]u8{0xBB} ** 32, &.{transferLogAt(101, 2, 0)}, &.{txRec(2, 0x22)});
+    try std.testing.expect(try waitForTxCount(ctx, 2));
+    const c = (try ctx.read(TxTally, @as(u64, 0))).?;
+    try std.testing.expectEqual(@as(u64, 0x11 + 0x22), c.from_sum);
+    try std.testing.expectEqual(@as(u64, 0x11 + 0x22), c.val_sum);
 }
 
 const CHILD2_ADDR: [20]u8 = [_]u8{0xC2} ** 20;

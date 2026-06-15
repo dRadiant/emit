@@ -50,9 +50,25 @@ pub const FlatStoreWriter = struct {
             var buf: [flat_reader.META_SIZE]u8 = undefined;
             const n = meta_file.pread(&buf, 0) catch 0;
             if (n == flat_reader.META_SIZE) {
-                if (Meta.deserialize(&buf)) |m| meta = m;
+                if (Meta.deserialize(&buf)) |m| meta = m else {
+                    // Treating a corrupt meta as a fresh store would loop the
+                    // follower on NonDenseAppend with no hint of the cause.
+                    core.log.err("meta.bin is corrupt (checksum mismatch). Restore it or re-import.\n", .{});
+                    return error.CorruptMeta;
+                }
             }
         } else |_| {}
+
+        // A blocks.dat shorter than the committed size means the store lost
+        // finalized bytes. Appending past EOF would hand readers garbage.
+        // Larger is fine, an orphan tail from a crash before the meta commit.
+        if (meta.blocks_dat_size > 0) {
+            const dat_size = (try blocks_file.stat()).size;
+            if (dat_size < meta.blocks_dat_size) {
+                core.log.err("blocks.dat is {d} bytes, meta committed {d}. Truncated store, re-import.\n", .{ dat_size, meta.blocks_dat_size });
+                return error.TruncatedBlocksDat;
+            }
+        }
 
         // Read first_block from index header, or pre-init empty headers so a
         // FlatStoreReader can open this dir before the first block finalizes.

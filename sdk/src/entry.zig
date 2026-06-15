@@ -19,6 +19,7 @@ const std = @import("std");
 const core = @import("core");
 
 const eth = @import("eth");
+const entity_serial = @import("entity_serial.zig");
 const ethcall = @import("ethcall.zig");
 const event_log_mod = @import("event_log.zig");
 const filter_builder = @import("filter_builder.zig");
@@ -51,13 +52,15 @@ pub const Options = struct {
     /// for chains without the canonical deployment.
     multicall_address: [20]u8 = CANONICAL_MULTICALL3,
     multicall_batch_size: usize = ethcall.DEFAULT_BATCH_SIZE,
-    /// When true, `run` and `init` block after backfill and enter the
-    /// live head-following loop. `init` never returns.
+    /// When true, `run` blocks after backfill in the live head-following
+    /// loop and `spawn` runs that loop on a background thread. `init`
+    /// backfills (including the follow gap-fill) and returns without
+    /// entering the loop.
     follow: bool = false,
     /// When set, stream the filtered backfill from a remote engine `serve`
     /// listener instead of reading a local flat store at `engine_data_dir`.
-    /// Backfill only. Live following over the stream is a separate capability,
-    /// so remote with `follow` is rejected.
+    /// With `follow`, live blocks stream over the same connection
+    /// (`tcp_client.follow`), reconnecting from the committed cursor.
     remote_engine: ?RemoteEngine = null,
 };
 
@@ -85,6 +88,9 @@ pub const RunStats = struct {
     discovered_children: u32 = 0,
     logs_dispatched: u64 = 0,
     blocks_dispatched: u64 = 0,
+    // Inclusive block span the run covered, from the engine store index.
+    start_block: u64 = 0,
+    end_block: u64 = 0,
     commits_performed: u32 = 0,
     prefetch_calls_gathered: u64 = 0,
     prefetch_calls_executed: u64 = 0,
@@ -97,6 +103,82 @@ pub const RunStats = struct {
     replay_ns: u64 = 0,
     elapsed_ns: u64 = 0,
 };
+
+/// Render the full stats block at info level. Shown automatically under
+/// `--verbose` at run completion. Default runs get a one-line summary
+/// instead. Factory fields read zero for non-factory indexers, kept visible
+/// so users can confirm no children were unexpectedly discovered.
+pub fn printStats(prog_name: []const u8, stats: RunStats) void {
+    const ms = std.time.ns_per_ms;
+    const phases = stats.filter_build_ns + stats.scan_creations_ns + stats.append_children_ns + stats.prefetch_ns + stats.replay_ns;
+    const overhead_ns = if (stats.elapsed_ns > phases) stats.elapsed_ns - phases else 0;
+    // Batch count derived from executed pairs and the default Multicall3
+    // chunk. Exact count would need the per-run override routed through stats.
+    const batches = (stats.prefetch_calls_executed + ethcall.DEFAULT_BATCH_SIZE - 1) / ethcall.DEFAULT_BATCH_SIZE;
+    core.log.info(
+        \\{s} indexer complete
+        \\  start block:       {d}
+        \\  end block:         {d}
+        \\  blocks scanned:    {d}
+        \\  blocks matched:    {d}
+        \\  filter logs:       {d}
+        \\  discovered child:  {d}
+        \\  child blocks:      {d}
+        \\  child logs:        {d}
+        \\  logs dispatched:   {d}
+        \\  blocks dispatched: {d}
+        \\  commits:           {d}
+        \\  phases skipped:    {}
+        \\  prefetch gathered: {d}
+        \\  prefetch executed: {d}
+        \\  prefetch batches:  {d}
+        \\  ── timing ──
+        \\  filter build:      {d} ms
+        \\  scan creations:    {d} ms
+        \\  append children:   {d} ms
+        \\  prefetch:          {d} ms
+        \\  replay:            {d} ms
+        \\  overhead:          {d} ms
+        \\  elapsed:           {d} ms
+        \\
+    , .{
+        prog_name,
+        stats.start_block,
+        stats.end_block,
+        stats.filter_blocks_scanned,
+        stats.filter_blocks_matched,
+        stats.filter_total_logs,
+        stats.discovered_children,
+        stats.children_blocks_matched,
+        stats.children_total_logs,
+        stats.logs_dispatched,
+        stats.blocks_dispatched,
+        stats.commits_performed,
+        stats.phases_skipped,
+        stats.prefetch_calls_gathered,
+        stats.prefetch_calls_executed,
+        batches,
+        stats.filter_build_ns / ms,
+        stats.scan_creations_ns / ms,
+        stats.append_children_ns / ms,
+        stats.prefetch_ns / ms,
+        stats.replay_ns / ms,
+        overhead_ns / ms,
+        stats.elapsed_ns / ms,
+    });
+}
+
+/// Backfill-completion announcement for the blocking entry points that never
+/// return (`run --follow`, `spawn`). One line at the default level, the full
+/// stats block under `--verbose`. Backfill-only `run` returns stats and the
+/// caller owns the print.
+fn announceBackfill(comptime m: sdk_manifest.Manifest, stats: RunStats) void {
+    if (core.log.getLevel() == .verbose)
+        printStats(m.name, stats)
+    else
+        core.log.info("{s}: backfill done in {d} ms ({d} logs dispatched)\n", .{ m.name, stats.elapsed_ns / std.time.ns_per_ms, stats.logs_dispatched });
+    core.log.info("{s}: following the chain head\n", .{m.name});
+}
 
 /// Comptime-generate the long-lived context type. `entities` is the user's
 /// tuple of entity types, each declaring
@@ -115,7 +197,9 @@ pub fn Context(comptime entities: anytype) type {
     const EventLogs = EventLogsStruct(entities);
     return struct {
         const Self = @This();
-        pub const Snap = state_snap_mod.StateSnap(mutableCount(entities), immutableCount(entities));
+        /// Resolved entity type list, evaluated once for every `inline for`.
+        const entity_list = resolveEntities(entities);
+        pub const Snap = state_snap_mod.StateSnap(mutableCount(entities), immutableCount(entities), blobStoreCount(entities));
 
         block_number: u64 = 0,
         timestamp: u64 = 0,
@@ -159,12 +243,16 @@ pub fn Context(comptime entities: anytype) type {
         /// immutable store's live log (finalized records plus the overlay). Not
         /// for handlers, which already run under the loop's lock so a read here
         /// would deadlock.
+        ///
+        /// Blob entities (ADR-005) cannot use this path: a blob field is a
+        /// slice borrowing the store mmap, and `read` releases the lock on
+        /// return, so a concurrent commit could remap under the borrow. Read
+        /// them through `readView`, which holds the lock across the borrow.
         pub fn read(self: *Self, comptime T: type, key: anytype) !?T {
+            comptime assertNoBlobs(T, "read");
             self.lock();
             defer self.unlock();
-            const store = &@field(self.stores, entityFieldName(T));
-            if (comptime T.storage == .immutable) return store.get(key);
-            return store.load(key);
+            return self.readLocked(T, key);
         }
 
         /// Live record count of immutable entity `T` (finalized + overlay).
@@ -180,13 +268,59 @@ pub fn Context(comptime entities: anytype) type {
         /// `T` in ascending key order, returning the filled prefix. Tip-overlay
         /// aware and taken under the Context lock, so callers never lock
         /// directly. Build a newest-first page with `start = count(T) - n`.
-        /// Mutable entities are point-read by key via `read`.
+        /// `count` and `range` take the lock separately, so a commit between
+        /// the two can shift the page by a few records. Never incoherent data,
+        /// just a moved window. Wrap both in `lock`/`unlock` for a pinned page.
+        /// Mutable entities are point-read by key via `read`. Blob entities use
+        /// `readView` (the filled `out` would borrow the mmap past the lock).
         pub fn range(self: *Self, comptime T: type, start: u64, out: []T) ![]T {
             comptime assertImmutable(T, "range");
+            comptime assertNoBlobs(T, "range");
             self.lock();
             defer self.unlock();
             return @field(self.stores, entityFieldName(T)).range(start, out);
         }
+
+        fn readLocked(self: *Self, comptime T: type, key: anytype) !?T {
+            const store = &@field(self.stores, entityFieldName(T));
+            if (comptime T.storage == .immutable) return store.get(key);
+            return store.load(key);
+        }
+
+        /// Open a read view: holds the Context lock so blob field slices stay
+        /// valid for the borrow's use, then released on `deinit`. The sound way
+        /// to read blob entities from an external thread (ADR-005). Numeric
+        /// entities can use it too for a pinned multi-read snapshot. Copy any
+        /// blob bytes out before `deinit` if they must outlive the view. Never
+        /// open a view from a handler, which already holds the lock.
+        pub fn readView(self: *Self) ReadView {
+            self.lock();
+            return .{ .ctx = self };
+        }
+
+        /// RAII read guard from `readView`. Reads borrow the store mmap and are
+        /// valid until `deinit` releases the lock.
+        pub const ReadView = struct {
+            ctx: *Self,
+
+            pub fn read(self: ReadView, comptime T: type, key: anytype) !?T {
+                return self.ctx.readLocked(T, key);
+            }
+
+            pub fn count(self: ReadView, comptime T: type) u64 {
+                comptime assertImmutable(T, "count");
+                return @field(self.ctx.stores, entityFieldName(T)).count();
+            }
+
+            pub fn range(self: ReadView, comptime T: type, start: u64, out: []T) ![]T {
+                comptime assertImmutable(T, "range");
+                return @field(self.ctx.stores, entityFieldName(T)).range(start, out);
+            }
+
+            pub fn deinit(self: ReadView) void {
+                self.ctx.unlock();
+            }
+        };
 
         /// Manual guard for multi-key snapshots. Prefer `read` for single keys.
         pub fn lock(self: *Self) void {
@@ -245,14 +379,14 @@ pub fn Context(comptime entities: anytype) type {
         pub fn commitCycle(self: *Self) !void {
             // Flush ImmutableStore appends to events.dat first. Their new
             // record counts feed the next state.snap.
-            inline for (comptime resolveEntities(entities)) |T| {
+            inline for (entity_list) |T| {
                 if (comptime T.storage == .immutable) {
                     const field_name = comptime entityFieldName(T);
                     var store = &@field(self.stores, field_name);
                     try store.flushAppends();
                 }
             }
-            inline for (comptime resolveEntities(entities)) |T| {
+            inline for (entity_list) |T| {
                 if (comptime T.storage == .immutable) {
                     const field_name = comptime entityFieldName(T);
                     var log = &@field(self._event_logs, field_name);
@@ -264,7 +398,7 @@ pub fn Context(comptime entities: anytype) type {
             var slabs: [Snap.mutable_count][]const u8 = undefined;
             var slab_bufs: [Snap.mutable_count][]u8 = undefined;
             comptime var slab_idx_init: usize = 0;
-            inline for (comptime resolveEntities(entities)) |T| {
+            inline for (entity_list) |T| {
                 if (comptime T.storage == .mutable) {
                     const field_name = comptime entityFieldName(T);
                     var store = &@field(self.stores, field_name);
@@ -279,7 +413,7 @@ pub fn Context(comptime entities: anytype) type {
             // Collect new immutable record counts.
             var counts: [Snap.immutable_count]u64 = undefined;
             comptime var count_idx_init: usize = 0;
-            inline for (comptime resolveEntities(entities)) |T| {
+            inline for (entity_list) |T| {
                 if (comptime T.storage == .immutable) {
                     const field_name = comptime entityFieldName(T);
                     const store = &@field(self.stores, field_name);
@@ -288,11 +422,28 @@ pub fn Context(comptime entities: anytype) type {
                 }
             }
 
-            try self._state_snap.commit(self._last_dispatched_block, &slabs, &counts);
+            // Flush each store's staged blob payloads to its blobs.dat (write
+            // + fsync + remap) BEFORE the state.snap rename, then record the
+            // committed lengths in blob-slot order. The ordering keeps a crash
+            // between the two from leaving the snap referencing undurable
+            // bytes (ADR-005). Blobless schemas make this a zero-length array.
+            var blob_bytes: [Snap.blob_count]u64 = undefined;
+            comptime var blob_idx_init: usize = 0;
+            inline for (entity_list) |T| {
+                if (comptime entity_serial.hasBlobs(T)) {
+                    const field_name = comptime entityFieldName(T);
+                    var store = &@field(self.stores, field_name);
+                    try store.flushBlobs();
+                    blob_bytes[blob_idx_init] = store.committedBlobLen();
+                    blob_idx_init += 1;
+                }
+            }
+
+            try self._state_snap.commit(self._last_dispatched_block, &slabs, &counts, &blob_bytes);
 
             // Rebind each MutableStore's slab to the new state.snap body.
             comptime var refresh_idx: usize = 0;
-            inline for (comptime resolveEntities(entities)) |T| {
+            inline for (entity_list) |T| {
                 if (comptime T.storage == .mutable) {
                     const field_name = comptime entityFieldName(T);
                     var store = &@field(self.stores, field_name);
@@ -302,7 +453,7 @@ pub fn Context(comptime entities: anytype) type {
             }
 
             // Advance each ImmutableStore's committed count.
-            inline for (comptime resolveEntities(entities)) |T| {
+            inline for (entity_list) |T| {
                 if (comptime T.storage == .immutable) {
                     const field_name = comptime entityFieldName(T);
                     var store = &@field(self.stores, field_name);
@@ -315,6 +466,10 @@ pub fn Context(comptime entities: anytype) type {
 
         /// Strict cache read, never issues HTTP. Returns `error.NotPrefetched`
         /// for undeclared pairs, `error.CallReverted` for status=1 entries.
+        /// Any `[]const u8` in the result (a dynamic `string`/`bytes`, bare or
+        /// a tuple field) borrows the cache entry's bytes, stable until a
+        /// re-prefetch overwrites the same key. Copy it to hold past the
+        /// current handler.
         pub fn ethCall(
             self: *Self,
             comptime T: type,
@@ -324,6 +479,31 @@ pub fn Context(comptime entities: anytype) type {
             const cache = self._cache orelse return error.NotPrefetched;
             const calldata_hash = comptime ethcall.calldataHashOf(method);
             const entry = cache.getByHash(to, calldata_hash) orelse return error.NotPrefetched;
+            if (entry.status != 0) return error.CallReverted;
+            return ethcall.decodeAs(T, entry.bytes);
+        }
+
+        /// Strict cache read for a parameterized method. `args` is a tuple of
+        /// fixed-size values (the same the prefetch resolved), encoded into the
+        /// calldata `selector ++ word*` so the key matches its prefetched entry.
+        /// `ethCall` is the no-arg fast path.
+        pub fn ethCallArgs(
+            self: *Self,
+            comptime T: type,
+            to: [20]u8,
+            comptime method: []const u8,
+            args: anytype,
+        ) !T {
+            const cache = self._cache orelse return error.NotPrefetched;
+            const sel = comptime ethcall.selectorOf(method);
+            const nargs = std.meta.fields(@TypeOf(args)).len;
+            var calldata: [4 + nargs * 32]u8 = undefined;
+            @memcpy(calldata[0..4], &sel);
+            inline for (args, 0..) |a, i| {
+                const w = ethcall.encodeArg(a);
+                @memcpy(calldata[4 + i * 32 ..][0..32], &w);
+            }
+            const entry = cache.get(to, &calldata) orelse return error.NotPrefetched;
             if (entry.status != 0) return error.CallReverted;
             return ethcall.decodeAs(T, entry.bytes);
         }
@@ -344,6 +524,18 @@ fn immutableCount(comptime entities: anytype) usize {
     comptime {
         var n: usize = 0;
         for (resolveEntities(entities)) |T| if (T.storage == .immutable) {
+            n += 1;
+        };
+        return n;
+    }
+}
+
+/// Count of blob-bearing stores (either kind), the `state.snap` blob slot
+/// count. Slot order is entity-declaration order among blob-bearing types.
+fn blobStoreCount(comptime entities: anytype) usize {
+    comptime {
+        var n: usize = 0;
+        for (resolveEntities(entities)) |T| if (entity_serial.hasBlobs(T)) {
             n += 1;
         };
         return n;
@@ -388,7 +580,10 @@ pub fn run(
     defer ctx.deinit();
     // Headless follow runs the live loop inline on this thread (blocks forever
     // under normal operation). Backfill-only (`follow = false`) returns stats.
-    if (options.follow) try followLoop(m, Handler, ctx, options);
+    if (options.follow) {
+        announceBackfill(m, ctx.stats);
+        try followLoop(m, Handler, ctx, options);
+    }
     return ctx.stats;
 }
 
@@ -403,7 +598,25 @@ pub fn init(
     options: Options,
     allocator: std.mem.Allocator,
 ) !*Context(entities) {
+    // Fail the build on a malformed manifest (empty method strings, a factory
+    // spawn_param of the wrong type that would otherwise yield garbage child
+    // addresses at runtime).
+    comptime sdk_manifest.validateManifest(m);
+
     var timer = try std.time.Timer.start();
+
+    // Banner is verbose-only. Per-phase progress prints at the default level
+    // (the test suite stays quiet via the is_test silent default).
+    core.log.debug(
+        \\
+        \\   ███████ ███    ███ ██ ████████
+        \\   ██      ████  ████ ██    ██
+        \\   █████   ██ ████ ██ ██    ██
+        \\   ██      ██  ██  ██ ██    ██
+        \\   ███████ ██      ██ ██    ██
+        \\
+        \\
+    , .{});
 
     // Derive and mkdir the entity / filter / ethcall subdirs under `data_dir`.
     const entity_dir = try std.fs.path.join(allocator, &.{ options.data_dir, "entity" });
@@ -425,6 +638,7 @@ pub fn init(
     defer if (reader) |*r| r.deinit();
 
     const C = Context(entities);
+    const entity_list = comptime resolveEntities(entities);
     const ctx = try allocator.create(C);
     errdefer allocator.destroy(ctx);
 
@@ -442,6 +656,15 @@ pub fn init(
     errdefer ctx._state_snap.deinit();
     ctx._last_dispatched_block = ctx._state_snap.cursor;
 
+    // Local path reports the engine store's covered span from the flat reader.
+    // Both the cold build and the warm re-run reach here. The remote path has
+    // no reader and sets the span from the streamed store in remoteBackfill.
+    if (reader) |r| {
+        ctx.stats.start_block = r.first_block;
+        ctx.stats.end_block = if (r.index_count == 0) r.first_block else r.first_block + r.index_count - 1;
+        core.log.info("  indexing blocks {d} → {d}\n", .{ ctx.stats.start_block, ctx.stats.end_block });
+    }
+
     // Open the engine's per-block timestamp index if present. Absence (older
     // stores) or a corrupt file leaves it null, and `humanize.timestampOf`
     // falls back to the derivation formula. The mmap outlives the dir handle.
@@ -453,17 +676,30 @@ pub fn init(
         ctx._timestamps = core.timestamps.TimestampReader.open(engine_dh) catch null;
     }
     errdefer if (ctx._timestamps) |*ts| ts.deinit();
+    // Function-scope cleanup for ownership set inside blocks below. The
+    // block-local errdefers expire when their blocks exit, so a later init
+    // failure (replay, gap-fill) must free through the ctx fields. Matters to
+    // spawn-embedding callers that catch the error and retry instead of
+    // exiting.
+    errdefer if (ctx._cache) |c| {
+        c.deinit();
+        allocator.destroy(c);
+    };
+    errdefer if (ctx._child_addresses) |set| {
+        set.deinit();
+        allocator.destroy(set);
+    };
 
     // Open every ImmutableStore's events.dat. Logs live on the Context so
     // each ImmutableStore can hold a stable pointer into the field.
-    inline for (comptime resolveEntities(entities)) |T| {
+    inline for (entity_list) |T| {
         if (comptime T.storage == .immutable) {
             const field_name = comptime entityFieldName(T);
             const log_file_name = comptime field_name ++ ".events.dat";
             @field(ctx._event_logs, field_name) = try event_log_mod.EventLog(T).open(allocator, entity_dh, log_file_name);
         }
     }
-    errdefer inline for (comptime resolveEntities(entities)) |T| {
+    errdefer inline for (entity_list) |T| {
         if (comptime T.storage == .immutable) {
             const field_name = comptime entityFieldName(T);
             @field(ctx._event_logs, field_name).deinit();
@@ -483,6 +719,7 @@ pub fn init(
         try writeFilterFingerprint(filter_dh, fp);
     } else if (shouldSkipFilterBuild(filter_dh, allocator, fp)) {
         ctx.stats.phases_skipped = true;
+        core.log.info("  reusing filtered index, skipping build\n", .{});
         // Even with the filter reused, factory children must be rediscovered
         // so the live address gate admits them. The primary store always
         // holds the factory create-events, so scanCreations rebuilds the same
@@ -497,7 +734,25 @@ pub fn init(
         // otherwise make build() try to append blocks <= the existing tail,
         // raising error.OutOfOrder. Clear first so the rebuild starts clean.
         try clearFilterFiles(filter_dh);
-        const primary_result = try filter_builder.build(&reader.?, m, filter_dh, allocator);
+
+        // Tx-fields carry. The whole build range must be covered up front,
+        // a hole would surface as a dropped block mid-build.
+        var txs_storage: core.txs.TxsReader = undefined;
+        var txs_reader: ?*const core.txs.TxsReader = null;
+        if (comptime sdk_manifest.wantsTxFields(m)) {
+            // Clamp to what the flat store actually holds: the build scans no
+            // block below first_block or above the tip regardless of manifest.
+            const build_from = @max(m.start_block, reader.?.first_block);
+            const build_end = @min(
+                m.end_block orelse std.math.maxInt(u64),
+                reader.?.first_block + reader.?.index_count - 1,
+            );
+            txs_storage = try openTxsRequired(options.engine_data_dir, build_from, build_end);
+            txs_reader = &txs_storage;
+        }
+        defer if (comptime sdk_manifest.wantsTxFields(m)) txs_storage.deinit();
+
+        const primary_result = try filter_builder.build(&reader.?, m, txs_reader, filter_dh, allocator);
         try requireCompleteFilter("phase 1 (build)", primary_result);
         ctx.stats.filter_blocks_scanned = primary_result.blocks_scanned;
         ctx.stats.filter_blocks_matched = primary_result.blocks_matched;
@@ -513,15 +768,13 @@ pub fn init(
             ctx.stats.discovered_children = discovered.count();
 
             if (discovered.count() > 0) {
-                const child_addrs = try allocator.alloc([20]u8, discovered.count());
+                const child_addrs = try keysToSlice(&discovered, allocator);
                 defer allocator.free(child_addrs);
-                var i: usize = 0;
-                var it = discovered.keyIterator();
-                while (it.next()) |addr| : (i += 1) child_addrs[i] = addr.*;
 
                 const child_result = try filter_builder.appendChildren(
                     &reader.?,
                     m,
+                    txs_reader,
                     child_addrs,
                     filter_dh,
                     allocator,
@@ -566,21 +819,45 @@ pub fn init(
     {
         comptime var mut_slot: usize = 0;
         comptime var imm_slot: usize = 0;
-        inline for (comptime resolveEntities(entities)) |T| {
+        comptime var blob_slot: usize = 0;
+        inline for (entity_list) |T| {
             const field_name = comptime entityFieldName(T);
             if (comptime T.storage == .mutable) {
-                @field(ctx.stores, field_name) = mutable_store_mod.MutableStore(T).open(
-                    allocator,
-                    ctx._state_snap.mutableSlab(mut_slot),
-                );
+                if (comptime entity_serial.hasBlobs(T)) {
+                    @field(ctx.stores, field_name) = try mutable_store_mod.MutableStore(T).openWithBlobs(
+                        allocator,
+                        ctx._state_snap.mutableSlab(mut_slot),
+                        entity_dh,
+                        comptime field_name ++ ".blobs.dat",
+                        ctx._state_snap.blobBytes(blob_slot),
+                    );
+                    blob_slot += 1;
+                } else {
+                    @field(ctx.stores, field_name) = mutable_store_mod.MutableStore(T).open(
+                        allocator,
+                        ctx._state_snap.mutableSlab(mut_slot),
+                    );
+                }
                 mut_slot += 1;
             } else {
                 const log_ptr = &@field(ctx._event_logs, field_name);
-                @field(ctx.stores, field_name) = try immutable_store_mod.ImmutableStore(T).open(
-                    allocator,
-                    log_ptr,
-                    ctx._state_snap.immutableCount(imm_slot),
-                );
+                if (comptime entity_serial.hasBlobs(T)) {
+                    @field(ctx.stores, field_name) = try immutable_store_mod.ImmutableStore(T).openWithBlobs(
+                        allocator,
+                        log_ptr,
+                        ctx._state_snap.immutableCount(imm_slot),
+                        entity_dh,
+                        comptime field_name ++ ".blobs.dat",
+                        ctx._state_snap.blobBytes(blob_slot),
+                    );
+                    blob_slot += 1;
+                } else {
+                    @field(ctx.stores, field_name) = try immutable_store_mod.ImmutableStore(T).open(
+                        allocator,
+                        log_ptr,
+                        ctx._state_snap.immutableCount(imm_slot),
+                    );
+                }
                 imm_slot += 1;
             }
         }
@@ -604,69 +881,87 @@ pub fn init(
     try ctx.commitCycle();
     ctx.stats.elapsed_ns = timer.read();
 
-    // Remote follow handles the gap differently: the live REGISTER re-streams
-    // from the committed cursor, so the engine fills any advance during backfill.
+    // Local follow gap-fills the flat-store advance the engine made during
+    // backfill so `spawn` returns a caught-up ctx. Remote follow re-streams from
+    // the cursor via REGISTER instead. followLoop runs the gap-fill again at the
+    // live handoff to catch any advance since this point.
     if (options.follow and options.remote_engine == null) {
-        // Gap fill. The engine may have advanced during backfill. Re-open
-        // the reader so any flat-store entries added since the start of
-        // init are visible (the original `reader` mmap was sized at open).
-        const engine_last = try live.readMeta(options.engine_data_dir);
-        if (engine_last > ctx._last_dispatched_block) {
-            var gap_reader = try core.FlatStoreReader.open(options.engine_data_dir);
-            defer gap_reader.deinit();
-
-            const gap_from = ctx._last_dispatched_block + 1;
-            const gap_result = try filter_builder.appendBlocks(
-                &gap_reader,
-                m,
-                gap_from,
-                engine_last,
-                filter_dh,
-                allocator,
-            );
-            try requireCompleteFilter("follow gap-fill", gap_result);
-
-            // The gap may hold create-events for children unknown to the
-            // backfill pass (and child events from already-known children).
-            // Rediscover over the now-extended primary, merge into the live set,
-            // and extend children.dat across the gap so replay sees them. The
-            // gap range is strictly above the children store's tail, so the
-            // append stays monotonic.
-            if (comptime m.factories.len > 0) {
-                var gap_children = try scanner.scanCreations(filter_dh, m, allocator);
-                defer gap_children.deinit();
-                if (ctx._child_addresses) |set| {
-                    var it = gap_children.keyIterator();
-                    while (it.next()) |addr| try set.put(addr.*, {});
-                    if (set.count() > 0) {
-                        const addrs = try allocator.alloc([20]u8, set.count());
-                        defer allocator.free(addrs);
-                        var i: usize = 0;
-                        var ks = set.keyIterator();
-                        while (ks.next()) |a| : (i += 1) addrs[i] = a.*;
-                        const cres = try filter_builder.appendChildrenBlocks(
-                            &gap_reader,
-                            m,
-                            addrs,
-                            gap_from,
-                            engine_last,
-                            filter_dh,
-                            allocator,
-                        );
-                        try requireCompleteFilter("follow gap-fill children", cres);
-                    }
-                }
-            }
-
-            _ = try scanner.replay(filter_dh, m, Handler, ctx, .{
-                .commit_interval = options.commit_interval,
-                .start_block = ctx._last_dispatched_block,
-            });
-            try ctx.commitCycle();
-        }
+        try followGapFill(m, Handler, ctx, options, allocator);
     }
     // init never enters the live loop. run/spawn drive followLoop below.
     return ctx;
+}
+
+/// Replay the flat-store advance the engine made past the cursor. Re-reads meta
+/// and dispatches `(cursor, last_finalized]` from a freshly opened reader. The
+/// reader `init` mmap'd at open never sees blocks appended during backfill. Run
+/// once after backfill so `spawn` returns a caught-up ctx, and again at the live
+/// handoff. The engine can finalize more blocks between the two, and the live
+/// loop reads only the pending ring, so a block finalizing in that window would
+/// be dispatched by no one. Idempotent when meta has not advanced.
+///
+/// A sub-tick residual remains. meta and pending are separate files read
+/// non-atomically, so a block whose full finalize lands between this meta read
+/// and the live loop's first pending read is still missed. Closing it needs a
+/// pending-before-meta read with boundary dedup, or an atomic engine checkpoint.
+fn followGapFill(
+    comptime m: sdk_manifest.Manifest,
+    comptime Handler: type,
+    ctx: anytype,
+    options: Options,
+    allocator: std.mem.Allocator,
+) !void {
+    const engine_last = try live.readMeta(options.engine_data_dir);
+    if (engine_last <= ctx._last_dispatched_block) return;
+
+    const filter_dir = try std.fs.path.join(allocator, &.{ options.data_dir, "filter" });
+    defer allocator.free(filter_dir);
+    var filter_dh = try std.fs.cwd().openDir(filter_dir, .{});
+    defer filter_dh.close();
+
+    var gap_reader = try core.FlatStoreReader.open(options.engine_data_dir);
+    defer gap_reader.deinit();
+
+    const gap_from = ctx._last_dispatched_block + 1;
+
+    // Fresh open per gap fill. The engine extends txs.dat with each finalize,
+    // an init-scoped reader would not see the new coverage.
+    var txs_storage: core.txs.TxsReader = undefined;
+    var txs_reader: ?*const core.txs.TxsReader = null;
+    if (comptime sdk_manifest.wantsTxFields(m)) {
+        txs_storage = try openTxsRequired(options.engine_data_dir, gap_from, engine_last);
+        txs_reader = &txs_storage;
+    }
+    defer if (comptime sdk_manifest.wantsTxFields(m)) txs_storage.deinit();
+
+    const gap_result = try filter_builder.appendBlocks(&gap_reader, m, txs_reader, gap_from, engine_last, filter_dh, allocator);
+    try requireCompleteFilter("follow gap-fill", gap_result);
+
+    // The gap may hold create-events for children unknown to the backfill pass
+    // (and child events from already-known children). Rediscover over the
+    // now-extended primary, merge into the live set, and extend children.dat so
+    // replay sees them. The gap range sits above the children tail, append stays
+    // monotonic.
+    if (comptime m.factories.len > 0) {
+        var gap_children = try scanner.scanCreations(filter_dh, m, allocator);
+        defer gap_children.deinit();
+        if (ctx._child_addresses) |set| {
+            var it = gap_children.keyIterator();
+            while (it.next()) |addr| try set.put(addr.*, {});
+            if (set.count() > 0) {
+                const addrs = try keysToSlice(set, allocator);
+                defer allocator.free(addrs);
+                const cres = try filter_builder.appendChildrenBlocks(&gap_reader, m, txs_reader, addrs, gap_from, engine_last, filter_dh, allocator);
+                try requireCompleteFilter("follow gap-fill children", cres);
+            }
+        }
+    }
+
+    _ = try scanner.replay(filter_dh, m, Handler, ctx, .{
+        .commit_interval = options.commit_interval,
+        .start_block = ctx._last_dispatched_block,
+    });
+    try ctx.commitCycle();
 }
 
 /// Live loop body. Sets up the Multicall (when a node RPC is configured) and
@@ -690,8 +985,16 @@ fn followLoop(
             ctx._allocator,
         );
     }
+
+    // Close the init->live handoff window. The engine may have finalized more
+    // blocks since init's gap-fill. Replay that advance from the flat store
+    // before the live loop (which reads only the pending ring) takes over.
+    try followGapFill(m, Handler, ctx, options, ctx._allocator);
+
     if (options.node_rpc) |rpc_url| {
         var http = eth.http_transport.HttpTransport.init(ctx._allocator, rpc_url);
+        // Frees the std.http.Client connection pool (kept-alive sockets).
+        defer http.deinit();
         var provider = eth.provider.Provider.init(ctx._allocator, &http);
         var mc = eth.multicall.Multicall.init(ctx._allocator, &provider, options.multicall_address);
         defer mc.deinit();
@@ -720,6 +1023,7 @@ pub fn spawn(
     opts.follow = true;
     const ctx = try init(m, Handler, entities, opts, allocator);
     errdefer ctx.deinit();
+    announceBackfill(m, ctx.stats);
 
     const Ctx = Context(entities);
     const Thunk = struct {
@@ -736,9 +1040,31 @@ pub fn spawn(
     return ctx;
 }
 
-/// Gather → dedupe → filterUncached → preload. Runs once between Phases 3 and 5.
-/// All gather allocations live in a local arena that frees on return. The
-/// only state that escapes is the cache writes from `preload`.
+/// Static + dynamic prefetch calls for one round, merged and deduped. With the
+/// cache warmed by prior rounds, chained `.of`/`.of_return` calls that couldn't
+/// resolve before now appear, so re-gathering grows the set toward its fixpoint.
+fn gatherUnique(
+    arena: std.mem.Allocator,
+    comptime m: sdk_manifest.Manifest,
+    filter_dh: std.fs.Dir,
+    cache: *const ethcall.Cache,
+) ![]ethcall.Call {
+    const static_calls = try prefetch.gatherStatic(arena, m);
+    const dynamic_calls = try prefetch.gatherDynamic(arena, filter_dh, m, cache);
+
+    const merged = try arena.alloc(ethcall.Call, static_calls.len + dynamic_calls.len);
+    @memcpy(merged[0..static_calls.len], static_calls);
+    @memcpy(merged[static_calls.len..], dynamic_calls);
+
+    return prefetch.dedupe(arena, merged);
+}
+
+/// Bounded multi-round prefetch between Phases 3 and 5. Each round gathers →
+/// dedupes → drops cached → preloads; round `k+1` resolves chained targets the
+/// prior round cached. Round cap is the manifest's deepest chain (1 when none
+/// chain, so it runs exactly once with no overhead). A per-round arena reset
+/// frees each round's gather before the next. The only escaping state is the
+/// cache writes from `preload`.
 fn runPhase4(
     comptime m: sdk_manifest.Manifest,
     options: Options,
@@ -747,35 +1073,42 @@ fn runPhase4(
 ) !void {
     const allocator = ctx._allocator;
     const cache = ctx._cache.?;
+    const max_rounds = comptime sdk_manifest.prefetchMaxDepth(m);
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
-    const arena = arena_state.allocator();
 
-    const static_calls = try prefetch.gatherStatic(arena, m);
-    const dynamic_calls = try prefetch.gatherDynamic(arena, filter_dh, m);
-
-    const merged = try arena.alloc(ethcall.Call, static_calls.len + dynamic_calls.len);
-    @memcpy(merged[0..static_calls.len], static_calls);
-    @memcpy(merged[static_calls.len..], dynamic_calls);
-
-    const unique = try prefetch.dedupe(arena, merged);
-    ctx.stats.prefetch_calls_gathered = unique.len;
-
-    const missing = try prefetch.filterUncached(arena, cache, unique);
-    if (missing.len == 0) return;
-
-    // No RPC configured: gather is informational, fetch is a no-op. Handlers
-    // that hit an uncached pair see `error.NotPrefetched` at replay.
-    const rpc_url = options.node_rpc orelse return;
+    // No RPC: gather once for the informational count, nothing to fetch.
+    // Handlers that hit an uncached pair see `error.NotPrefetched` at replay.
+    const rpc_url = options.node_rpc orelse {
+        const unique = try gatherUnique(arena_state.allocator(), m, filter_dh, cache);
+        ctx.stats.prefetch_calls_gathered = unique.len;
+        return;
+    };
 
     var http = eth.http_transport.HttpTransport.init(allocator, rpc_url);
+    // Frees the std.http.Client connection pool (kept-alive sockets).
+    defer http.deinit();
     var provider = eth.provider.Provider.init(allocator, &http);
     var mc = eth.multicall.Multicall.init(allocator, &provider, options.multicall_address);
     defer mc.deinit();
 
-    try cache.preload(allocator, &mc, missing, options.multicall_batch_size);
-    ctx.stats.prefetch_calls_executed = missing.len;
+    var round: usize = 0;
+    while (round < max_rounds) : (round += 1) {
+        _ = arena_state.reset(.retain_capacity);
+        const arena = arena_state.allocator();
+
+        const unique = try gatherUnique(arena, m, filter_dh, cache);
+        // Last round gathers the fully-resolved set, so the final overwrite is
+        // the total distinct call count.
+        ctx.stats.prefetch_calls_gathered = unique.len;
+
+        const missing = try prefetch.filterUncached(arena, cache, unique);
+        if (missing.len == 0) break;
+
+        try cache.preload(allocator, &mc, missing, options.multicall_batch_size);
+        ctx.stats.prefetch_calls_executed += missing.len;
+    }
 }
 
 /// Skip the filter build only when the on-disk filter has at least one entry
@@ -809,6 +1142,7 @@ fn streamInto(
     addresses: []const [20]u8,
     topics: []const [32]u8,
     exclude: []const [20]u8,
+    tx_fields: bool,
     allocator: std.mem.Allocator,
 ) !u64 {
     var store = try filtered_store_mod.FilteredStore.open(allocator, filter_dh, base);
@@ -822,6 +1156,7 @@ fn streamInto(
         .addresses = addresses,
         .topics = topics,
         .exclude_addresses = exclude,
+        .tx_fields = tx_fields,
     }, &store, allocator);
     return result.blocks_received;
 }
@@ -846,8 +1181,24 @@ fn remoteBackfill(
         comptime filter_builder.collectKnownAddresses(m),
         comptime filter_builder.collectAllTopics(m),
         &.{},
+        comptime sdk_manifest.wantsTxFields(m),
         allocator,
     );
+
+    // Remote has no flat reader. Derive the indexed span from the streamed
+    // primary store first and last block, so the stats and the verbose range
+    // line match the local path instead of reading 0.
+    {
+        var ps = filtered_store_mod.FilteredStore.open(allocator, filter_dh, filter_builder.BASE_PRIMARY) catch null;
+        if (ps) |*store| {
+            defer store.deinit();
+            if (store.count() > 0) {
+                ctx.stats.start_block = (try store.readEntry(0)).block_number;
+                ctx.stats.end_block = (try store.readEntry(store.count() - 1)).block_number;
+                core.log.info("  indexing blocks {d} → {d}\n", .{ ctx.stats.start_block, ctx.stats.end_block });
+            }
+        }
+    }
 
     if (comptime m.factories.len > 0) {
         const child_topics = comptime filter_builder.collectChildTopics(m);
@@ -856,11 +1207,8 @@ fn remoteBackfill(
         ctx.stats.discovered_children = discovered.count();
 
         if (discovered.count() > 0 and child_topics.len > 0) {
-            const child_addrs = try allocator.alloc([20]u8, discovered.count());
+            const child_addrs = try keysToSlice(&discovered, allocator);
             defer allocator.free(child_addrs);
-            var i: usize = 0;
-            var it = discovered.keyIterator();
-            while (it.next()) |a| : (i += 1) child_addrs[i] = a.*;
 
             ctx.stats.children_blocks_matched = try streamInto(
                 re,
@@ -869,6 +1217,7 @@ fn remoteBackfill(
                 child_addrs,
                 child_topics,
                 comptime filter_builder.collectKnownAddresses(m),
+                comptime sdk_manifest.wantsTxFields(m),
                 allocator,
             );
         }
@@ -877,6 +1226,15 @@ fn remoteBackfill(
         // moves to ctx, freed by Context.deinit.
         try setChildAddresses(C, ctx, allocator, discovered);
     }
+}
+
+/// Copy a `[20]u8` key set into a freshly-allocated slice. Caller frees.
+fn keysToSlice(set: *const std.AutoHashMap([20]u8, void), allocator: std.mem.Allocator) ![][20]u8 {
+    const out = try allocator.alloc([20]u8, set.count());
+    var i: usize = 0;
+    var it = set.keyIterator();
+    while (it.next()) |a| : (i += 1) out[i] = a.*;
+    return out;
 }
 
 /// Move `discovered` onto the heap and hand ownership to `ctx`. The set has
@@ -908,7 +1266,7 @@ fn clearFilterFiles(filter_dh: std.fs.Dir) !void {
 /// Hard-fail when a filter phase dropped blocks. Better than shipping a partial index.
 fn requireCompleteFilter(phase: []const u8, r: filter_builder.BuildResult) !void {
     if (r.dropped_blocks == 0) return;
-    std.debug.print(
+    core.log.err(
         \\
         \\ERROR: filter {s} dropped {d} of {d} matching blocks.
         \\Index is incomplete; aborting. Likely cause: a block's serialized log
@@ -920,6 +1278,35 @@ fn requireCompleteFilter(phase: []const u8, r: filter_builder.BuildResult) !void
         .{ phase, r.dropped_blocks, r.blocks_matched + r.dropped_blocks },
     );
     return error.FilterBuildIncomplete;
+}
+
+/// Open the engine's txs.{dat,idx} pair and require coverage of `[from, to]`.
+/// Called only for manifests setting `tx_fields`. Absence or a coverage hole
+/// is fatal at init, never a silent null `log.tx` at dispatch.
+fn openTxsRequired(engine_data_dir: []const u8, from: u64, to: u64) !core.txs.TxsReader {
+    var dh = try std.fs.cwd().openDir(engine_data_dir, .{});
+    defer dh.close();
+    var tr = (core.txs.TxsReader.open(dh) catch null) orelse {
+        core.log.err(
+            \\
+            \\ERROR: manifest sets tx_fields but the engine store has no txs.{{dat,idx}}.
+            \\Re-run the import without --no-tx-fields (or run `emit-engine import`
+            \\against a store that already has logs to backfill the tx pass).
+            \\
+        , .{});
+        return error.TxFieldsUnavailable;
+    };
+    if (!tr.covers(from, to)) {
+        core.log.err(
+            \\
+            \\ERROR: manifest sets tx_fields but txs.dat covers [{d}, {d}], the
+            \\indexed range needs [{d}, {d}]. Extend the import's tx pass first.
+            \\
+        , .{ tr.first_block, tr.first_block + tr.count -| 1, from, to });
+        tr.deinit();
+        return error.TxFieldsUnavailable;
+    }
+    return tr;
 }
 
 /// Comptime-build the inner struct that holds one entity store per tuple
@@ -1019,6 +1406,17 @@ fn assertImmutable(comptime T: type, comptime who: []const u8) void {
     if (T.storage != .immutable) @compileError(
         "Context." ++ who ++ "(): '" ++ @typeName(T) ++ "' is a mutable entity. " ++
             who ++ "() serves immutable event-log entities; use read() for keyed state.",
+    );
+}
+
+/// Blob fields borrow the store mmap, so a value returned past the lock would
+/// dangle on a concurrent commit. The auto-locking accessors reject them and
+/// point at `readView`, which holds the lock across the borrow (ADR-005).
+fn assertNoBlobs(comptime T: type, comptime who: []const u8) void {
+    if (entity_serial.hasBlobs(T)) @compileError(
+        "Context." ++ who ++ "(): '" ++ @typeName(T) ++ "' has blob fields whose slices " ++
+            "borrow the store mmap. Read it through `ctx.readView()` so the borrow stays " ++
+            "valid under the lock, and copy any blob bytes out before the view is released.",
     );
 }
 
@@ -1322,6 +1720,71 @@ test "init: backfills planted Transfers and final balances match" {
     try testing.expectEqual(@as(u64, 90), alice.balance);
     try testing.expectEqual(@as(u64, 30), bob.balance);
     try testing.expectEqual(@as(u64, 30), carl.balance);
+}
+
+fn writeTestMeta(dir: std.fs.Dir, last_finalized: u64) !void {
+    const meta = flat_reader.Meta{
+        .last_finalized_block = last_finalized,
+        .blocks_dat_size = 0,
+        .blocks_idx_count = 0,
+        .blooms_count = 0,
+        .checksum = 0,
+    };
+    var buf: [flat_reader.META_SIZE]u8 = undefined;
+    meta.serialize(&buf);
+    var f = try dir.createFile("meta.bin", .{});
+    defer f.close();
+    try f.writeAll(&buf);
+}
+
+test "follow gap-fill dispatches blocks the engine finalized after backfill" {
+    // Residual fix for the init->live handoff. The engine can finalize blocks
+    // into the flat store after init's backfill, and the live loop reads only
+    // the pending ring, so followGapFill must replay that advance or the blocks
+    // are dispatched by no one. Backfill 100-101, grow the store to 100-103 with
+    // meta past the cursor, then assert followGapFill dispatches 102-103 without
+    // re-dispatching 100-101.
+    const allocator = testing.allocator;
+
+    const ALICE: [20]u8 = [_]u8{0xA1} ** 20;
+    var d: [4][32]u8 = undefined;
+    const log100 = makeTransferLog(100, 0, [_]u8{0} ** 20, ALICE, 100, &d[0]);
+    const log101 = makeTransferLog(101, 0, [_]u8{0} ** 20, ALICE, 10, &d[1]);
+
+    var src_tmp = testing.tmpDir(.{});
+    defer src_tmp.cleanup();
+    try writeFlatStoreFromLogs(src_tmp.dir, &.{ &.{log100}, &.{log101} }, allocator);
+    var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
+
+    var data_tmp = testing.tmpDir(.{});
+    defer data_tmp.cleanup();
+    var data_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_path = try data_tmp.dir.realpath(".", &data_path_buf);
+
+    const Manifest: sdk_manifest.Manifest = .{
+        .name = "erc20",
+        .chain_id = 1,
+        .start_block = 0,
+        .contracts = &.{.{ .name = "T", .address = ADDR_TOKEN, .events = &.{Transfer} }},
+    };
+    const options: Options = .{ .engine_data_dir = src_path, .data_dir = data_path, .commit_interval = 100_000 };
+
+    const ctx = try init(Manifest, TransferHandler, .{Account}, options, allocator);
+    defer ctx.deinit();
+    try testing.expectEqual(@as(u64, 101), ctx._last_dispatched_block);
+
+    // The engine appends two finalized blocks and advances meta past the cursor.
+    const log102 = makeTransferLog(102, 0, [_]u8{0} ** 20, ALICE, 5, &d[2]);
+    const log103 = makeTransferLog(103, 0, [_]u8{0} ** 20, ALICE, 1, &d[3]);
+    try writeFlatStoreFromLogs(src_tmp.dir, &.{ &.{log100}, &.{log101}, &.{log102}, &.{log103} }, allocator);
+    try writeTestMeta(src_tmp.dir, 103);
+
+    try followGapFill(Manifest, TransferHandler, ctx, options, allocator);
+
+    try testing.expectEqual(@as(u64, 103), ctx._last_dispatched_block);
+    const alice = (try ctx.stores.accounts.load(ALICE)) orelse return error.MissingAlice;
+    try testing.expectEqual(@as(u64, 116), alice.balance); // 100 + 10 + 5 + 1
 }
 
 test "Context read/count/range/cursor over an immutable store after backfill" {

@@ -17,9 +17,12 @@ Module index:
 | File | Role |
 |---|---|
 | `main.zig` | CLI: `import`, `follow`, `serve`, `status` |
-| `rocksdb_import.zig` | Nethermind RocksDB → flat store, 7 parallel decode workers |
-| `receipt_decoder.zig` | RLP-encoded receipt → `core.RawLog` |
+| `rocksdb_import.zig` | Nethermind RocksDB → flat store, 7 parallel decode workers, resumable tx pass |
+| `rpc_import.zig` | `eth_getLogs` import: adaptive ranges, timestamp + tx-table passes |
+| `receipt_decoder.zig` | RLP-encoded receipt → `core.RawLog`, stored-sender capture |
 | `rlp.zig` | Minimal RLP walker (~150 lines) |
+| `tx_decode.zig` | Raw signed tx → `to`/`value`, splice-sighash ecrecover for missing senders |
+| `tx_json.zig` | JSON full-block transactions → per-block `TxRecord` tables |
 | `flat_writer.zig` | Append to `blocks.dat` / `blooms.bin` / `blocks.idx` / `meta.bin` |
 | `head_follower.zig` | WS newHeads + gap-fill + reorg detection + finalization |
 | `pending_ring.zig` | 64-block `pending.bin` ring buffer (atomic tmp + rename per write) |
@@ -31,10 +34,11 @@ Module index:
 Usage: emit-engine <command> [options]
 
 Commands:
-  import --rocksdb <path> --data-dir <path> [--rpc <url>]
+  import --rocksdb <path> --data-dir <path> [--rpc <url>] [--txs-db <path>] [--no-tx-fields]
                                               Bulk import from Nethermind
-  import --rpc <url> --data-dir <path>        Import via eth_getLogs (v2)
-  follow --rpc <url> [--ws <url>] --data-dir <path> [--catch-up-rpc]
+  import --rpc <url> --data-dir <path> [--from N] [--to N] [--no-timestamps] [--no-tx-fields]
+                                              Import via eth_getLogs (+ timestamps)
+  follow --rpc <url> [--ws <url>] --data-dir <path> [--catch-up-rpc] [--no-tx-fields]
                                               Follow chain head
   serve [--listen <host:port>] [--max-connections <n>] --data-dir <path>
                                               Stream filtered blocks to remote indexers
@@ -55,6 +59,15 @@ A bounded worker pool (`--max-connections`, default 16) serves indexers
 concurrently. A streamed indexer is byte-for-byte identical to a collocated one;
 the client side is configured with the SDK's `--remote-engine host:port`. The
 process is independent of `import`/`follow` — point it at the same `--data-dir`.
+
+Transaction fields (`txs.{dat,idx}`) are written by default. The
+RocksDB import runs a resumable tx pass over the receipts (stored senders) and
+the sibling `blocks` DB — `to`/`value` decoded from the raw transactions, with
+splice-sighash ecrecover where the compact receipt row stores no sender. The
+RPC import and the follower take the fields from `eth_getBlockByNumber(full=true)`.
+`--no-tx-fields` opts out; `--txs-db` overrides the derived sibling-DB path.
+Indexers whose events declare `tx_fields` refuse to start against a store
+missing coverage.
 
 Build:
 
@@ -115,7 +128,7 @@ Environment overrides:
 
 ## Output layout
 
-Five files written to `--data-dir`:
+Eight files written to `--data-dir`:
 
 | File | Purpose | Mutability |
 |---|---|---|
@@ -123,10 +136,12 @@ Five files written to `--data-dir`:
 | `blooms.bin` | Per-block topic + address blooms (1280 B/block) | Immutable after write |
 | `blocks.idx` | `block_number → (offset u64, length u32)` dense array | Immutable after write |
 | `meta.bin` | Checkpoint: `(first_block, latest_block, total_logs, file_sizes, crc32)` | Atomic rename per commit |
-| `pending.bin` | Last 64 pre-finality blocks + per-block timestamp, reorg buffer (`EMITPEND` magic) | Atomic rename per write |
+| `pending.bin` | Last 64 pre-finality blocks + per-block timestamp + per-block tx table, reorg buffer (`EMITPND2` magic) | Atomic rename per write |
 | `timestamps.bin` | Exact per-block Unix timestamp (`u32 LE`, dense by block), backfilled from the `headers` DB during import and extended by the follower on finalization | Advisory; absent ⇒ formula fallback |
+| `txs.dat` | Per-block LZ4 tx tables: one 76 B `TxRecord` (index, type, flags, from, to, value) per log-producing tx (ADR-006) | Advisory; absent ⇒ tx-blind indexers unaffected |
+| `txs.idx` | `block_number → (offset u64, length u32)` into `txs.dat`, dense, count-published-last resume cursor | Advisory |
 
-Total at mainnet chain tip: ~249 GB.
+Total at mainnet chain tip: ~295 GB (~250 GB without tx fields).
 
 ## What engine does NOT do
 
@@ -141,6 +156,7 @@ Indexers built with `sdk` read the flat store via `core.FlatStoreReader` and wat
 | Operation | Time | Notes |
 |---|---|---|
 | Import (RocksDB direct) | 13 min | full mainnet, 7 parallel decode workers |
+| Tx-fields pass (RocksDB) | ~2.2 h | one-time, resumable, 10 recovery workers; 45 GB, 0 unrecovered senders measured |
 | Head-follow latency | <1s | local WebSocket, gap-fill via HTTP `eth_getLogs` |
 | Reorg recovery | <1s | bounded by `pending.bin` walk depth (64 blocks max) |
 

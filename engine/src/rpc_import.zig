@@ -16,6 +16,7 @@ const core = @import("core");
 const eth = @import("eth");
 
 const FlatStoreWriter = @import("flat_writer.zig").FlatStoreWriter;
+const tx_json = @import("tx_json.zig");
 const types = core.types;
 const log_serial = core.log_serial;
 
@@ -50,6 +51,10 @@ pub const Config = struct {
     /// correctness landmine. Set false (`--no-timestamps`) only for chains where
     /// the formula is acceptable.
     timestamps: bool = true,
+    /// Populate `txs.{dat,idx}` (ADR-006) via batched full-block fetches. The
+    /// node returns pre-recovered senders, no crypto. On by default and
+    /// strict like timestamps. Set false (`--no-tx-fields`) to skip.
+    tx_fields: bool = true,
 };
 
 /// Reusable per-block buffers, allocated once for the whole import.
@@ -92,7 +97,19 @@ pub fn run(config: Config) !void {
         defer ts_writer.deinit();
         try importTimestamps(&ts_writer, config.rpc_url, end, page);
     } else if (!config.timestamps) {
-        std.debug.print("Timestamps skipped (--no-timestamps); blocks use the formula fallback.\n", .{});
+        core.log.info("Timestamps skipped (--no-timestamps); blocks use the formula fallback.\n", .{});
+    }
+
+    // Pass 3, tx tables. Same shape as timestamps: own resume cursor
+    // (txs.idx count), strict, backfillable into an existing store.
+    if (config.tx_fields and writer.meta.blocks_idx_count > 0) {
+        var dir = try std.fs.cwd().openDir(config.data_dir, .{});
+        defer dir.close();
+        var txw = try core.txs.TxsWriter.open(dir, writer.first_block);
+        defer txw.deinit();
+        try importTxTables(&txw, config.data_dir, config.rpc_url, end, page);
+    } else if (!config.tx_fields) {
+        core.log.info("Tx fields skipped (--no-tx-fields).\n", .{});
     }
 }
 
@@ -101,10 +118,10 @@ pub fn run(config: Config) !void {
 /// store stays consistent and a re-run resumes from the next block.
 fn importLogs(writer: *FlatStoreWriter, rpc_url: []const u8, start: u64, end: u64, page: std.mem.Allocator) !void {
     if (start > end) {
-        std.debug.print("Logs: flat store already covers through block {d}.\n", .{end});
+        core.log.info("Logs: flat store already covers through block {d}.\n", .{end});
         return;
     }
-    std.debug.print("Importing logs [{d}, {d}] via eth_getLogs ({s}).\n", .{ start, end, rpc_url });
+    core.log.info("Importing logs [{d}, {d}] via eth_getLogs ({s}).\n", .{ start, end, rpc_url });
 
     const scratch = Scratch{
         .raw_logs = try page.alloc(types.RawLog, types.MAX_LOGS_PER_BLOCK),
@@ -131,7 +148,7 @@ fn importLogs(writer: *FlatStoreWriter, rpc_url: []const u8, start: u64, end: u6
             retries = 0;
             batch = @min(batch * 2, MAX_BATCH);
             if (hi >= next_log) {
-                std.debug.print("  ... logs block {d}/{d} ({d} so far)\n", .{ hi, end, total_logs });
+                core.log.debug("  ... logs block {d}/{d} ({d} so far)\n", .{ hi, end, total_logs });
                 next_log = hi + LOG_EVERY;
             }
         } else |err| {
@@ -143,16 +160,16 @@ fn importLogs(writer: *FlatStoreWriter, rpc_url: []const u8, start: u64, end: u6
             }
             retries += 1;
             if (retries > MAX_RETRIES) {
-                std.debug.print("Logs block {d}: {s} after {d} retries — aborting.\n", .{ lo, @errorName(err), MAX_RETRIES });
+                core.log.err("Logs block {d}: {s} after {d} retries — aborting.\n", .{ lo, @errorName(err), MAX_RETRIES });
                 return err;
             }
-            std.debug.print("Logs block {d}: {s}, retry {d}/{d}\n", .{ lo, @errorName(err), retries, MAX_RETRIES });
+            core.log.debug("Logs block {d}: {s}, retry {d}/{d}\n", .{ lo, @errorName(err), retries, MAX_RETRIES });
             std.Thread.sleep(std.time.ns_per_s * retries);
         }
     }
 
     try writer.commitMeta();
-    std.debug.print("Logs done: [{d}, {d}] — {d} blocks, {d} logs.\n", .{ start, end, end - start + 1, total_logs });
+    core.log.info("Logs done: [{d}, {d}] — {d} blocks, {d} logs.\n", .{ start, end, end - start + 1, total_logs });
 }
 
 /// Fill `timestamps.bin` over [resume, end] via batched `eth_getBlockByNumber`.
@@ -163,10 +180,10 @@ fn importLogs(writer: *FlatStoreWriter, rpc_url: []const u8, start: u64, end: u6
 fn importTimestamps(ts_writer: *core.timestamps.TimestampWriter, rpc_url: []const u8, end: u64, page: std.mem.Allocator) !void {
     const start = ts_writer.first_block + ts_writer.count;
     if (start > end) {
-        std.debug.print("Timestamps: already cover through block {d}.\n", .{end});
+        core.log.info("Timestamps: already cover through block {d}.\n", .{end});
         return;
     }
-    std.debug.print("Fetching timestamps [{d}, {d}] via eth_getBlockByNumber.\n", .{ start, end });
+    core.log.info("Fetching timestamps [{d}, {d}] via eth_getBlockByNumber.\n", .{ start, end });
 
     var lo: u64 = start;
     var chunk: u64 = TS_CHUNK;
@@ -181,7 +198,7 @@ fn importTimestamps(ts_writer: *core.timestamps.TimestampWriter, rpc_url: []cons
             retries = 0;
             chunk = @min(chunk * 2, TS_CHUNK_MAX);
             if (hi >= next_log) {
-                std.debug.print("  ... timestamps block {d}/{d}\n", .{ hi, end });
+                core.log.debug("  ... timestamps block {d}/{d}\n", .{ hi, end });
                 next_log = hi + LOG_EVERY;
             }
         } else |err| {
@@ -191,16 +208,156 @@ fn importTimestamps(ts_writer: *core.timestamps.TimestampWriter, rpc_url: []cons
             }
             retries += 1;
             if (retries > MAX_RETRIES) {
-                std.debug.print("Timestamps block {d}: {s} after {d} retries — aborting. Re-run to resume.\n", .{ lo, @errorName(err), MAX_RETRIES });
+                core.log.err("Timestamps block {d}: {s} after {d} retries — aborting. Re-run to resume.\n", .{ lo, @errorName(err), MAX_RETRIES });
                 return err;
             }
-            std.debug.print("Timestamps block {d}: {s}, retry {d}/{d}\n", .{ lo, @errorName(err), retries, MAX_RETRIES });
+            core.log.debug("Timestamps block {d}: {s}, retry {d}/{d}\n", .{ lo, @errorName(err), retries, MAX_RETRIES });
             std.Thread.sleep(std.time.ns_per_s * retries);
         }
     }
 
     try ts_writer.sync();
-    std.debug.print("Timestamps done: [{d}, {d}].\n", .{ start, end });
+    core.log.info("Timestamps done: [{d}, {d}].\n", .{ start, end });
+}
+
+/// Full blocks are fat (~hundreds of KB of JSON each), so tx-table chunks
+/// start and cap far below the timestamp pass's.
+const TX_CHUNK: u64 = 16;
+const TX_CHUNK_MAX: u64 = 128;
+
+/// Once-allocated buffers for the tx-table pass.
+const TxBatchBufs = struct {
+    entry: []u8,
+    decomp: []u8,
+    logs: []types.RawLog,
+    mask: []u16,
+    records: []core.txs.TxRecord,
+    serialize: []u8,
+    compress: []u8,
+};
+
+/// Fill `txs.{dat,idx}` over [resume, end] via batched full-block fetches.
+/// The node returns pre-recovered senders, no crypto. Strict like the
+/// timestamp pass: every block must yield a complete table or the import
+/// aborts loudly. Appends are dense, so a failed batch resumes from the
+/// writer's own cursor.
+fn importTxTables(txw: *core.txs.TxsWriter, data_dir: []const u8, rpc_url: []const u8, end: u64, page: std.mem.Allocator) !void {
+    const start = txw.first_block + txw.count;
+    if (start > end) {
+        core.log.info("Tx fields: already cover through block {d}.\n", .{end});
+        return;
+    }
+    core.log.info("Fetching tx fields [{d}, {d}] via eth_getBlockByNumber(full).\n", .{ start, end });
+
+    // The log-producing mask comes from our own store, the canonical log set.
+    var store = try core.FlatStoreReader.open(data_dir);
+    defer store.deinit();
+
+    const table_max = 4 + types.MAX_LOGS_PER_BLOCK * core.txs.RECORD_SIZE;
+    const bufs = TxBatchBufs{
+        .entry = try page.alloc(u8, types.BLOCK_BUF_SIZE),
+        .decomp = try page.alloc(u8, types.BLOCK_BUF_SIZE),
+        .logs = try page.alloc(types.RawLog, types.MAX_LOGS_PER_BLOCK),
+        .mask = try page.alloc(u16, types.MAX_LOGS_PER_BLOCK),
+        .records = try page.alloc(core.txs.TxRecord, types.MAX_LOGS_PER_BLOCK),
+        .serialize = try page.alloc(u8, table_max),
+        .compress = try page.alloc(u8, table_max + table_max / 128 + 64),
+    };
+
+    var lo: u64 = start;
+    var chunk: u64 = TX_CHUNK;
+    var retries: u32 = 0;
+    var next_log: u64 = start + LOG_EVERY;
+
+    while (lo <= end) {
+        const hi = @min(lo + chunk - 1, end);
+        if (txTableBatch(rpc_url, txw, &store, &bufs, lo, hi, page)) |_| {
+            try txw.sync();
+            lo = hi + 1;
+            retries = 0;
+            chunk = @min(chunk * 2, TX_CHUNK_MAX);
+            if (hi >= next_log) {
+                core.log.debug("  ... tx fields block {d}/{d}\n", .{ hi, end });
+                next_log = hi + LOG_EVERY;
+            }
+        } else |err| {
+            // Dense appends: a failed batch may have landed a prefix. Resume
+            // from the writer's cursor, never re-append below it.
+            lo = txw.first_block + txw.count;
+            if (chunk > 1) {
+                chunk = @max(1, chunk / 2);
+                continue;
+            }
+            retries += 1;
+            if (retries > MAX_RETRIES) {
+                core.log.err("Tx fields block {d}: {s} after {d} retries — aborting. Re-run to resume.\n", .{ lo, @errorName(err), MAX_RETRIES });
+                return err;
+            }
+            core.log.debug("Tx fields block {d}: {s}, retry {d}/{d}\n", .{ lo, @errorName(err), retries, MAX_RETRIES });
+            std.Thread.sleep(std.time.ns_per_s * retries);
+        }
+    }
+
+    try txw.sync();
+    core.log.info("Tx fields done: [{d}, {d}].\n", .{ start, end });
+}
+
+/// Fetch [lo, hi] full blocks in one batch and append each block's table in
+/// order. Responses can arrive reordered, so they are staged by id first.
+/// Per-batch arena + client, the `importBatch` rationale.
+fn txTableBatch(
+    rpc_url: []const u8,
+    txw: *core.txs.TxsWriter,
+    store: *const core.FlatStoreReader,
+    bufs: *const TxBatchBufs,
+    lo: u64,
+    hi: u64,
+    parent_alloc: std.mem.Allocator,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(parent_alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var http = eth.http_transport.HttpTransport.init(a, rpc_url);
+    defer http.deinit();
+
+    var body: std.ArrayList(u8) = .empty;
+    try body.append(a, '[');
+    var b = lo;
+    while (b <= hi) : (b += 1) {
+        if (b > lo) try body.append(a, ',');
+        var item_buf: [128]u8 = undefined;
+        const item = try std.fmt.bufPrint(&item_buf, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"eth_getBlockByNumber\",\"params\":[\"0x{x}\",true]}}", .{ b - lo, b });
+        try body.appendSlice(a, item);
+    }
+    try body.append(a, ']');
+
+    const raw = try httpPost(&http, body.items, a);
+    const Item = struct {
+        id: u64,
+        result: ?struct { transactions: []tx_json.JsonTx } = null,
+    };
+    const parsed = try std.json.parseFromSlice([]Item, a, raw, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    const n: usize = @intCast(hi - lo + 1);
+    const by_id = try a.alloc(?[]tx_json.JsonTx, n);
+    @memset(by_id, null);
+    for (parsed.value) |item| {
+        if (item.id >= n) continue;
+        if (item.result) |r| by_id[item.id] = r.transactions;
+    }
+
+    var bn = lo;
+    while (bn <= hi) : (bn += 1) {
+        const block_txs = by_id[bn - lo] orelse return error.MissingBlock;
+        const entry = try store.readBlock(bn, bufs.entry);
+        const decoded = try core.log_serial.decompressEntry(entry, bufs.decomp);
+        const log_count = core.log_serial.deserializeLogs(decoded, bufs.logs);
+        const mask = tx_json.logMask(bufs.logs[0..log_count], bufs.mask);
+        const recs = try tx_json.buildRecords(block_txs, mask, bufs.records);
+        try txw.append(bn, recs, bufs.serialize, bufs.compress);
+    }
 }
 
 /// Fetch [lo, hi] in one `eth_getLogs` and write its blocks. Owns a per-batch
@@ -208,6 +365,11 @@ fn importTimestamps(ts_writer: *core.timestamps.TimestampWriter, rpc_url: []cons
 /// return. The writer and scratch live across batches. The provider and
 /// transport share the arena allocator, `getLogs` frees the transport's
 /// response with the provider's allocator, so they must be the same.
+///
+/// The per-batch client (one TLS handshake per batch) is deliberate.
+/// `HttpTransport` embeds `std.http.Client` by value, so connection reuse
+/// needs vendoring eth.zig. The import is bottlenecked on provider latency
+/// and rate limits, not handshakes. Disproportionate for a one-time fallback.
 fn importBatch(
     writer: *FlatStoreWriter,
     rpc_url: []const u8,
@@ -301,7 +463,7 @@ fn parseTimestampBatch(
 /// POST a raw JSON body (here a JSON-RPC batch array) over the transport's
 /// client, reusing its connection. Mirrors `HttpTransport.request` but sends
 /// the body verbatim instead of wrapping it as a single call.
-fn httpPost(http: *eth.http_transport.HttpTransport, body: []const u8, alloc: std.mem.Allocator) ![]u8 {
+pub fn httpPost(http: *eth.http_transport.HttpTransport, body: []const u8, alloc: std.mem.Allocator) ![]u8 {
     var response_body: std.Io.Writer.Allocating = .init(alloc);
     errdefer response_body.deinit();
     const result = http.client.fetch(.{
@@ -345,49 +507,27 @@ fn writeBatch(
         const block_logs = logs[block_start..cursor];
 
         if (block_logs.len > types.MAX_LOGS_PER_BLOCK) {
-            std.debug.print(
+            core.log.err(
                 "Block {d}: {d} logs exceeds MAX_LOGS_PER_BLOCK ({d}). Bump the constant in core/src/types.zig.\n",
                 .{ bn, block_logs.len, types.MAX_LOGS_PER_BLOCK },
             );
             return error.TooManyLogsInBlock;
         }
 
-        for (block_logs, 0..) |log, i| scratch.raw_logs[i] = toRawLog(log, bn);
+        for (block_logs, 0..) |log, i| scratch.raw_logs[i] = try toRawLog(log, bn, null);
         const raw = scratch.raw_logs[0..block_logs.len];
 
-        const topic_bloom = log_serial.buildTopicBloom(raw);
-        const addr_bloom = log_serial.buildAddrBloom(raw);
-        const serialized_len = log_serial.serializeLogs(raw, scratch.serialize_buf);
-        const entry_len = try log_serial.compressEntry(scratch.serialize_buf[0..serialized_len], scratch.compress_buf);
-
-        try writer.appendBlock(bn, scratch.compress_buf[0..entry_len], &topic_bloom.bits, &addr_bloom.bits);
+        const pack = try log_serial.packBlock(raw, scratch.serialize_buf, scratch.compress_buf);
+        try writer.appendBlock(bn, scratch.compress_buf[0..pack.entry_len], &pack.topic_bloom.bits, &pack.addr_bloom.bits);
     }
 
     if (cursor != logs.len) return error.UnexpectedLogOrder;
     return @intCast(logs.len);
 }
 
-/// Convert an eth.zig log to a `RawLog`, borrowing `log.data` (consumed by
-/// `serializeLogs` before the batch arena is freed, no copy needed).
-fn toRawLog(log: eth.receipt.Log, block_number: u64) types.RawLog {
-    var topics: [types.MAX_TOPICS][32]u8 = std.mem.zeroes([types.MAX_TOPICS][32]u8);
-    var topic_count: u8 = 0;
-    for (log.topics) |t| {
-        if (topic_count >= types.MAX_TOPICS) break;
-        topics[topic_count] = t;
-        topic_count += 1;
-    }
-    return .{
-        .block_number = block_number,
-        .log_index = @intCast(log.log_index orelse 0),
-        .tx_index = @intCast(log.transaction_index orelse 0),
-        .address = log.address,
-        .topic_count = topic_count,
-        .topics = topics,
-        .data = log.data,
-        .tx_hash = log.transaction_hash orelse std.mem.zeroes([32]u8),
-    };
-}
+// Shared conversion, null allocator borrows `log.data` (consumed by
+// `packBlock` before the batch arena is freed, no copy needed).
+const toRawLog = @import("head_follower.zig").toRawLog;
 
 /// One-off chain-tip query with its own short-lived arena.
 fn queryTip(rpc_url: []const u8, parent_alloc: std.mem.Allocator) !u64 {

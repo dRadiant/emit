@@ -1,7 +1,7 @@
-/// Read-only access to the flat log store (blocks.dat + blocks.idx + blooms.bin).
-/// Thread-safe. Multiple readers operate concurrently via pread + mmap.
-/// Writer lives in engine. Read-only infrastructure shared by engine
-/// (status/validation) and sdk (filtered index builds).
+//! Read-only access to the flat log store (blocks.dat + blocks.idx + blooms.bin).
+//! Thread-safe. Multiple readers operate concurrently via pread + mmap.
+//! Writer lives in engine. Read-only infrastructure shared by engine
+//! (status/validation) and sdk (filtered index builds).
 const std = @import("std");
 
 const bloom = @import("bloom.zig");
@@ -83,6 +83,7 @@ pub const FlatStoreReader = struct {
         defer dir.close();
 
         const blocks_file = try dir.openFile("blocks.dat", .{});
+        errdefer blocks_file.close();
 
         // mmap blocks.idx
         const idx_file = try dir.openFile("blocks.idx", .{});
@@ -98,9 +99,16 @@ pub const FlatStoreReader = struct {
             idx_file.handle,
             0,
         );
+        errdefer std.posix.munmap(index_map);
 
         const first_block = std.mem.readInt(u64, index_map[0..8], .little);
         const index_count = std.mem.readInt(u64, index_map[8..16], .little);
+        // Validate the header count against the mapped size, division form so a
+        // hostile count cannot overflow the multiply. The writer appends entries
+        // before publishing the count, so this holds against a live writer too.
+        // A corrupt count fails loud here instead of degrading every lookup to
+        // BlockNotFound.
+        if (index_count > (idx_size - INDEX_HEADER_SIZE) / INDEX_ENTRY_SIZE) return error.InvalidIndex;
 
         // mmap blooms.bin
         const blooms_file = try dir.openFile("blooms.bin", .{});
@@ -118,6 +126,10 @@ pub const FlatStoreReader = struct {
         );
 
         const blooms_count = std.mem.readInt(u64, blooms_map[0..8], .little);
+        if (blooms_count > (blooms_size - BLOOM_HEADER_SIZE) / BLOOM_ENTRY_SIZE) {
+            std.posix.munmap(blooms_map);
+            return error.InvalidBlooms;
+        }
 
         return .{
             .blocks_file = blocks_file,
@@ -149,7 +161,9 @@ pub const FlatStoreReader = struct {
         if (loc.length == 0) return error.EmptyBlock;
         if (loc.length > buf.len) return error.BufferTooSmall;
 
-        const n = try self.blocks_file.pread(buf[0..loc.length], loc.offset);
+        // preadAll loops on legal POSIX short reads. A short total is real EOF,
+        // a truncated blocks.dat.
+        const n = try self.blocks_file.preadAll(buf[0..loc.length], loc.offset);
         if (n != loc.length) return error.ShortRead;
 
         return buf[0..loc.length];

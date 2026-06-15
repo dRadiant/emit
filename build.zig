@@ -128,8 +128,14 @@ pub fn build(b: *std.Build) void {
         .{ .path = "test/compile_fail/prefetch_param_unknown.zig", .expected = "has no parameter named `tken0`. Available: token0, token1, pair, allPairsLength" },
         .{ .path = "test/compile_fail/prefetch_param_wrong_type.zig", .expected = "references parameter `allPairsLength` of type `uint256`, expected `address`" },
         .{ .path = "test/compile_fail/prefetch_method_empty.zig", .expected = "has an empty method string" },
+        .{ .path = "test/compile_fail/prefetch_of_absent.zig", .expected = "but no earlier call declares it." },
+        .{ .path = "test/compile_fail/prefetch_of_ambiguous.zig", .expected = "but multiple earlier calls declare that method." },
         .{ .path = "test/compile_fail/static_prefetch_method_empty.zig", .expected = "static_prefetch entry has an empty method string" },
         .{ .path = "test/compile_fail/event_nested_dynamic.zig", .expected = "is a tuple with a dynamic component; nested dynamics are not yet supported" },
+        .{ .path = "test/compile_fail/factory_disjoint_child_events.zig", .expected = "factories must declare identical child_events. Split distinct protocols into separate manifests." },
+        .{ .path = "test/compile_fail/log_tx_undeclared.zig", .expected = "type 'void' does not support field access" },
+        .{ .path = "test/compile_fail/blob_read_needs_view.zig", .expected = "copy any blob bytes out before the view is released." },
+        .{ .path = "test/compile_fail/address_not_checksummed.zig", .expected = "is not EIP-55 checksummed. Use '0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045'." },
     };
     for (compile_fail) |s| {
         const obj = b.addObject(.{

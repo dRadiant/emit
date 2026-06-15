@@ -13,6 +13,11 @@
 ///       AND (address ∉ filter.exclude_addrs)
 /// Phase 1 leaves exclude_addrs empty. Phase 3 sets it to static∪factory so a
 /// static contract that's also a factory child does not appear in both pairs.
+///
+/// The rule matches manifest-level sets, not per-contract pairs. A declared
+/// address emitting another contract's topic is kept (cross product). Dispatch
+/// owns per-contract scoping via the comptime emitter gate in `handler.zig`,
+/// so the over-inclusion costs index bytes, never a mis-dispatched handler.
 const std = @import("std");
 
 const core = @import("core");
@@ -51,10 +56,11 @@ const Filter = core.filter.Filter;
 pub fn build(
     reader: *const FlatStoreReader,
     comptime m: sdk_manifest.Manifest,
+    txs: ?*const core.txs.TxsReader,
     dir: std.fs.Dir,
     allocator: std.mem.Allocator,
 ) !BuildResult {
-    return appendBlocks(reader, m, m.start_block, m.end_block orelse std.math.maxInt(u64), dir, allocator);
+    return appendBlocks(reader, m, txs, m.start_block, m.end_block orelse std.math.maxInt(u64), dir, allocator);
 }
 
 /// Extend the primary filtered-store pair over `from_block..=to_block`.
@@ -65,6 +71,7 @@ pub fn build(
 pub fn appendBlocks(
     reader: *const FlatStoreReader,
     comptime m: sdk_manifest.Manifest,
+    txs: ?*const core.txs.TxsReader,
     from_block: u64,
     to_block: u64,
     dir: std.fs.Dir,
@@ -75,6 +82,7 @@ pub fn appendBlocks(
     return runPhase(
         reader,
         known_addresses,
+        txs,
         from_block,
         to_block,
         .{
@@ -95,6 +103,7 @@ pub fn appendBlocks(
 pub fn appendChildren(
     reader: *const FlatStoreReader,
     comptime m: sdk_manifest.Manifest,
+    txs: ?*const core.txs.TxsReader,
     child_addresses: []const [20]u8,
     dir: std.fs.Dir,
     allocator: std.mem.Allocator,
@@ -102,6 +111,7 @@ pub fn appendChildren(
     return appendChildrenBlocks(
         reader,
         m,
+        txs,
         child_addresses,
         m.start_block,
         m.end_block orelse std.math.maxInt(u64),
@@ -119,6 +129,7 @@ pub fn appendChildren(
 pub fn appendChildrenBlocks(
     reader: *const FlatStoreReader,
     comptime m: sdk_manifest.Manifest,
+    txs: ?*const core.txs.TxsReader,
     child_addresses: []const [20]u8,
     from_block: u64,
     to_block: u64,
@@ -134,6 +145,7 @@ pub fn appendChildrenBlocks(
     return runPhase(
         reader,
         child_addresses,
+        txs,
         from_block,
         to_block,
         .{
@@ -154,6 +166,7 @@ pub fn appendChildrenBlocks(
 fn runPhase(
     reader: *const FlatStoreReader,
     bloom_addresses: []const [20]u8,
+    txs: ?*const core.txs.TxsReader,
     start_block: u64,
     end_block: u64,
     filter: Filter,
@@ -165,7 +178,7 @@ fn runPhase(
     defer store.deinit();
 
     var sink = StoreSink{ .store = &store };
-    const r = try core.parallel_filter.run(reader, bloom_addresses, filter, start_block, end_block, StoreSink, &sink, allocator);
+    const r = try core.parallel_filter.run(reader, bloom_addresses, filter, txs, start_block, end_block, StoreSink, &sink, allocator);
     try store.syncAll();
 
     return .{
@@ -379,7 +392,7 @@ test "build: filters multi-contract flat store, primary contains exactly the mat
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
 
-    const result = try build(&reader, SmallManifest, dst_tmp.dir, allocator);
+    const result = try build(&reader, SmallManifest, null, dst_tmp.dir, allocator);
     try testing.expectEqual(matching_count, result.blocks_matched);
     try testing.expectEqual(matching_log_total, result.total_logs);
     try testing.expectEqual(N, result.blocks_scanned);
@@ -460,7 +473,7 @@ fn buildIntoNewTmp(
     allocator: std.mem.Allocator,
 ) !RebuildOutput {
     const tmp = testing.tmpDir(.{});
-    _ = try build(reader, m, tmp.dir, allocator);
+    _ = try build(reader, m, null, tmp.dir, allocator);
     const decoded = try dumpDecodedBlocks(tmp.dir, BASE_PRIMARY, allocator);
     return .{ .tmp = tmp, .decoded = decoded };
 }
@@ -537,13 +550,13 @@ test "build + appendChildren: primary holds creations, children holds child even
 
     // Phase 1: build primary. Only the factory creation event qualifies, since
     // child addresses are not yet known.
-    const primary = try build(&reader, FactoryManifest, dst_tmp.dir, allocator);
+    const primary = try build(&reader, FactoryManifest, null, dst_tmp.dir, allocator);
     try testing.expectEqual(@as(u64, 1), primary.blocks_matched);
     try testing.expectEqual(@as(u64, 1), primary.total_logs);
 
     // Phase 3: append children for the addresses the pre-pass discovered.
     const discovered = [_][20]u8{ ChildAddr1, ChildAddr2, ChildAddr3 };
-    const children = try appendChildren(&reader, FactoryManifest, &discovered, dst_tmp.dir, allocator);
+    const children = try appendChildren(&reader, FactoryManifest, null, &discovered, dst_tmp.dir, allocator);
     try testing.expectEqual(@as(u64, 3), children.blocks_matched);
     try testing.expectEqual(@as(u64, 3), children.total_logs);
 
@@ -603,8 +616,8 @@ test "appendChildren: returns zero-result for empty discovered set" {
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
 
-    _ = try build(&reader, FactoryManifest, dst_tmp.dir, allocator);
-    const result = try appendChildren(&reader, FactoryManifest, &.{}, dst_tmp.dir, allocator);
+    _ = try build(&reader, FactoryManifest, null, dst_tmp.dir, allocator);
+    const result = try appendChildren(&reader, FactoryManifest, null, &.{}, dst_tmp.dir, allocator);
     try testing.expectEqual(@as(u64, 0), result.blocks_scanned);
     try testing.expectEqual(@as(u64, 0), result.blocks_matched);
 }
@@ -646,7 +659,7 @@ test "build: end_block clamps the scan range to a fixed window" {
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
 
-    const result = try build(&reader, ClampedManifest, dst_tmp.dir, allocator);
+    const result = try build(&reader, ClampedManifest, null, dst_tmp.dir, allocator);
     try testing.expectEqual(@as(u64, 20), result.blocks_matched);
     try testing.expectEqual(@as(u64, 20), result.total_logs);
 
@@ -693,11 +706,11 @@ test "appendBlocks extends a primary filter env over the new range" {
     defer dst_tmp.cleanup();
 
     // First pass: cover blocks 100..=104.
-    const first = try appendBlocks(&reader, M, 100, 104, dst_tmp.dir, allocator);
+    const first = try appendBlocks(&reader, M, null, 100, 104, dst_tmp.dir, allocator);
     try testing.expectEqual(@as(u64, 5), first.blocks_matched);
 
     // Second pass extends the pair over 105..=109, same files, appended.
-    const second = try appendBlocks(&reader, M, 105, 109, dst_tmp.dir, allocator);
+    const second = try appendBlocks(&reader, M, null, 105, 109, dst_tmp.dir, allocator);
     try testing.expectEqual(@as(u64, 5), second.blocks_matched);
 
     var decoded = try dumpDecodedBlocks(dst_tmp.dir, BASE_PRIMARY, allocator);
@@ -757,9 +770,9 @@ test "appendChildrenBlocks extends the children pair over a sub-range" {
 
     const children = [_][20]u8{ChildAddr};
     // Backfill covers 100..=104, then the follow gap extends 105..=109.
-    const first = try appendChildrenBlocks(&reader, M, &children, 100, 104, dst_tmp.dir, allocator);
+    const first = try appendChildrenBlocks(&reader, M, null, &children, 100, 104, dst_tmp.dir, allocator);
     try testing.expectEqual(@as(u64, 5), first.blocks_matched);
-    const second = try appendChildrenBlocks(&reader, M, &children, 105, 109, dst_tmp.dir, allocator);
+    const second = try appendChildrenBlocks(&reader, M, null, &children, 105, 109, dst_tmp.dir, allocator);
     try testing.expectEqual(@as(u64, 5), second.blocks_matched);
 
     var decoded = try dumpDecodedBlocks(dst_tmp.dir, BASE_CHILDREN, allocator);

@@ -1,15 +1,15 @@
-/// Per-block Unix timestamps. Dense `u32 LE` array indexed by
-/// `block - first_block`, in `timestamps.bin`.
-///
-/// `u32` epoch-seconds exact until 2106, halves the file versus `u64`
-/// (~39 MB at the tip). Zero entry means unknown (gap not yet backfilled).
-/// Callers fall back to the formula. Partial or absent file is always safe.
-///
-/// Layout:
-///   0   8         magic "EMITTIME"
-///   8   8         first_block (u64 LE)
-///   16  8         count (u64 LE)
-///   24  count*4   timestamps (u32 LE)
+//! Per-block Unix timestamps. Dense `u32 LE` array indexed by
+//! `block - first_block`, in `timestamps.bin`.
+//!
+//! `u32` epoch-seconds exact until 2106, halves the file versus `u64`
+//! (~39 MB at the tip). Zero entry means unknown (gap not yet backfilled).
+//! Callers fall back to the formula. Partial or absent file is always safe.
+//!
+//! Layout:
+//!   0   8         magic "EMITTIME"
+//!   8   8         first_block (u64 LE)
+//!   16  8         count (u64 LE)
+//!   24  count*4   timestamps (u32 LE)
 const std = @import("std");
 
 const flat_format = @import("flat_format.zig");
@@ -31,8 +31,8 @@ pub const TimestampReader = struct {
     count: u64,
 
     /// Open `dir/timestamps.bin`. Returns null when the file is absent or too
-    /// short to hold a header. `error.InvalidMagic` and `error.Truncated`
-    /// surface a corrupt file loudly.
+    /// short to hold a header. `error.InvalidMagic` surfaces a corrupt file
+    /// loudly.
     pub fn open(dir: std.fs.Dir) !?TimestampReader {
         const file = dir.openFile(FILE_NAME, .{}) catch |err| switch (err) {
             error.FileNotFound => return null,
@@ -48,8 +48,14 @@ pub const TimestampReader = struct {
 
         try flat_format.validateMagic(map, MAGIC);
         const first_block = std.mem.readInt(u64, map[8..16], .little);
-        const count = std.mem.readInt(u64, map[16..24], .little);
-        if (HEADER_SIZE + count * ENTRY_SIZE > size) return error.Truncated;
+        // The header count is read through the SHARED map and can run ahead of
+        // the earlier stat when the follower publishes between the two. The
+        // data is advisory, so clamp to what the mapping holds instead of
+        // erroring on a healthy live store.
+        const count = @min(
+            std.mem.readInt(u64, map[16..24], .little),
+            (size - HEADER_SIZE) / ENTRY_SIZE,
+        );
 
         return .{ .map = map, .first_block = first_block, .count = count };
     }

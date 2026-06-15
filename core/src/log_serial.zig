@@ -1,7 +1,7 @@
-/// Packed binary log serialization and LZ4 entry helpers.
-/// Format: log_count(u32 LE) || [log_count × LogEntry]
-/// LogEntry: tx_index(u16) || log_index(u16) || address(20) || topic_count(u8)
-///           || topics(count×32) || data_len(u32) || data(var) || tx_hash(32)
+//! Packed binary log serialization and LZ4 entry helpers.
+//! Format: log_count(u32 LE) || [log_count × LogEntry]
+//! LogEntry: tx_index(u16) || log_index(u16) || address(20) || topic_count(u8)
+//!           || topics(count×32) || data_len(u32) || data(var) || tx_hash(32)
 const std = @import("std");
 
 const lz4 = @import("lz4");
@@ -86,6 +86,58 @@ pub fn deserializeLogs(buf: []const u8, out: []RawLog) usize {
     return log_count;
 }
 
+/// Bounds-checked `deserializeLogs` for untrusted input (the remote TCP stream).
+/// Every length is validated against `buf` and `out` before use, so a malformed
+/// or hostile frame returns `error.MalformedLogEntry` instead of reading or
+/// writing out of bounds (a forged `topic_count` would otherwise smash the
+/// 4-slot `topics` array, a forged `data_len` would slice past `buf`). Identical
+/// output to `deserializeLogs` on valid input. Keep the trusted local path on
+/// the unchecked version. This adds a branch per field.
+pub fn deserializeLogsChecked(buf: []const u8, out: []RawLog) !usize {
+    if (buf.len < 4) return error.MalformedLogEntry;
+    const log_count: usize = std.mem.readInt(u32, buf[0..4], .little);
+    if (log_count > out.len) return error.MalformedLogEntry;
+    var pos: usize = 4;
+
+    for (0..log_count) |i| {
+        var log: RawLog = undefined;
+        log.block_number = 0;
+
+        // Fixed head: tx_index(2) + log_index(2) + address(20) + topic_count(1).
+        // `buf.len - pos` never underflows. pos <= buf.len is held by every check.
+        if (buf.len - pos < 25) return error.MalformedLogEntry;
+        log.tx_index = std.mem.readInt(u16, buf[pos..][0..2], .little);
+        pos += 2;
+        log.log_index = std.mem.readInt(u16, buf[pos..][0..2], .little);
+        pos += 2;
+        log.address = buf[pos..][0..20].*;
+        pos += 20;
+        log.topic_count = buf[pos];
+        pos += 1;
+
+        if (log.topic_count > types.MAX_TOPICS) return error.MalformedLogEntry;
+        if (buf.len - pos < @as(usize, log.topic_count) * 32) return error.MalformedLogEntry;
+        for (0..log.topic_count) |t| {
+            log.topics[t] = buf[pos..][0..32].*;
+            pos += 32;
+        }
+
+        if (buf.len - pos < 4) return error.MalformedLogEntry;
+        const data_len: usize = std.mem.readInt(u32, buf[pos..][0..4], .little);
+        pos += 4;
+        if (buf.len - pos < data_len) return error.MalformedLogEntry;
+        log.data = buf[pos..][0..data_len];
+        pos += data_len;
+
+        if (buf.len - pos < 32) return error.MalformedLogEntry;
+        log.tx_hash = buf[pos..][0..32].*;
+        pos += 32;
+
+        out[i] = log;
+    }
+    return log_count;
+}
+
 // ── LZ4 entry helpers ────────────────────────────────────────────────────
 // Every block in blocks.dat is stored as: lz4_len(u32 LE) || lz4_data.
 // LZ4 achieves ~1.74x on log data (80% random bytes: hashes, addresses).
@@ -127,6 +179,26 @@ pub fn buildAddrBloom(logs: []const RawLog) bloom.AddrBloom {
         b.insert(bloom.AddrBloom.addrToBloomKey(log.address));
     }
     return b;
+}
+
+/// One block's full pack: blooms over the logs, serialize, LZ4 compress into
+/// `compress_buf`. The single sequence behind every ingestion path (RocksDB
+/// import, RPC import, head follower), so the entry format is built in
+/// exactly one place. An empty `logs` packs a valid zero-count entry with
+/// empty blooms, required for dense block numbering.
+pub const PackedBlock = struct {
+    topic_bloom: bloom.Bloom,
+    addr_bloom: bloom.AddrBloom,
+    entry_len: usize,
+};
+
+pub fn packBlock(logs: []const RawLog, serialize_buf: []u8, compress_buf: []u8) !PackedBlock {
+    const serialized_len = serializeLogs(logs, serialize_buf);
+    return .{
+        .topic_bloom = buildTopicBloom(logs),
+        .addr_bloom = buildAddrBloom(logs),
+        .entry_len = try compressEntry(serialize_buf[0..serialized_len], compress_buf),
+    };
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -188,6 +260,61 @@ test "serializeLogs/deserializeLogs roundtrip" {
         }
         try std.testing.expectEqual(@as(u64, 0), out[i].block_number);
     }
+}
+
+test "deserializeLogsChecked matches deserializeLogs on valid input" {
+    const data = [_]u8{ 0xAA, 0xBB, 0xCC };
+    const logs = [_]RawLog{.{
+        .block_number = 7,
+        .tx_index = 5,
+        .log_index = 2,
+        .address = [_]u8{0x11} ** 20,
+        .topic_count = 2,
+        .topics = .{ [_]u8{0xAA} ** 32, [_]u8{0xBB} ** 32, [_]u8{0} ** 32, [_]u8{0} ** 32 },
+        .data = &data,
+        .tx_hash = [_]u8{0x22} ** 32,
+    }};
+    var buf: [512]u8 = undefined;
+    const written = serializeLogs(&logs, &buf);
+
+    var out_checked: [4]RawLog = undefined;
+    var out_plain: [4]RawLog = undefined;
+    const n_checked = try deserializeLogsChecked(buf[0..written], &out_checked);
+    const n_plain = deserializeLogs(buf[0..written], &out_plain);
+    try std.testing.expectEqual(n_plain, n_checked);
+    try std.testing.expectEqual(@as(usize, 1), n_checked);
+    try std.testing.expectEqual(logs[0].topic_count, out_checked[0].topic_count);
+    try std.testing.expectEqualSlices(u8, logs[0].data, out_checked[0].data);
+    try std.testing.expectEqualSlices(u8, &logs[0].tx_hash, &out_checked[0].tx_hash);
+}
+
+test "deserializeLogsChecked rejects malformed input" {
+    var out: [16]RawLog = undefined;
+
+    // Too short to even hold log_count.
+    try std.testing.expectError(error.MalformedLogEntry, deserializeLogsChecked(&.{ 1, 2 }, &out));
+
+    // log_count exceeds the output capacity (a no-real-block count).
+    var count_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &count_buf, 999, .little);
+    try std.testing.expectError(error.MalformedLogEntry, deserializeLogsChecked(&count_buf, &out));
+
+    // log_count = 1 but the fixed head is truncated (only 6 of 25 bytes follow).
+    var short_head: [10]u8 = std.mem.zeroes([10]u8);
+    std.mem.writeInt(u32, short_head[0..4], 1, .little);
+    try std.testing.expectError(error.MalformedLogEntry, deserializeLogsChecked(&short_head, &out));
+
+    // topic_count beyond MAX_TOPICS would smash the topics array.
+    var bad_topics: [4 + 25]u8 = std.mem.zeroes([4 + 25]u8);
+    std.mem.writeInt(u32, bad_topics[0..4], 1, .little);
+    bad_topics[4 + 24] = types.MAX_TOPICS + 1;
+    try std.testing.expectError(error.MalformedLogEntry, deserializeLogsChecked(&bad_topics, &out));
+
+    // data_len points past the buffer.
+    var bad_data: [4 + 25 + 4]u8 = std.mem.zeroes([4 + 25 + 4]u8);
+    std.mem.writeInt(u32, bad_data[0..4], 1, .little);
+    std.mem.writeInt(u32, bad_data[4 + 25 ..][0..4], 1000, .little);
+    try std.testing.expectError(error.MalformedLogEntry, deserializeLogsChecked(&bad_data, &out));
 }
 
 test "compressEntry/decompressEntry roundtrip" {

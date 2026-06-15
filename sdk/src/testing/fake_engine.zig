@@ -32,6 +32,8 @@ pub const FakeEngine = struct {
         addr_bloom: [bloom.ADDR_BLOOM_SIZE]u8,
         /// Owned by `FakeEngine.alloc`. LZ4-compressed packed-log payload.
         lz4_entry: []u8,
+        /// Owned serialized tx table, empty unless a test plants one.
+        tx_table: []u8 = &.{},
     };
 
     pub fn init(dir: std.fs.Dir, alloc: std.mem.Allocator) FakeEngine {
@@ -39,7 +41,10 @@ pub const FakeEngine = struct {
     }
 
     pub fn deinit(self: *FakeEngine) void {
-        for (self.entries.items) |e| self.alloc.free(e.lz4_entry);
+        for (self.entries.items) |e| {
+            self.alloc.free(e.lz4_entry);
+            self.alloc.free(e.tx_table);
+        }
         self.entries.deinit(self.alloc);
     }
 
@@ -54,6 +59,22 @@ pub const FakeEngine = struct {
         return self.ingestAt(block_number, 0, hash, logs);
     }
 
+    /// Like `ingest` but plants a per-block tx table, matching the follower
+    /// building one from the full-block fetch (ADR-006). Records must be
+    /// ascending by `tx_index`.
+    pub fn ingestWithTxs(
+        self: *FakeEngine,
+        block_number: u64,
+        hash: [32]u8,
+        logs: []const core.RawLog,
+        records: []const core.txs.TxRecord,
+    ) !void {
+        const table = try self.alloc.alloc(u8, 4 + records.len * core.txs.RECORD_SIZE);
+        defer self.alloc.free(table);
+        const written = core.txs.serializeRecords(records, table);
+        return self.ingestFull(block_number, 0, hash, logs, table[0..written]);
+    }
+
     /// Like `ingest` but carries an exact block timestamp, matching the
     /// follower writing `header.timestamp` into the pending ring.
     pub fn ingestAt(
@@ -62,6 +83,17 @@ pub const FakeEngine = struct {
         timestamp: u32,
         hash: [32]u8,
         logs: []const core.RawLog,
+    ) !void {
+        return self.ingestFull(block_number, timestamp, hash, logs, &.{});
+    }
+
+    fn ingestFull(
+        self: *FakeEngine,
+        block_number: u64,
+        timestamp: u32,
+        hash: [32]u8,
+        logs: []const core.RawLog,
+        tx_table: []const u8,
     ) !void {
         const serialize_buf = try self.alloc.alloc(u8, types.BLOCK_BUF_SIZE);
         defer self.alloc.free(serialize_buf);
@@ -72,6 +104,8 @@ pub const FakeEngine = struct {
         const entry_len = try log_serial.compressEntry(serialize_buf[0..serialized_len], compress_buf);
 
         const owned = try self.alloc.dupe(u8, compress_buf[0..entry_len]);
+        errdefer self.alloc.free(owned);
+        const owned_txs = try self.alloc.dupe(u8, tx_table);
 
         const tb = log_serial.buildTopicBloom(logs);
         const ab = log_serial.buildAddrBloom(logs);
@@ -83,6 +117,7 @@ pub const FakeEngine = struct {
             .topic_bloom = tb.bits,
             .addr_bloom = ab.bits,
             .lz4_entry = owned,
+            .tx_table = owned_txs,
         });
         try self.persistPending();
     }
@@ -95,6 +130,7 @@ pub const FakeEngine = struct {
             return error.InvalidFinalize;
         const oldest = self.entries.orderedRemove(0);
         self.alloc.free(oldest.lz4_entry);
+        self.alloc.free(oldest.tx_table);
         self.last_finalized = block;
         try self.persistPending();
         try self.persistMeta();

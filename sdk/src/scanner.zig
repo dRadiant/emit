@@ -70,8 +70,11 @@ pub fn scanCreations(
     var i: u64 = 0;
     while (i < primary.count()) : (i += 1) {
         const entry = try primary.readEntry(i);
-        const payload = primary.readPayload(i, payload_buf) catch continue;
-        const decoded = log_serial.decompressEntry(payload, decompress_buf) catch continue;
+        // A corrupt entry here would silently drop a factory child spawned in
+        // this block. The filtered store is engine-written and atomic-committed,
+        // so a read or decompress failure is real corruption: fail loud.
+        const payload = try primary.readPayload(i, payload_buf);
+        const decoded = try log_serial.decompressEntry(payload, decompress_buf);
         const log_count = log_serial.deserializeLogs(decoded, log_buf);
 
         for (log_buf[0..log_count]) |*log| {
@@ -139,43 +142,74 @@ pub fn replay(
     defer allocator.free(decompress_primary);
     const log_buf_primary = try allocator.alloc(RawLog, types.MAX_LOGS_PER_BLOCK);
     defer allocator.free(log_buf_primary);
-    const merge_buf = try allocator.alloc(RawLog, 2 * types.MAX_LOGS_PER_BLOCK);
-    defer allocator.free(merge_buf);
+    // Tx-fields carry. Each pair's entry tail holds the kept logs' TxRecords,
+    // sized to the structural u16 ceiling so no legitimate block overflows.
+    const tx_enabled = comptime sdk_manifest.wantsTxFields(m);
+    const tx_buf_primary = if (tx_enabled) try allocator.alloc(core.txs.TxRecord, core.txs.MAX_RECORDS) else &[_]core.txs.TxRecord{};
+    defer if (tx_enabled) allocator.free(tx_buf_primary);
+    // Only the factory path k-way-merges primary + children. A factory-free
+    // manifest dispatches the primary's logs in place, no merge buffer.
+    const merge_buf = if (has_children) try allocator.alloc(RawLog, 2 * types.MAX_LOGS_PER_BLOCK) else &[_]RawLog{};
+    defer if (has_children) allocator.free(merge_buf);
     const decompress_children = if (has_children) try allocator.alloc(u8, types.BLOCK_BUF_SIZE) else &[_]u8{};
     defer if (has_children) allocator.free(decompress_children);
     const log_buf_children = if (has_children) try allocator.alloc(RawLog, types.MAX_LOGS_PER_BLOCK) else &[_]RawLog{};
     defer if (has_children) allocator.free(log_buf_children);
+    const tx_buf_children = if (tx_enabled and has_children) try allocator.alloc(core.txs.TxRecord, core.txs.MAX_RECORDS) else &[_]core.txs.TxRecord{};
+    defer if (tx_enabled and has_children) allocator.free(tx_buf_children);
+
+    // Default-level live counter. `show_progress` short-circuits the per-block
+    // mask test off the hot path when the level is silent.
+    const show_progress = core.log.getLevel() != .silent;
+    const total_blocks: u64 = (if (primary) |p| p.store.count() else 0) +
+        (if (children) |c| c.store.count() else 0);
 
     while (true) {
-        const next_p: ?u64 = if (primary) |p| p.peek() else null;
-        const next_c: ?u64 = if (children) |c| c.peek() else null;
+        const next_p: ?u64 = if (primary) |p| try p.peek() else null;
+        const next_c: ?u64 = if (children) |c| try c.peek() else null;
         if (next_p == null and next_c == null) break;
 
         const block_number = pickMin(next_p, next_c);
         var block_ts: u32 = 0;
 
-        var merge_count: usize = 0;
-        if (primary) |p| if (next_p) |bn| if (bn == block_number) {
-            block_ts = p.peekedTimestamp();
-            const logs = try p.consume(block_number, decompress_primary, log_buf_primary);
-            for (logs) |log| {
-                merge_buf[merge_count] = log;
-                merge_count += 1;
-            }
-        };
-        if (children) |c| {
-            if (next_c) |bn| if (bn == block_number) {
-                if (block_ts == 0) block_ts = c.peekedTimestamp();
-                const logs = try c.consume(block_number, decompress_children, log_buf_children);
-                for (logs) |log| {
+        var logs: []const RawLog = &.{};
+        // This block's tx tables, reset per iteration. A merged log resolves
+        // against either source, both are subsets of the same block table.
+        var tx_primary: []const core.txs.TxRecord = &.{};
+        var tx_children: []const core.txs.TxRecord = &.{};
+        if (comptime has_children) {
+            // k-way merge of primary + children, re-sorted into canonical order.
+            var merge_count: usize = 0;
+            if (primary) |p| if (next_p) |bn| if (bn == block_number) {
+                block_ts = p.peekedTimestamp();
+                for (try p.consume(block_number, decompress_primary, log_buf_primary, tx_buf_primary, &tx_primary)) |log| {
                     merge_buf[merge_count] = log;
                     merge_count += 1;
                 }
             };
+            if (children) |c| if (next_c) |bn| if (bn == block_number) {
+                if (block_ts == 0) block_ts = c.peekedTimestamp();
+                for (try c.consume(block_number, decompress_children, log_buf_children, tx_buf_children, &tx_children)) |log| {
+                    merge_buf[merge_count] = log;
+                    merge_count += 1;
+                }
+            };
+            if (merge_count == 0) continue;
+            std.mem.sort(RawLog, merge_buf[0..merge_count], {}, lessByTxLog);
+            logs = merge_buf[0..merge_count];
+        } else {
+            // Single source. Dispatch the primary's logs in place, no merge
+            // buffer. The store is canonical within a block in practice, so the
+            // sort only fires for an out-of-order entry. The hot path stays
+            // O(n) on the canonical-order check.
+            const p = primary.?;
+            block_ts = p.peekedTimestamp();
+            const consumed = try p.consume(block_number, decompress_primary, log_buf_primary, tx_buf_primary, &tx_primary);
+            if (consumed.len == 0) continue;
+            if (!std.sort.isSorted(RawLog, consumed, {}, lessByTxLog))
+                std.mem.sort(RawLog, consumed, {}, lessByTxLog);
+            logs = consumed;
         }
-
-        if (merge_count == 0) continue;
-        std.mem.sort(RawLog, merge_buf[0..merge_count], {}, lessByTxLog);
 
         // Prefer the exact time carried in the FilteredStore entry. The remote
         // stream fills it from the PUSH frame. 0 means a local build, fall
@@ -183,9 +217,19 @@ pub fn replay(
         ctx.block_number = block_number;
         ctx.timestamp = if (block_ts != 0) @as(u64, block_ts) else humanize.timestampOf(ctx, block_number);
         result.blocks_dispatched += 1;
+        if (show_progress and (result.blocks_dispatched & 0x3FFF) == 0)
+            core.log.info("\r  replaying {d}/{d} blocks", .{ result.blocks_dispatched, total_blocks });
 
-        for (merge_buf[0..merge_count]) |log| {
-            try handler_mod.dispatchLog(m, Handler, ctx, log);
+        for (logs) |log| {
+            // A kept log whose record is in neither table is a carry bug or a
+            // truncated entry. Never dispatch a silent null `log.tx`.
+            const tx: ?*const core.txs.TxRecord = if (tx_enabled)
+                core.txs.find(tx_primary, log.tx_index) orelse
+                    core.txs.find(tx_children, log.tx_index) orelse
+                    return error.MissingTxRecord
+            else
+                null;
+            try handler_mod.dispatchLog(m, Handler, ctx, log, tx);
             result.logs_dispatched += 1;
             events_since_commit += 1;
         }
@@ -199,6 +243,9 @@ pub fn replay(
             events_since_commit = 0;
         }
     }
+
+    if (show_progress and total_blocks > 0)
+        core.log.info("\r  replaying {d}/{d} blocks\n", .{ result.blocks_dispatched, total_blocks });
 
     result.elapsed_ns = timer.read();
     return result;
@@ -277,10 +324,12 @@ const CursorWalker = struct {
         self.store.deinit();
     }
 
-    fn peek(self: *CursorWalker) ?u64 {
+    fn peek(self: *CursorWalker) !?u64 {
         if (self.next_index >= self.store.count()) return null;
         if (self.peeked == null) {
-            self.peeked = self.store.readEntry(self.next_index) catch return null;
+            // A read failure here is corruption, not end of stream. Propagate so
+            // replay fails loud instead of silently truncating the dispatch.
+            self.peeked = try self.store.readEntry(self.next_index);
         }
         return self.peeked.?.block_number;
     }
@@ -291,17 +340,28 @@ const CursorWalker = struct {
         return if (self.peeked) |e| e.timestamp else 0;
     }
 
+    /// `tx_buf.len == 0` skips the tail parse (tx-blind manifests). Otherwise
+    /// the bytes after the lz4 payload are this block's TxRecord subtable,
+    /// written by the builder's carry. A missing tail fails loud: the
+    /// fingerprint covers `tx_fields`, so a tx-enabled replay never walks a
+    /// tx-blind index.
     fn consume(
         self: *CursorWalker,
         block_number: u64,
         decompress_buf: []u8,
         log_buf: []RawLog,
+        tx_buf: []core.txs.TxRecord,
+        tx_out: *[]const core.txs.TxRecord,
     ) ![]RawLog {
         const entry = self.peeked orelse try self.store.readEntry(self.next_index);
         const payload = try self.store.readPayloadFor(entry, self.payload_buf);
         const decoded = try log_serial.decompressEntry(payload, decompress_buf);
         const log_count = log_serial.deserializeLogs(decoded, log_buf);
         for (log_buf[0..log_count]) |*log| log.block_number = block_number;
+        if (tx_buf.len > 0) {
+            const lz4_len = std.mem.readInt(u32, payload[0..4], .little);
+            tx_out.* = try core.txs.deserializeRecords(payload[4 + lz4_len ..], tx_buf);
+        }
         self.next_index += 1;
         self.peeked = null;
         return log_buf[0..log_count];
@@ -474,7 +534,7 @@ test "scanCreations: extracts spawned addresses from factory creation events" {
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
 
-    _ = try filter_builder.build(&reader, FactoryManifest, dst_tmp.dir, allocator);
+    _ = try filter_builder.build(&reader, FactoryManifest, null, dst_tmp.dir, allocator);
 
     var discovered = try scanCreations(dst_tmp.dir, FactoryManifest, allocator);
     defer discovered.deinit();
@@ -519,7 +579,7 @@ test "replay: dispatches logs in canonical (block, tx, log_index) order across o
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
 
-    _ = try filter_builder.build(&reader, Manifest, dst_tmp.dir, allocator);
+    _ = try filter_builder.build(&reader, Manifest, null, dst_tmp.dir, allocator);
 
     var counter = Counter{ .allocator = allocator };
     defer counter.deinit();
@@ -569,7 +629,7 @@ test "replay seeks past start_block so already-dispatched range is skipped" {
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
 
-    _ = try filter_builder.build(&reader, Manifest, dst_tmp.dir, allocator);
+    _ = try filter_builder.build(&reader, Manifest, null, dst_tmp.dir, allocator);
 
     var counter = Counter{ .allocator = allocator };
     defer counter.deinit();
@@ -634,9 +694,9 @@ test "replay: k-way merge across BLOCKS_PRIMARY and BLOCKS_CHILDREN preserves bl
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
 
-    _ = try filter_builder.build(&reader, FactoryManifest, dst_tmp.dir, allocator);
+    _ = try filter_builder.build(&reader, FactoryManifest, null, dst_tmp.dir, allocator);
     const child_addrs = [_][20]u8{ CHILD_1, CHILD_2 };
-    _ = try filter_builder.appendChildren(&reader, FactoryManifest, &child_addrs, dst_tmp.dir, allocator);
+    _ = try filter_builder.appendChildren(&reader, FactoryManifest, null, &child_addrs, dst_tmp.dir, allocator);
 
     var counter = Counter{ .allocator = allocator };
     defer counter.deinit();
@@ -768,7 +828,7 @@ test "factory orchestration: build → scanCreations → appendChildren → repl
     var dst_tmp = testing.tmpDir(.{});
     defer dst_tmp.cleanup();
 
-    _ = try filter_builder.build(&reader, FactoryManifest, dst_tmp.dir, allocator);
+    _ = try filter_builder.build(&reader, FactoryManifest, null, dst_tmp.dir, allocator);
 
     {
         var discovered = try scanCreations(dst_tmp.dir, FactoryManifest, allocator);
@@ -778,7 +838,7 @@ test "factory orchestration: build → scanCreations → appendChildren → repl
     }
 
     const child_addrs = [_][20]u8{CHILD_1};
-    _ = try filter_builder.appendChildren(&reader, FactoryManifest, &child_addrs, dst_tmp.dir, allocator);
+    _ = try filter_builder.appendChildren(&reader, FactoryManifest, null, &child_addrs, dst_tmp.dir, allocator);
 
     var counter = Counter{ .allocator = allocator };
     defer counter.deinit();
@@ -787,4 +847,102 @@ test "factory orchestration: build → scanCreations → appendChildren → repl
     try testing.expectEqual(@as(u64, 2), result.logs_dispatched);
     try testing.expectEqual(@as(u32, 1), counter.pair_creations);
     try testing.expectEqual(@as(u32, 1), counter.syncs);
+}
+
+// Transfer variant opting into `log.tx`. A distinct type so the shared
+// Transfer manifests above stay tx-blind.
+const TxTransfer = struct {
+    pub const signature = "Transfer(address,address,uint256)";
+    pub const tx_fields = true;
+};
+
+// Records each dispatched log's decoded tx for the tx-fields tests.
+const TxProbe = struct {
+    seen: std.ArrayListUnmanaged(handler_mod.Tx) = .{},
+    block_number: u64 = 0,
+    timestamp: u64 = 0,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *TxProbe) void {
+        self.seen.deinit(self.allocator);
+    }
+
+    pub fn handleTransfer(log: handler_mod.Log(TxTransfer), self: *TxProbe) !void {
+        try self.seen.append(self.allocator, log.tx);
+    }
+};
+
+test "replay with tx_fields decodes each log's tx through the carry" {
+    const allocator = testing.allocator;
+    var src_tmp = testing.tmpDir(.{});
+    defer src_tmp.cleanup();
+
+    // Block 100: kept logs in tx 1 and tx 3, a foreign log in tx 2 whose
+    // record must not surface. Block 101: one log in tx 0.
+    const tt = topicOf(TxTransfer);
+    const ot = topicOf(Approval);
+    const blocks = [_]TestBlock{
+        .{ .block_number = 100, .logs = &.{
+            .{ .tx_index = 1, .log_index = 0, .address = ADDR_TOKEN, .topic0 = tt },
+            .{ .tx_index = 2, .log_index = 1, .address = FACTORY_ADDR, .topic0 = ot },
+            .{ .tx_index = 3, .log_index = 2, .address = ADDR_TOKEN, .topic0 = tt },
+        } },
+        .{ .block_number = 101, .logs = &.{
+            .{ .tx_index = 0, .log_index = 0, .address = ADDR_TOKEN, .topic0 = tt },
+        } },
+    };
+    try core.flat_reader.writeTestStore(src_tmp.dir, &blocks, allocator);
+
+    // The block tables hold every log-producing tx, the carry selects.
+    {
+        var sbuf: [4096]u8 = undefined;
+        var cbuf: [4096]u8 = undefined;
+        var tw = try core.txs.TxsWriter.open(src_tmp.dir, 100);
+        defer tw.deinit();
+        try tw.append(100, &.{ txRec(1, 0x11), txRec(2, 0x22), txRec(3, 0x33) }, &sbuf, &cbuf);
+        try tw.append(101, &.{txRec(0, 0x44)}, &sbuf, &cbuf);
+    }
+
+    var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const src_path = try src_tmp.dir.realpath(".", &src_path_buf);
+    var reader = try FlatStoreReader.open(src_path);
+    defer reader.deinit();
+    var txs_reader = (try core.txs.TxsReader.open(src_tmp.dir)).?;
+    defer txs_reader.deinit();
+
+    const TxManifest: sdk_manifest.Manifest = .{
+        .name = "txfields",
+        .chain_id = 1,
+        .start_block = 0,
+        .contracts = &.{.{ .name = "T", .address = ADDR_TOKEN, .events = &.{TxTransfer} }},
+    };
+    comptime std.debug.assert(sdk_manifest.wantsTxFields(TxManifest));
+
+    var dst_tmp = testing.tmpDir(.{});
+    defer dst_tmp.cleanup();
+    _ = try filter_builder.build(&reader, TxManifest, &txs_reader, dst_tmp.dir, allocator);
+
+    var probe = TxProbe{ .allocator = allocator };
+    defer probe.deinit();
+    const result = try replay(dst_tmp.dir, TxManifest, TxProbe, &probe, .{});
+
+    try testing.expectEqual(@as(u64, 3), result.logs_dispatched);
+    try testing.expectEqual(@as(usize, 3), probe.seen.items.len);
+    // (100, tx 1), (100, tx 3), (101, tx 0). The dropped log's tx 2 never appears.
+    try testing.expectEqualSlices(u8, &([_]u8{0x11} ** 20), &probe.seen.items[0].from);
+    try testing.expectEqualSlices(u8, &([_]u8{0x33} ** 20), &probe.seen.items[1].from);
+    try testing.expectEqualSlices(u8, &([_]u8{0x44} ** 20), &probe.seen.items[2].from);
+    try testing.expectEqual(@as(u256, 0x11), probe.seen.items[0].value);
+    try testing.expectEqualSlices(u8, &([_]u8{0x12} ** 20), &probe.seen.items[0].to.?);
+}
+
+fn txRec(tx_index: u16, seed: u8) core.txs.TxRecord {
+    return .{
+        .tx_index = tx_index,
+        .tx_type = 2,
+        .flags = 0,
+        .from = [_]u8{seed} ** 20,
+        .to = [_]u8{seed +% 1} ** 20,
+        .value = [_]u8{seed} ++ [_]u8{0} ** 31,
+    };
 }

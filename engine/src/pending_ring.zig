@@ -36,6 +36,8 @@ pub const Entry = struct {
     topic_bloom: [bloom.BLOOM_SIZE]u8,
     addr_bloom: [bloom.ADDR_BLOOM_SIZE]u8,
     lz4_entry: []u8,
+    /// Serialized tx table (`core.txs` records), owned like `lz4_entry`.
+    tx_table: []u8 = &.{},
 };
 
 pub const PendingRing = struct {
@@ -59,14 +61,17 @@ pub const PendingRing = struct {
             // follower re-baselines from meta and rewrites it in the current
             // format. Genuine corruption of a current-format file still fails
             // loud (Truncated / NonDense).
-            error.InvalidMagic => std.debug.print("pending.bin: unrecognized magic, discarding and re-baselining from meta\n", .{}),
+            error.InvalidMagic => core.log.info("pending.bin: unrecognized magic, discarding and re-baselining from meta\n", .{}),
             else => return err,
         };
         return ring;
     }
 
     pub fn deinit(self: *PendingRing) void {
-        for (self.entries.items) |e| self.alloc.free(e.lz4_entry);
+        for (self.entries.items) |e| {
+            self.alloc.free(e.lz4_entry);
+            self.alloc.free(e.tx_table);
+        }
         self.entries.deinit(self.alloc);
     }
 
@@ -80,12 +85,15 @@ pub const PendingRing = struct {
         topic_bloom: *const [bloom.BLOOM_SIZE]u8,
         addr_bloom: *const [bloom.ADDR_BLOOM_SIZE]u8,
         lz4_entry: []const u8,
+        tx_table: []const u8,
     ) !void {
         if (self.latestBlock()) |latest| {
             if (block_number != latest + 1) return error.NonDenseInsert;
         }
         const owned = try self.alloc.alloc(u8, lz4_entry.len);
+        errdefer self.alloc.free(owned);
         @memcpy(owned, lz4_entry);
+        const owned_txs = try self.alloc.dupe(u8, tx_table);
         try self.entries.append(self.alloc, .{
             .block_number = block_number,
             .timestamp = timestamp,
@@ -93,8 +101,9 @@ pub const PendingRing = struct {
             .topic_bloom = topic_bloom.*,
             .addr_bloom = addr_bloom.*,
             .lz4_entry = owned,
+            .tx_table = owned_txs,
         });
-        try self.persist();
+        try self.flush();
     }
 
     /// Block hash for reorg detection. O(1) via index arithmetic since entries
@@ -142,24 +151,31 @@ pub const PendingRing = struct {
         return self.entries.orderedRemove(0);
     }
 
-    /// Persist current state to disk. Call after batch mutations.
+    /// Persist current state to disk via atomic rewrite. Mutating methods call
+    /// it themselves; batch operations (`popOldest` runs) call it once after.
     pub fn flush(self: *PendingRing) !void {
-        try self.persist();
+        const buf = try pending_format.serialize(self.alloc, self.entries.items);
+        defer self.alloc.free(buf);
+        try core.atomic_file.write(self.dir, "pending.bin.tmp", "pending.bin", buf);
     }
 
     /// Walk backwards from `from` comparing stored hashes against `canonical`.
-    /// Returns the first block number where they diverge (the fork point).
     /// `canonical[0]` is the hash for `from - 1`, `canonical[1]` for `from - 2`.
-    pub fn findForkPoint(self: *const PendingRing, from: u64, canonical: []const [32]u8) u64 {
-        const oldest = self.oldestBlock() orelse return from;
+    /// Returns the fork point (lowest block at or above which the ring diverges
+    /// from canonical), or null when the canonical window is exhausted without a
+    /// match. Null means the reorg runs deeper than the ring holds, which the
+    /// caller must treat as unrecoverable rather than guess a fork above the true
+    /// one. A too-high fork leaves orphan blocks that finalize into the flat store.
+    pub fn findForkPoint(self: *const PendingRing, from: u64, canonical: []const [32]u8) ?u64 {
+        const oldest = self.oldestBlock() orelse return null;
         var fork = from;
         for (canonical) |hash| {
             if (fork <= oldest) break;
             const stored = self.getHash(fork - 1) orelse break;
-            if (std.mem.eql(u8, &stored, &hash)) break;
+            if (std.mem.eql(u8, &stored, &hash)) return fork;
             fork -= 1;
         }
-        return fork;
+        return null;
     }
 
     /// Delete all entries with block_number >= from_block. Returns count deleted.
@@ -169,23 +185,18 @@ pub const PendingRing = struct {
             const last = self.entries.items[self.entries.items.len - 1];
             if (last.block_number < from_block) break;
             self.alloc.free(last.lz4_entry);
+            self.alloc.free(last.tx_table);
             _ = self.entries.pop();
             deleted += 1;
         }
-        if (deleted > 0) try self.persist();
+        if (deleted > 0) try self.flush();
         return deleted;
     }
 
     // ── Persistence ──────────────────────────────────────────────────────
 
-    fn persist(self: *PendingRing) !void {
-        const buf = try pending_format.serialize(self.alloc, self.entries.items);
-        defer self.alloc.free(buf);
-        try core.atomic_file.write(self.dir, "pending.bin.tmp", "pending.bin", buf);
-    }
-
     /// Load pending.bin on startup via `core.pending_format.parse`.
-    /// Dupes each `lz4_entry` into ring-owned memory.
+    /// Dupes each `lz4_entry` and `tx_table` into ring-owned memory.
     fn load(self: *PendingRing) !void {
         const file = try self.dir.openFile("pending.bin", .{});
         defer file.close();
@@ -202,6 +213,8 @@ pub const PendingRing = struct {
         try self.entries.ensureUnusedCapacity(self.alloc, parsed.len);
         for (parsed) |p| {
             const owned = try self.alloc.dupe(u8, p.lz4_entry);
+            errdefer self.alloc.free(owned);
+            const owned_txs = try self.alloc.dupe(u8, p.tx_table);
             self.entries.appendAssumeCapacity(.{
                 .block_number = p.block_number,
                 .timestamp = p.timestamp,
@@ -209,6 +222,7 @@ pub const PendingRing = struct {
                 .topic_bloom = p.topic_bloom,
                 .addr_bloom = p.addr_bloom,
                 .lz4_entry = owned,
+                .tx_table = owned_txs,
             });
         }
     }
@@ -228,7 +242,7 @@ test "insert and read back hash" {
     var ring = try PendingRing.open(tmp.dir, testing.allocator);
     defer ring.deinit();
 
-    try ring.insert(100, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+    try ring.insert(100, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry, &.{});
 
     const hash = ring.getHash(100).?;
     try testing.expectEqualSlices(u8, &dummy_hash, &hash);
@@ -244,9 +258,9 @@ test "oldest and latest track correctly" {
     try testing.expect(ring.oldestBlock() == null);
     try testing.expect(ring.latestBlock() == null);
 
-    try ring.insert(100, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
-    try ring.insert(101, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
-    try ring.insert(102, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+    try ring.insert(100, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry, &.{});
+    try ring.insert(101, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry, &.{});
+    try ring.insert(102, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry, &.{});
 
     try testing.expectEqual(@as(u64, 100), ring.oldestBlock().?);
     try testing.expectEqual(@as(u64, 102), ring.latestBlock().?);
@@ -259,8 +273,8 @@ test "popOldest removes and returns first entry" {
     var ring = try PendingRing.open(tmp.dir, testing.allocator);
     defer ring.deinit();
 
-    try ring.insert(100, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
-    try ring.insert(101, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+    try ring.insert(100, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry, &.{});
+    try ring.insert(101, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry, &.{});
 
     const oldest = (ring.popOldest()).?;
     defer ring.alloc.free(oldest.lz4_entry);
@@ -281,7 +295,7 @@ test "truncateFrom removes blocks at and above fork point" {
     defer ring.deinit();
 
     for (100..110) |i| {
-        try ring.insert(i, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+        try ring.insert(i, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry, &.{});
     }
     try testing.expectEqual(@as(usize, 10), ring.count());
 
@@ -299,7 +313,7 @@ test "canFinalize respects finality depth" {
     var ring = try PendingRing.open(tmp.dir, testing.allocator);
     defer ring.deinit();
 
-    try ring.insert(100, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+    try ring.insert(100, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry, &.{});
 
     try testing.expect(!ring.canFinalize(163)); // 63 confirmations
     try testing.expect(ring.canFinalize(164)); // 64 confirmations
@@ -309,14 +323,16 @@ test "persists across reopen" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Write
+    // Write. Block 42 carries a tx table, the field a reload must not drop
+    // (the txs.dat mirror reads it from popped entries after a restart).
+    const table = [_]u8{ 1, 0, 0, 0 } ++ [_]u8{0x7E} ** 76;
     {
         var ring = try PendingRing.open(tmp.dir, testing.allocator);
         defer ring.deinit();
         const hash = [_]u8{0xBB} ** 32;
         const entry = [_]u8{ 3, 0, 0, 0, 0xDE, 0xAD, 0xBE };
-        try ring.insert(42, 1_700_000_042, hash, &dummy_topic, &dummy_addr, &entry);
-        try ring.insert(43, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+        try ring.insert(42, 1_700_000_042, hash, &dummy_topic, &dummy_addr, &entry, &table);
+        try ring.insert(43, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry, &.{});
     }
 
     // Reopen and verify
@@ -328,6 +344,8 @@ test "persists across reopen" {
         const hash = ring.getHash(42).?;
         try testing.expectEqual(@as(u8, 0xBB), hash[0]);
         try testing.expectEqual(@as(u32, 1_700_000_042), ring.entries.items[0].timestamp);
+        try testing.expectEqualSlices(u8, &table, ring.entries.items[0].tx_table);
+        try testing.expectEqual(@as(usize, 0), ring.entries.items[1].tx_table.len);
     }
 }
 
@@ -339,7 +357,7 @@ test "reorg scenario: insert, truncate, re-insert" {
 
     const hash_a = [_]u8{0xAA} ** 32;
     for (100..110) |i| {
-        try ring.insert(i, 0, hash_a, &dummy_topic, &dummy_addr, &dummy_entry);
+        try ring.insert(i, 0, hash_a, &dummy_topic, &dummy_addr, &dummy_entry, &.{});
     }
 
     // Reorg at 107
@@ -348,7 +366,7 @@ test "reorg scenario: insert, truncate, re-insert" {
     // Re-insert canonical
     const hash_b = [_]u8{0xBB} ** 32;
     for (107..110) |i| {
-        try ring.insert(i, 0, hash_b, &dummy_topic, &dummy_addr, &dummy_entry);
+        try ring.insert(i, 0, hash_b, &dummy_topic, &dummy_addr, &dummy_entry, &.{});
     }
 
     try testing.expectEqual(@as(usize, 10), ring.count());
@@ -364,8 +382,8 @@ test "truncate everything leaves empty ring" {
     var ring = try PendingRing.open(tmp.dir, testing.allocator);
     defer ring.deinit();
 
-    try ring.insert(100, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
-    try ring.insert(101, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry);
+    try ring.insert(100, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry, &.{});
+    try ring.insert(101, 0, dummy_hash, &dummy_topic, &dummy_addr, &dummy_entry, &.{});
 
     _ = try ring.truncateFrom(100);
     try testing.expectEqual(@as(usize, 0), ring.count());
@@ -380,13 +398,13 @@ test "findForkPoint walks back to matching hash" {
 
     const hash_a = [_]u8{0xAA} ** 32;
     for (100..110) |i| {
-        try ring.insert(i, 0, hash_a, &dummy_topic, &dummy_addr, &dummy_entry);
+        try ring.insert(i, 0, hash_a, &dummy_topic, &dummy_addr, &dummy_entry, &.{});
     }
 
     // Canonical matches at 105, diverges above
     const hash_b = [_]u8{0xBB} ** 32;
     const canonical = [_][32]u8{ hash_b, hash_b, hash_b, hash_a }; // 108,107,106,105
-    const fork = ring.findForkPoint(109, &canonical);
+    const fork = ring.findForkPoint(109, &canonical).?;
     try testing.expectEqual(@as(u64, 106), fork);
 }
 
@@ -398,23 +416,42 @@ test "findForkPoint returns from when all match" {
 
     const hash_a = [_]u8{0xAA} ** 32;
     for (100..105) |i| {
-        try ring.insert(i, 0, hash_a, &dummy_topic, &dummy_addr, &dummy_entry);
+        try ring.insert(i, 0, hash_a, &dummy_topic, &dummy_addr, &dummy_entry, &.{});
     }
 
     // First canonical hash matches immediately (no reorg)
     const canonical = [_][32]u8{hash_a};
-    const fork = ring.findForkPoint(105, &canonical);
+    const fork = ring.findForkPoint(105, &canonical).?;
     try testing.expectEqual(@as(u64, 105), fork);
 }
 
-test "findForkPoint on empty ring returns from" {
+test "findForkPoint returns null when no canonical hash matches" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ring = try PendingRing.open(tmp.dir, testing.allocator);
+    defer ring.deinit();
+
+    const hash_a = [_]u8{0xAA} ** 32;
+    for (100..110) |i| {
+        try ring.insert(i, 0, hash_a, &dummy_topic, &dummy_addr, &dummy_entry, &.{});
+    }
+
+    // Every compared block diverges (the reorg is deeper than the fetched
+    // window). Walking the whole array without a match must signal failure, not
+    // guess a fork above the true one and orphan-finalize.
+    const hash_b = [_]u8{0xBB} ** 32;
+    const canonical = [_][32]u8{ hash_b, hash_b, hash_b };
+    try testing.expectEqual(@as(?u64, null), ring.findForkPoint(109, &canonical));
+}
+
+test "findForkPoint on empty ring returns null" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var ring = try PendingRing.open(tmp.dir, testing.allocator);
     defer ring.deinit();
 
     const canonical = [_][32]u8{[_]u8{0} ** 32};
-    try testing.expectEqual(@as(u64, 100), ring.findForkPoint(100, &canonical));
+    try testing.expectEqual(@as(?u64, null), ring.findForkPoint(100, &canonical));
 }
 
 // Dense-ring invariant that head_follower's reorg recovery depends on. After
@@ -428,7 +465,7 @@ test "truncate + re-insert restores dense ring with canonical hashes" {
 
     const hash_a = [_]u8{0xAA} ** 32;
     for (100..106) |i| {
-        try ring.insert(i, 0, hash_a, &dummy_topic, &dummy_addr, &dummy_entry);
+        try ring.insert(i, 0, hash_a, &dummy_topic, &dummy_addr, &dummy_entry, &.{});
     }
     try testing.expectEqual(@as(usize, 6), ring.count());
 
@@ -440,7 +477,7 @@ test "truncate + re-insert restores dense ring with canonical hashes" {
     // Recovery re-inserts canonical 103, 104, 105 with hash B.
     const hash_b = [_]u8{0xBB} ** 32;
     for (103..106) |i| {
-        try ring.insert(i, 0, hash_b, &dummy_topic, &dummy_addr, &dummy_entry);
+        try ring.insert(i, 0, hash_b, &dummy_topic, &dummy_addr, &dummy_entry, &.{});
     }
     try testing.expectEqual(@as(usize, 6), ring.count());
     try testing.expectEqual(@as(u64, 105), ring.latestBlock().?);

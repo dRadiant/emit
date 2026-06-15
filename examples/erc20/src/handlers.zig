@@ -13,12 +13,15 @@ const Ctx = sdk.Context(@import("entities.zig"));
 
 /// Wrapping arithmetic on balances so a non-genesis start block doesn't
 /// trip integer-overflow safety checks. Balances reconcile by head.
+/// Save the sender before loading the receiver. A self-transfer must read
+/// the already-debited balance, two pre-loaded copies would let the second
+/// save discard the subtraction and mint value from nothing.
 pub fn handleTransfer(log: sdk.Log(m.Transfer), ctx: *Ctx) !void {
     var sender = try ctx.stores.accounts.loadOrInit(log.params.from);
-    var receiver = try ctx.stores.accounts.loadOrInit(log.params.to);
     sender.balance -%= log.params.value;
-    receiver.balance +%= log.params.value;
     try ctx.stores.accounts.save(sender);
+    var receiver = try ctx.stores.accounts.loadOrInit(log.params.to);
+    receiver.balance +%= log.params.value;
     try ctx.stores.accounts.save(receiver);
 
     try ctx.stores.transfers.save(.{

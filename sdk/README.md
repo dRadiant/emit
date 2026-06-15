@@ -53,13 +53,17 @@ Four arguments: manifest (concrete types), handler (a struct exposing `handleTra
 
 To run an indexer off-host, set `.remote_engine = .{ .host = "127.0.0.1", .port = 9090 }` (in place of `.engine_data_dir`) and the SDK streams the filtered backfill and live blocks from an `emit-engine serve` over TCP instead of reading the local flat store. Functionality is identical to a locally running indexer.
 
+### Transaction fields
+
+An event opting in with `pub const tx_fields = true;` (next to its `signature`) gives its handler `log.tx: sdk.Tx` — the owning transaction's `from`, `to` (null for contract creations), `value`, and `tx_type`, decoded and non-optional. Reading `log.tx` on an event that did not declare it is a compile error. Any declaration turns on the carry for the whole manifest: the filtered index packs the matching `TxRecord`s alongside the logs (local and remote alike), and `init` fails loud unless the engine store's `txs.{dat,idx}` covers the indexed range. Manifests with no declaration compile byte-identical to before — zero cost when unused. See [examples/uniswap-v2/](../examples/uniswap-v2/) (`trader = log.tx.from`) and ADR-006.
+
 ## Public surface
 
 Re-exported from `root.zig`:
 
 - **Entry:** `run`, `init`, `Context`, `Options`, `RunStats`, `StorageMode`
 - **Manifest:** `Manifest`, `ContractDef`, `FactoryDef`, `PrefetchDef`, `PrefetchCall`, `StaticCall`, `AddressSource`
-- **Handler:** `DecodedLog`, `Log`
+- **Handler:** `DecodedLog`, `Log`, `Tx`
 - **Helpers:** `address` (comptime hex → `[20]u8` with EIP-55 check), `concat`, `storeFor`, `Amount`, `amount`
 - **Validation:** `validateHandler`, `validateManifest`
 - **Constants:** `DEFAULT_BATCH_SIZE`

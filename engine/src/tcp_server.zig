@@ -76,7 +76,7 @@ pub fn run(opts: Options) !void {
     var server = try address.listen(.{ .reuse_address = true });
     defer server.deinit();
     try setAcceptTimeout(server, ACCEPT_POLL_MS);
-    std.debug.print(
+    core.log.info(
         "emit-engine serve: listening on {s}:{d} ({d} workers, data-dir {s}, tip {d})\n",
         .{ opts.host, server.listen_address.getPort(), opts.max_connections, opts.data_dir, tipOf(&reader) },
     );
@@ -103,12 +103,12 @@ fn acceptLoop(ctx: WorkerCtx) void {
     while (!ctx.stop.load(.acquire)) {
         const conn = ctx.server.accept() catch |e| {
             if (e == error.WouldBlock) continue;
-            std.debug.print("serve: accept failed: {s}\n", .{@errorName(e)});
+            core.log.info("serve: accept failed: {s}\n", .{@errorName(e)});
             continue;
         };
         defer conn.stream.close();
         serveConnection(conn.stream, ctx.reader, ctx.ts, ctx.cfg, ctx.alloc) catch |e| {
-            std.debug.print("serve: connection ended: {s}\n", .{@errorName(e)});
+            core.log.debug("serve: connection ended: {s}\n", .{@errorName(e)});
         };
     }
 }
@@ -132,6 +132,9 @@ pub fn serveConnection(
 ) !void {
     setNoDelay(stream);
     clearRecvTimeout(stream);
+    // Heartbeats detect closed peers, not wedged ones. A zero-window client
+    // would otherwise block a worker in writevAll forever.
+    setSendTimeout(stream, 2 * cfg.heartbeat_ms);
 
     const reg_payload = try readFrame(stream, .register, allocator);
     defer allocator.free(reg_payload);
@@ -146,7 +149,26 @@ pub fn serveConnection(
         return sendGoaway(stream, .shutdown, "empty filter", allocator);
     }
 
-    try streamBackfill(stream, reader, ts_reader, reg, allocator);
+    // Tx-fields carry. Refuse up front when the store cannot serve the whole
+    // backfill range, never stream a client a half-covered index.
+    var txs_storage: ?core.txs.TxsReader = null;
+    defer if (txs_storage) |*t| t.deinit();
+    if (reg.tx_fields) {
+        var dir = try std.fs.cwd().openDir(cfg.data_dir, .{});
+        defer dir.close();
+        txs_storage = core.txs.TxsReader.open(dir) catch null;
+        if (txs_storage == null)
+            return sendGoaway(stream, .shutdown, "tx fields unavailable: store has no txs.{dat,idx}", allocator);
+        const tip = tipOf(reader);
+        // Clamp to the store's first block: a fresh client registers cursor 0
+        // regardless of where the flat store begins.
+        const start = @max(reg.cursor +| 1, reader.first_block);
+        if (start <= tip and !txs_storage.?.covers(start, tip))
+            return sendGoaway(stream, .shutdown, "tx fields unavailable: txs.dat does not cover the backfill range", allocator);
+    }
+    const txs_reader: ?*const core.txs.TxsReader = if (txs_storage) |*t| t else null;
+
+    try streamBackfill(stream, reader, ts_reader, txs_reader, reg, allocator);
     if (!reg.follow) return sendGoaway(stream, .shutdown, "backfill complete", allocator);
     try streamLive(stream, reg, tipOf(reader), cfg, allocator);
 }
@@ -160,12 +182,13 @@ fn streamBackfill(
     stream: std.net.Stream,
     reader: *const FlatStoreReader,
     ts_reader: ?*const TimestampReader,
+    txs_reader: ?*const core.txs.TxsReader,
     reg: tcp_frame.Register,
     allocator: std.mem.Allocator,
 ) !void {
     if (reader.index_count == 0) return;
     const tip = tipOf(reader);
-    const start = reg.cursor + 1; // cursor = last block the client already has
+    const start = reg.cursor +| 1; // cursor = last block the client already has
     if (start > tip) return; // already caught up
 
     const filter: core.filter.Filter = .{
@@ -177,7 +200,7 @@ fn streamBackfill(
     // Shared with the SDK builder: a parallel io_uring read + filter pipeline,
     // chunked so each chunk's survivors PUSH before the next reads.
     var sink = PushSink{ .stream = stream, .ts = ts_reader };
-    const r = try core.parallel_filter.run(reader, reg.addresses, filter, start, tip, PushSink, &sink, allocator);
+    const r = try core.parallel_filter.run(reader, reg.addresses, filter, txs_reader, start, tip, PushSink, &sink, allocator);
     // A dropped block (read/decompress failure) means a hole. Refuse to hand the
     // client an incomplete index.
     if (r.dropped_blocks > 0) return error.BloomScanDropped;
@@ -196,6 +219,9 @@ const PushSink = struct {
 
 /// Highest block number stored (the last dense index slot).
 fn tipOf(reader: *const FlatStoreReader) u64 {
+    // Empty flat store (serve before import). Return 0 so a backfill range
+    // `(cursor, tip]` is empty rather than underflowing to maxInt.
+    if (reader.index_count == 0) return 0;
     return reader.first_block + reader.index_count - 1;
 }
 
@@ -231,13 +257,20 @@ fn streamLive(
     const compress_buf = try allocator.alloc(u8, types.BLOCK_BUF_SIZE);
     defer allocator.free(compress_buf);
 
+    // Tx carry scratch for the pending push path, allocated only when the
+    // client registered tx_fields. The pending entry carries the block's full
+    // table, the push appends the kept subset after the lz4 payload.
+    var tx_scratch: ?LiveTxScratch = if (reg.tx_fields) try LiveTxScratch.init(allocator) else null;
+    defer if (tx_scratch) |*ts| ts.deinit(allocator);
+    const tx: ?*LiveTxScratch = if (tx_scratch) |*ts| ts else null;
+
     // Pending blocks above the backfill coverage (and the client's cursor)
     // bridge the gap between the finalized tip and the live head. They may
     // already be in the ring before the first wake, so stream them up front.
     const live_start = @max(reg.cursor, flat_tip);
     for (prev.entries) |e| {
         if (e.block_number <= live_start) continue;
-        try filterAndPush(stream, e, filterFor(match_addrs.items, reg), decompress_buf, serialize_buf, compress_buf);
+        try filterAndPush(stream, e, filterFor(match_addrs.items, reg), decompress_buf, serialize_buf, compress_buf, tx);
     }
 
     while (true) {
@@ -267,13 +300,46 @@ fn streamLive(
         // floor both roll the client back and re-stream. The lower fork wins.
         if (minOpt(reorgFork(classification), add_floor)) |fork| {
             try sendReorg(stream, fork);
+            // An ADD_ADDRESS floor can sit below the ring window (child created
+            // more than FINALITY_DEPTH blocks ago). REORG dropped the client's
+            // store from `fork`, so the span the ring no longer holds must
+            // re-stream from the flat store under the full filter. A fresh
+            // reader sees blocks finalized since connect. Reorg forks sit above
+            // the finalized tip, so this fires only for ADD_ADDRESS.
+            var flat_covered: u64 = 0;
+            if (fork <= last_finalized) {
+                var fresh = try FlatStoreReader.open(cfg.data_dir);
+                defer fresh.deinit();
+                const fresh_tip = tipOf(&fresh);
+                if (fork <= fresh_tip) {
+                    var dir = try std.fs.cwd().openDir(cfg.data_dir, .{});
+                    defer dir.close();
+                    var ts = try TimestampReader.open(dir);
+                    defer if (ts) |*t| t.deinit();
+                    // Fresh txs reader for the same reason as the fresh flat
+                    // reader: coverage grows with each finalize. A hole now is
+                    // fatal, the client was promised tx fields at REGISTER.
+                    var fresh_txs: ?core.txs.TxsReader = null;
+                    defer if (fresh_txs) |*t| t.deinit();
+                    if (reg.tx_fields) {
+                        fresh_txs = (core.txs.TxsReader.open(dir) catch null) orelse return error.TxFieldsUnavailable;
+                        if (!fresh_txs.?.covers(fork, fresh_tip)) return error.TxFieldsUnavailable;
+                    }
+                    var sink = PushSink{ .stream = stream, .ts = if (ts) |*t| t else null };
+                    const r = try core.parallel_filter.run(&fresh, match_addrs.items, filter, if (fresh_txs) |*t| t else null, fork, fresh_tip, PushSink, &sink, allocator);
+                    if (r.dropped_blocks > 0) return error.BloomScanDropped;
+                    flat_covered = fresh_tip;
+                }
+            }
             for (curr.entries) |e| {
-                if (e.block_number < fork) continue;
-                try filterAndPush(stream, e, filter, decompress_buf, serialize_buf, compress_buf);
+                // Skip blocks below the fork (client kept them) and blocks the
+                // flat re-stream already pushed (client store key is monotonic).
+                if (e.block_number < fork or e.block_number <= flat_covered) continue;
+                try filterAndPush(stream, e, filter, decompress_buf, serialize_buf, compress_buf, tx);
             }
         } else {
             for (classification.new_blocks) |e| {
-                try filterAndPush(stream, e, filter, decompress_buf, serialize_buf, compress_buf);
+                try filterAndPush(stream, e, filter, decompress_buf, serialize_buf, compress_buf, tx);
             }
         }
 
@@ -286,8 +352,36 @@ fn streamLive(
     }
 }
 
+/// Tx carry scratch for the live push path, sized to the structural u16
+/// ceiling. Allocated per connection, only for tx_fields registrations.
+const LiveTxScratch = struct {
+    mask: []u16,
+    records: []core.txs.TxRecord,
+    selected: []core.txs.TxRecord,
+    /// Concat target: filtered entry + serialized subtable.
+    push_buf: []u8,
+
+    fn init(a: std.mem.Allocator) !LiveTxScratch {
+        return .{
+            .mask = try a.alloc(u16, core.txs.MAX_RECORDS),
+            .records = try a.alloc(core.txs.TxRecord, core.txs.MAX_RECORDS),
+            .selected = try a.alloc(core.txs.TxRecord, core.txs.MAX_RECORDS),
+            .push_buf = try a.alloc(u8, types.BLOCK_BUF_SIZE + core.txs.MAX_TABLE_SIZE),
+        };
+    }
+
+    fn deinit(self: *LiveTxScratch, a: std.mem.Allocator) void {
+        a.free(self.push_buf);
+        a.free(self.selected);
+        a.free(self.records);
+        a.free(self.mask);
+    }
+};
+
 /// Decompress a pending block, filter to matching logs, PUSH when non-empty.
-/// A block with no matching log produces no frame.
+/// A block with no matching log produces no frame. With `tx` set, the kept
+/// logs' TxRecords (selected from the entry's full table) trail the lz4
+/// payload. A table the ring lacks fails loud, the client registered for it.
 fn filterAndPush(
     stream: std.net.Stream,
     entry: Entry,
@@ -295,10 +389,21 @@ fn filterAndPush(
     decompress_buf: []u8,
     serialize_buf: []u8,
     compress_buf: []u8,
+    tx: ?*LiveTxScratch,
 ) !void {
     const decompressed = try log_serial.decompressEntry(entry.lz4_entry, decompress_buf);
-    const maybe = try core.filter.filterBlockEntry(decompressed, filter, serialize_buf, compress_buf);
+    const mask_buf: ?[]u16 = if (tx) |t| t.mask else null;
+    const maybe = try core.filter.filterBlockEntry(decompressed, filter, serialize_buf, compress_buf, mask_buf);
     const filtered = maybe orelse return;
+
+    if (tx) |t| {
+        const full = try core.txs.deserializeRecords(entry.tx_table, t.records);
+        const selected = core.txs.selectByMask(full, filtered.tx_mask, t.selected);
+        if (selected.len != filtered.tx_mask.len) return error.MissingTxRecord;
+        @memcpy(t.push_buf[0..filtered.entry.len], filtered.entry);
+        const sub_len = core.txs.serializeRecords(selected, t.push_buf[filtered.entry.len..]);
+        return sendPush(stream, entry.block_number, entry.timestamp, t.push_buf[0 .. filtered.entry.len + sub_len]);
+    }
     try sendPush(stream, entry.block_number, entry.timestamp, filtered.entry);
 }
 
@@ -382,6 +487,13 @@ fn writeFrame(stream: std.net.Stream, t: tcp_frame.FrameType, payload: []const u
 fn setNoDelay(stream: std.net.Stream) void {
     const one: c_int = 1;
     std.posix.setsockopt(stream.handle, std.posix.IPPROTO.TCP, std.os.linux.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
+}
+
+/// Bound writes so a wedged (zero-window) peer surfaces as an error instead of
+/// pinning a worker in `writevAll` forever. Best-effort, like `setNoDelay`.
+fn setSendTimeout(stream: std.net.Stream, ms: u32) void {
+    const tv = std.posix.timeval{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) };
+    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
 }
 
 /// Clear the recv timeout an accepted socket inherits from the listener (set by

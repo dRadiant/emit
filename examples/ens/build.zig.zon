@@ -1,0 +1,14 @@
+.{
+    .name = .ens_indexer,
+    .version = "0.0.0",
+    .fingerprint = 0x70fba6959eac9f94,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .emit = .{ .path = "../.." },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
