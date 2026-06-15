@@ -171,7 +171,7 @@ A dedicated migration guide is planned for the future. Until then, the example i
 ## Documentation
 
 - `docs/` — contains documentation, architecture, and technical documents. (TBA)
-- [`docs/adr/`](docs/adr/) — architectural decision records (pending block storage, filtered-index format, SDK storage, ethcall strictness)
+- [`docs/adr/`](docs/adr/) — architectural decision records (pending block storage, filtered-index format, SDK storage, ethcall strictness, entity blobs, tx fields, chained prefetch)
 - [`core/README.md`](core/README.md), [`engine/README.md`](engine/README.md), [`sdk/README.md`](sdk/README.md) — per-package orientation
 - [`examples/`](examples/) — runnable reference indexers with their own READMEs
 - [`CHANGELOG.md`](CHANGELOG.md) — release history
