@@ -134,7 +134,7 @@ $170/month Hetzner dedicated server (i9-13900, 128GB DDR5 ECC, 2x 2TB Gen4 U.2 N
 
 ## Status
 
-**v1.1.0** EMIT is not yet fully production ready, and is still under active development. Use at your own risk, and expect breaking changes.
+**v1.2.0** EMIT is not yet fully production ready, and is still under active development. Use at your own risk, and expect breaking changes.
 
 ## Packages
 
