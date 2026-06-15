@@ -269,10 +269,14 @@ const LiveSession = struct {
         }
     }
 
-    /// Gather → dedupe → filterUncached → preload. Skips when the manifest
-    /// declares no prefetch, when ctx has no cache (counter-shaped tests),
-    /// or when the block has no matching factory events. Missing entries
-    /// surface as `error.NotPrefetched` in handlers when multicall is null.
+    /// Bounded multi-round prefetch for one block. Each round gathers →
+    /// dedupes → drops cached → preloads, so round `k+1` resolves chained
+    /// `.of`/`.of_return` targets the prior round cached. Round cap is the
+    /// manifest's deepest chain (1 when none chain, the unchained fast path).
+    /// Skips when the manifest declares no prefetch, ctx has no cache
+    /// (counter-shaped tests), or multicall is null (no RPC, handlers then
+    /// see `error.NotPrefetched`). Per-round arena reset frees each round's
+    /// gather before the next.
     fn maybePrefetchBlock(
         self: *LiveSession,
         comptime m: sdk_manifest.Manifest,
@@ -283,20 +287,23 @@ const LiveSession = struct {
         const T = std.meta.Child(@TypeOf(ctx));
         if (comptime !@hasField(T, "_cache")) return;
         const cache = ctx._cache orelse return;
+        const mc = self.multicall orelse return;
+        const max_rounds = comptime sdk_manifest.prefetchMaxDepth(m);
 
         var arena_state = std.heap.ArenaAllocator.init(ctx._allocator);
         defer arena_state.deinit();
-        const arena = arena_state.allocator();
 
-        const calls = try prefetch.gatherOneBlock(arena, logs, m, cache);
-        if (calls.len == 0) return;
+        var round: usize = 0;
+        while (round < max_rounds) : (round += 1) {
+            _ = arena_state.reset(.retain_capacity);
+            const arena = arena_state.allocator();
 
-        const unique = try prefetch.dedupe(arena, calls);
-        const missing = try prefetch.filterUncached(arena, cache, unique);
-        if (missing.len == 0) return;
-
-        const mc = self.multicall orelse return;
-        try cache.preload(ctx._allocator, mc, missing, self.multicall_batch_size);
+            const calls = try prefetch.gatherOneBlock(arena, logs, m, cache);
+            const unique = try prefetch.dedupe(arena, calls);
+            const missing = try prefetch.filterUncached(arena, cache, unique);
+            if (missing.len == 0) break;
+            try cache.preload(ctx._allocator, mc, missing, self.multicall_batch_size);
+        }
     }
 };
 

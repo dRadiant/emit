@@ -1040,9 +1040,31 @@ pub fn spawn(
     return ctx;
 }
 
-/// Gather → dedupe → filterUncached → preload. Runs once between Phases 3 and 5.
-/// All gather allocations live in a local arena that frees on return. The
-/// only state that escapes is the cache writes from `preload`.
+/// Static + dynamic prefetch calls for one round, merged and deduped. With the
+/// cache warmed by prior rounds, chained `.of`/`.of_return` calls that couldn't
+/// resolve before now appear, so re-gathering grows the set toward its fixpoint.
+fn gatherUnique(
+    arena: std.mem.Allocator,
+    comptime m: sdk_manifest.Manifest,
+    filter_dh: std.fs.Dir,
+    cache: *const ethcall.Cache,
+) ![]ethcall.Call {
+    const static_calls = try prefetch.gatherStatic(arena, m);
+    const dynamic_calls = try prefetch.gatherDynamic(arena, filter_dh, m, cache);
+
+    const merged = try arena.alloc(ethcall.Call, static_calls.len + dynamic_calls.len);
+    @memcpy(merged[0..static_calls.len], static_calls);
+    @memcpy(merged[static_calls.len..], dynamic_calls);
+
+    return prefetch.dedupe(arena, merged);
+}
+
+/// Bounded multi-round prefetch between Phases 3 and 5. Each round gathers →
+/// dedupes → drops cached → preloads; round `k+1` resolves chained targets the
+/// prior round cached. Round cap is the manifest's deepest chain (1 when none
+/// chain, so it runs exactly once with no overhead). A per-round arena reset
+/// frees each round's gather before the next. The only escaping state is the
+/// cache writes from `preload`.
 fn runPhase4(
     comptime m: sdk_manifest.Manifest,
     options: Options,
@@ -1051,27 +1073,18 @@ fn runPhase4(
 ) !void {
     const allocator = ctx._allocator;
     const cache = ctx._cache.?;
+    const max_rounds = comptime sdk_manifest.prefetchMaxDepth(m);
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
-    const arena = arena_state.allocator();
 
-    const static_calls = try prefetch.gatherStatic(arena, m);
-    const dynamic_calls = try prefetch.gatherDynamic(arena, filter_dh, m, cache);
-
-    const merged = try arena.alloc(ethcall.Call, static_calls.len + dynamic_calls.len);
-    @memcpy(merged[0..static_calls.len], static_calls);
-    @memcpy(merged[static_calls.len..], dynamic_calls);
-
-    const unique = try prefetch.dedupe(arena, merged);
-    ctx.stats.prefetch_calls_gathered = unique.len;
-
-    const missing = try prefetch.filterUncached(arena, cache, unique);
-    if (missing.len == 0) return;
-
-    // No RPC configured: gather is informational, fetch is a no-op. Handlers
-    // that hit an uncached pair see `error.NotPrefetched` at replay.
-    const rpc_url = options.node_rpc orelse return;
+    // No RPC: gather once for the informational count, nothing to fetch.
+    // Handlers that hit an uncached pair see `error.NotPrefetched` at replay.
+    const rpc_url = options.node_rpc orelse {
+        const unique = try gatherUnique(arena_state.allocator(), m, filter_dh, cache);
+        ctx.stats.prefetch_calls_gathered = unique.len;
+        return;
+    };
 
     var http = eth.http_transport.HttpTransport.init(allocator, rpc_url);
     // Frees the std.http.Client connection pool (kept-alive sockets).
@@ -1080,8 +1093,22 @@ fn runPhase4(
     var mc = eth.multicall.Multicall.init(allocator, &provider, options.multicall_address);
     defer mc.deinit();
 
-    try cache.preload(allocator, &mc, missing, options.multicall_batch_size);
-    ctx.stats.prefetch_calls_executed = missing.len;
+    var round: usize = 0;
+    while (round < max_rounds) : (round += 1) {
+        _ = arena_state.reset(.retain_capacity);
+        const arena = arena_state.allocator();
+
+        const unique = try gatherUnique(arena, m, filter_dh, cache);
+        // Last round gathers the fully-resolved set, so the final overwrite is
+        // the total distinct call count.
+        ctx.stats.prefetch_calls_gathered = unique.len;
+
+        const missing = try prefetch.filterUncached(arena, cache, unique);
+        if (missing.len == 0) break;
+
+        try cache.preload(allocator, &mc, missing, options.multicall_batch_size);
+        ctx.stats.prefetch_calls_executed += missing.len;
+    }
 }
 
 /// Skip the filter build only when the on-disk filter has at least one entry
