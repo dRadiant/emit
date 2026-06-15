@@ -36,53 +36,92 @@ pub fn gatherOneBlock(
     arena: std.mem.Allocator,
     logs: []const RawLog,
     comptime m: sdk_manifest.Manifest,
+    cache: *const ethcall.Cache,
 ) ![]ethcall.Call {
     if (comptime m.prefetch.len == 0) return &.{};
 
     var out: std.ArrayList(ethcall.Call) = .empty;
-    try matchAndAppend(arena, &out, logs, m);
+    try matchAndAppend(arena, &out, logs, m, cache);
     return out.toOwnedSlice(arena);
 }
 
-/// Append one `Call` to `out` per `(matching log, declared PrefetchCall)`.
+/// Write `selector ++ abi_word*` for `pc` into `buf` (length `4 + pc.args.len*32`).
+/// A `.param` arg resolves to the event's word, a `.word` arg is the literal.
+/// Shared by the append path and the producer-key lookup in `resolveTarget`, so
+/// a chained call and its producer derive byte-identical calldata.
+fn fillCalldata(buf: []u8, comptime E: type, comptime pc: sdk_manifest.PrefetchCall, log: *const RawLog) void {
+    const sel = comptime ethcall.selectorOf(pc.method);
+    @memcpy(buf[0..4], &sel);
+    inline for (pc.args, 0..) |arg, ai| {
+        const w: [32]u8 = switch (arg) {
+            .word => |lit| lit,
+            .param => |name| sdk_manifest.paramWord(E, name, &log.topics, log.data),
+        };
+        @memcpy(buf[4 + ai * 32 ..][0..32], &w);
+    }
+}
+
+/// Target address for `def.calls[idx]` against a matching log. `.log`/`.param`
+/// resolve from the log alone. `.of`/`.of_return` chain off an earlier call's
+/// cached result, returning `null` when that producer isn't cached yet (a later
+/// prefetch round resolves it) or reverted, so the chained call is dropped this
+/// round rather than queued against a wrong target.
+fn resolveTarget(comptime def: sdk_manifest.PrefetchDef, comptime idx: usize, log: *const RawLog, cache: *const ethcall.Cache) ?[20]u8 {
+    return switch (def.calls[idx].address) {
+        .log => log.address,
+        .param => |name| sdk_manifest.extractAddress(def.on_event, .{ .param = name }, log.address, &log.topics, log.data),
+        .of => |m| resolveChainTarget(def, idx, m, 0, log, cache),
+        .of_return => |r| resolveChainTarget(def, idx, r.call, r.index, log, cache),
+    };
+}
+
+/// Address in return word `ret_index` of the earlier call named `producer_method`.
+/// Rebuilds the producer's `(target, calldata)` exactly as it was queued, looks
+/// it up in the cache, and slices the trailing 20 bytes of the chosen word.
+/// `null` when the producer target is itself unresolved, the result is uncached
+/// or reverted, or the result is too short to hold `ret_index`.
+fn resolveChainTarget(
+    comptime def: sdk_manifest.PrefetchDef,
+    comptime idx: usize,
+    comptime producer_method: []const u8,
+    comptime ret_index: u16,
+    log: *const RawLog,
+    cache: *const ethcall.Cache,
+) ?[20]u8 {
+    const pj = comptime sdk_manifest.producerIndex(def, idx, producer_method);
+    const producer = def.calls[pj];
+    const ptarget = resolveTarget(def, pj, log, cache) orelse return null;
+    var pbuf: [4 + producer.args.len * 32]u8 = undefined;
+    fillCalldata(&pbuf, def.on_event, producer, log);
+    const entry = cache.get(ptarget, &pbuf) orelse return null;
+    if (entry.status != 0) return null;
+    const off = @as(usize, ret_index) * 32;
+    if (entry.bytes.len < off + 32) return null;
+    return entry.bytes[off + 12 ..][0..20].*;
+}
+
+/// Append one `Call` to `out` per `(matching log, resolvable PrefetchCall)`.
 /// Matching shape is identical between live (one block's logs) and backfill
 /// (every block in the filtered index). Single source so the paths can't drift.
+/// `cache` resolves chained `.of`/`.of_return` targets; an unresolved chain link
+/// drops its call, re-tried next round once its producer lands in the cache.
 fn matchAndAppend(
     arena: std.mem.Allocator,
     out: *std.ArrayList(ethcall.Call),
     logs: []const RawLog,
     comptime m: sdk_manifest.Manifest,
+    cache: *const ethcall.Cache,
 ) !void {
     for (logs) |*log| {
         if (log.topic_count == 0) continue;
         inline for (m.prefetch) |def| {
             const on_topic = comptime sdk_manifest.eventTopic0(def.on_event);
             if (std.mem.eql(u8, &log.topics[0], &on_topic)) {
-                inline for (def.calls) |pc| {
-                    const sel = comptime ethcall.selectorOf(pc.method);
-                    const addr = sdk_manifest.extractAddress(
-                        def.on_event,
-                        pc.address,
-                        log.address,
-                        &log.topics,
-                        log.data,
-                    );
-                    if (comptime pc.args.len == 0) {
-                        const calldata = try arena.dupe(u8, &sel);
-                        try out.append(arena, .{ .target = addr, .calldata = calldata });
-                    } else {
-                        // selector ++ one 32-byte ABI word per arg. A `param`
-                        // resolves to the event's word, a `word` is the literal.
+                inline for (def.calls, 0..) |pc, idx| {
+                    if (resolveTarget(def, idx, log, cache)) |target| {
                         const calldata = try arena.alloc(u8, 4 + pc.args.len * 32);
-                        @memcpy(calldata[0..4], &sel);
-                        inline for (pc.args, 0..) |arg, ai| {
-                            const w: [32]u8 = switch (arg) {
-                                .word => |lit| lit,
-                                .param => |name| sdk_manifest.paramWord(def.on_event, name, &log.topics, log.data),
-                            };
-                            @memcpy(calldata[4 + ai * 32 ..][0..32], &w);
-                        }
-                        try out.append(arena, .{ .target = addr, .calldata = calldata });
+                        fillCalldata(calldata, def.on_event, pc, log);
+                        try out.append(arena, .{ .target = target, .calldata = calldata });
                     }
                 }
             }
@@ -96,6 +135,7 @@ pub fn gatherDynamic(
     arena: std.mem.Allocator,
     dir: std.fs.Dir,
     comptime m: sdk_manifest.Manifest,
+    cache: *const ethcall.Cache,
 ) ![]ethcall.Call {
     if (comptime m.prefetch.len == 0) return &.{};
 
@@ -118,7 +158,7 @@ pub fn gatherDynamic(
                 const payload = try store.readPayload(i, payload_buf);
                 const decoded = try log_serial.decompressEntry(payload, decompress_buf);
                 const log_count = log_serial.deserializeLogs(decoded, log_buf);
-                try matchAndAppend(arena, &out, log_buf[0..log_count], m);
+                try matchAndAppend(arena, &out, log_buf[0..log_count], m, cache);
             }
         } else |_| {}
     }
@@ -175,6 +215,10 @@ const Transfer = struct {
 
 const PairCreated = struct {
     pub const signature = "PairCreated(address indexed token0, address indexed token1, address pair, uint256 allPairsLength)";
+};
+
+const Swap = struct {
+    pub const signature = "Swap(address indexed sender, uint256 amount0Out, uint256 amount1Out, address indexed to)";
 };
 
 test "gatherStatic returns empty for a manifest with no static_prefetch" {
@@ -249,7 +293,11 @@ test "gatherOneBlock builds parameterized calldata; arg words match encodeArg" {
             }},
         }},
     };
-    const calls = try gatherOneBlock(arena, &.{log}, m);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try ethcall.Cache.open(std.testing.allocator, tmp.dir);
+    defer cache.deinit();
+    const calls = try gatherOneBlock(arena, &.{log}, m, &cache);
     try std.testing.expectEqual(@as(usize, 1), calls.len);
     try std.testing.expectEqualSlices(u8, &FACTORY, &calls[0].target);
     try std.testing.expectEqual(@as(usize, 4 + 64), calls[0].calldata.len);
@@ -382,7 +430,11 @@ test "gatherOneBlock emits one Call per matching log per PrefetchCall" {
         .tx_hash = [_]u8{0xFE} ** 32,
     };
 
-    const calls = try gatherOneBlock(arena, &.{log}, m);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try ethcall.Cache.open(std.testing.allocator, tmp.dir);
+    defer cache.deinit();
+    const calls = try gatherOneBlock(arena, &.{log}, m, &cache);
     try std.testing.expectEqual(@as(usize, 1), calls.len);
     try std.testing.expectEqualSlices(u8, &PAIR, &calls[0].target);
     const expected_sel = ethcall.selectorOf("decimals()");
@@ -417,7 +469,11 @@ test "gatherOneBlock returns empty when no log matches a PrefetchDef" {
         .tx_hash = [_]u8{0} ** 32,
     };
 
-    const calls = try gatherOneBlock(arena, &.{log}, m);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try ethcall.Cache.open(std.testing.allocator, tmp.dir);
+    defer cache.deinit();
+    const calls = try gatherOneBlock(arena, &.{log}, m, &cache);
     try std.testing.expectEqual(@as(usize, 0), calls.len);
 }
 
@@ -430,6 +486,116 @@ test "gatherDynamic returns empty for a manifest with no prefetch" {
     defer tmp.cleanup();
 
     const m: sdk_manifest.Manifest = .{ .name = "x", .chain_id = 1, .start_block = 0 };
-    const calls = try gatherDynamic(arena, tmp.dir, m);
+    var cache = try ethcall.Cache.open(std.testing.allocator, tmp.dir);
+    defer cache.deinit();
+    const calls = try gatherDynamic(arena, tmp.dir, m, &cache);
     try std.testing.expectEqual(@as(usize, 0), calls.len);
+}
+
+test "gatherOneBlock chains .of: skipped until producer cached, then resolved" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try ethcall.Cache.open(std.testing.allocator, tmp.dir);
+    defer cache.deinit();
+
+    const POOL = [_]u8{0xC1} ** 20;
+    const TOKEN0 = [_]u8{0x77} ** 20;
+
+    const m: sdk_manifest.Manifest = .{
+        .name = "uni",
+        .chain_id = 1,
+        .start_block = 0,
+        .prefetch = &.{.{
+            .on_event = Swap,
+            .calls = &.{
+                .{ .address = .log, .method = "token0()" },
+                .{ .address = .{ .of = "token0()" }, .method = "decimals()" },
+            },
+        }},
+    };
+
+    var topics: [4][32]u8 = std.mem.zeroes([4][32]u8);
+    topics[0] = sdk_manifest.eventTopic0(Swap);
+    const log: RawLog = .{
+        .block_number = 1,
+        .tx_index = 0,
+        .log_index = 0,
+        .address = POOL,
+        .topic_count = 1,
+        .topics = topics,
+        .data = &.{},
+        .tx_hash = [_]u8{0} ** 32,
+    };
+
+    // Round 0: token0() uncached, so the chained decimals() can't resolve its
+    // target and is dropped. Only the producer call is queued.
+    const r0 = try gatherOneBlock(arena, &.{log}, m, &cache);
+    try std.testing.expectEqual(@as(usize, 1), r0.len);
+    try std.testing.expectEqualSlices(u8, &POOL, &r0[0].target);
+
+    // Warm token0()'s result (address right-aligned in the word), then the
+    // chain resolves: decimals() now targets TOKEN0.
+    const token0_sel = ethcall.selectorOf("token0()");
+    var word: [32]u8 = std.mem.zeroes([32]u8);
+    @memcpy(word[12..32], &TOKEN0);
+    try cache.put(POOL, &token0_sel, 0, &word);
+
+    const r1 = try gatherOneBlock(arena, &.{log}, m, &cache);
+    try std.testing.expectEqual(@as(usize, 2), r1.len);
+    try std.testing.expectEqualSlices(u8, &POOL, &r1[0].target);
+    const decimals_sel = ethcall.selectorOf("decimals()");
+    try std.testing.expectEqualSlices(u8, &TOKEN0, &r1[1].target);
+    try std.testing.expectEqualSlices(u8, &decimals_sel, r1[1].calldata);
+}
+
+test "gatherOneBlock drops a chained call when the producer reverted" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try ethcall.Cache.open(std.testing.allocator, tmp.dir);
+    defer cache.deinit();
+
+    const POOL = [_]u8{0xC1} ** 20;
+
+    const m: sdk_manifest.Manifest = .{
+        .name = "uni",
+        .chain_id = 1,
+        .start_block = 0,
+        .prefetch = &.{.{
+            .on_event = Swap,
+            .calls = &.{
+                .{ .address = .log, .method = "token0()" },
+                .{ .address = .{ .of = "token0()" }, .method = "decimals()" },
+            },
+        }},
+    };
+
+    var topics: [4][32]u8 = std.mem.zeroes([4][32]u8);
+    topics[0] = sdk_manifest.eventTopic0(Swap);
+    const log: RawLog = .{
+        .block_number = 1,
+        .tx_index = 0,
+        .log_index = 0,
+        .address = POOL,
+        .topic_count = 1,
+        .topics = topics,
+        .data = &.{},
+        .tx_hash = [_]u8{0} ** 32,
+    };
+
+    // A reverted producer (status 1) yields no address, so the chained call
+    // stays dropped and never re-resolves.
+    const token0_sel = ethcall.selectorOf("token0()");
+    try cache.put(POOL, &token0_sel, 1, &.{});
+
+    const calls = try gatherOneBlock(arena, &.{log}, m, &cache);
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualSlices(u8, &POOL, &calls[0].target);
 }

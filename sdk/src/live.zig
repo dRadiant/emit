@@ -288,7 +288,7 @@ const LiveSession = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        const calls = try prefetch.gatherOneBlock(arena, logs, m);
+        const calls = try prefetch.gatherOneBlock(arena, logs, m, cache);
         if (calls.len == 0) return;
 
         const unique = try prefetch.dedupe(arena, calls);

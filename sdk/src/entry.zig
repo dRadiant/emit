@@ -1057,7 +1057,7 @@ fn runPhase4(
     const arena = arena_state.allocator();
 
     const static_calls = try prefetch.gatherStatic(arena, m);
-    const dynamic_calls = try prefetch.gatherDynamic(arena, filter_dh, m);
+    const dynamic_calls = try prefetch.gatherDynamic(arena, filter_dh, m, cache);
 
     const merged = try arena.alloc(ethcall.Call, static_calls.len + dynamic_calls.len);
     @memcpy(merged[0..static_calls.len], static_calls);
