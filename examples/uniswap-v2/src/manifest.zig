@@ -26,26 +26,6 @@ pub const Sync = struct {
     pub const signature = "Sync(uint112 reserve0, uint112 reserve1)";
 };
 
-/// Expands `addrs` into ERC20-shaped `StaticCall` triples at comptime.
-/// Lives in user code so adapting to other shapes (ERC721 `tokenURI`,
-/// ERC4626 `asset`) is a copy-paste edit.
-fn erc20Metadata(comptime addrs: []const [20]u8) []const sdk.StaticCall {
-    comptime {
-        var out: []const sdk.StaticCall = &.{};
-        for (addrs) |a| {
-            out = out ++ &[_]sdk.StaticCall{
-                .{ .address = a, .method = "decimals()" },
-                .{ .address = a, .method = "symbol()" },
-                .{ .address = a, .method = "name()" },
-            };
-        }
-        return out;
-    }
-}
-
-const WETH = sdk.address("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
-const USDC = sdk.address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
-
 pub const config: sdk.Manifest = .{
     .name = "uniswap-v2",
     .chain_id = 1,
@@ -60,14 +40,22 @@ pub const config: sdk.Manifest = .{
         .spawn_param = "pair",
         .child_events = &.{ Mint, Burn, Swap, Sync },
     }},
-    // Per-pair token decimals fetched once at creation. `symbol()`/`name()`
-    // would fit here too but their dynamic-string returns are deferred.
+    // Chained prefetch. A `Swap` log carries only the pair address, so token
+    // metadata is two hops away: `pair.token0()`, then `token0.decimals()` /
+    // `symbol()`. `.of "token0()"` targets the address the earlier `token0()`
+    // call returned, resolved one prefetch round later. Works for pairs created
+    // before the scan window, where no `PairCreated` is seen so token addresses
+    // can't come from an event param. `symbol()` returns a dynamic `string`,
+    // read as `[]const u8`.
     .prefetch = &.{.{
-        .on_event = PairCreated,
+        .on_event = Swap,
         .calls = &.{
-            .{ .address = .{ .param = "token0" }, .method = "decimals()" },
-            .{ .address = .{ .param = "token1" }, .method = "decimals()" },
+            .{ .address = .log, .method = "token0()" },
+            .{ .address = .log, .method = "token1()" },
+            .{ .address = .{ .of = "token0()" }, .method = "decimals()" },
+            .{ .address = .{ .of = "token0()" }, .method = "symbol()" },
+            .{ .address = .{ .of = "token1()" }, .method = "decimals()" },
+            .{ .address = .{ .of = "token1()" }, .method = "symbol()" },
         },
     }},
-    .static_prefetch = erc20Metadata(&.{ WETH, USDC }),
 };

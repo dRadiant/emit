@@ -2,12 +2,17 @@
 /// `PairCreated` events. Main scan dispatches `Sync` and `Swap` against them.
 const sdk = @import("sdk");
 
-/// Mutable. One row per pair contract. Latest reserves, updated on every Sync.
+/// Mutable. One row per pair contract. Reserves update on every Sync. Token
+/// addresses and their decimals are filled on the first Swap from the chained
+/// prefetch (`token0()`/`token1()` then `decimals()`), so pairs created before
+/// the scan window are enriched without a `PairCreated` log.
 pub const Pair = struct {
     pub const storage: sdk.StorageMode = .mutable;
     id: [20]u8,
     token0: [20]u8,
     token1: [20]u8,
+    token0_decimals: u8,
+    token1_decimals: u8,
     reserve0: u256,
     reserve1: u256,
 };
